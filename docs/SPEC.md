@@ -454,8 +454,8 @@ Also export all results as CSV and JSON.
 
 ## 11. Test data, ground truth, validation
 
-- Test data location (outside the project folder):
-  `/home/limhes/git/stamps/testdata/`
+- Test data location (inside the project folder, but gitignored -- never committed):
+  `/home/limhes/git/stamps/stamp_analyzer/testdata/`
   - `reference/`: the IT8 + ruler scan(s), with the `scanimage -A` dump
   - `samples/`: sample sheet scans
   - `ground_truth.yaml`: per stamp, the hand-gauged perforation per side, imperf
@@ -498,7 +498,7 @@ colour maths is wrong for this application. Paths below are relative to `stamp_a
 | `../rnd_projects/rgb_to_munsell/sRGBToMunsellAndISCCNBS.csv` | Centore's conversion table | The regression test for §9 | n/a |
 | `../rnd_projects/stamp_feature_detect`, `../__android` | Machin template matching; an Android skeleton with a mocked perforation result | Out of scope | n/a |
 
-Do not modify anything outside `stamp_analyzer/` (and `testdata/`).
+Do not modify anything outside `stamp_analyzer/` (which now also contains `testdata/`).
 
 ## 14. Future (design hooks only)
 

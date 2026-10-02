@@ -77,43 +77,31 @@ def _hole_centres(length_mm: float, gauge: float, rng: np.random.Generator) -> l
     return [start + i * pitch for i in range(n)]
 
 
-def generate_synthetic_stamp(
-    spec: SynthSpec,
-) -> tuple[np.ndarray, SynthGroundTruth]:
-    """Render a synthetic stock-card scene with one stamp.
+@dataclass
+class RenderedStamp:
+    """A rotated stamp (paper + holes), rendered in its own local canvas,
+    not yet composited onto a scene."""
 
-    Returns a 16-bit single-channel image (the scanner's green/luminance
-    channel is representative enough for perforation work) and the ground
-    truth used to validate algorithms against.
-    """
+    image: np.ndarray  # local_h x local_w, float64, paper_level / background_level
+    mask: np.ndarray  # local_h x local_w, uint8, 0 or 255 (paper, post-holes)
+    local_size: tuple[int, int]  # (local_w, local_h)
+    rot_centre: tuple[float, float]  # centre of rotation within the local canvas
+    stamp_size_px: tuple[float, float]  # (width, height) before rotation
+    holes: dict[Side, HoleGroundTruth]
+
+
+def render_rotated_stamp(spec: SynthSpec) -> RenderedStamp:
+    """Render one stamp (paper + perforation holes), rotated, in its own
+    local canvas sized to just contain it plus a small pad. Does not place
+    it on any background -- see :func:`generate_synthetic_stamp` and
+    ``tests/synth_sheet.py`` for that."""
     rng = np.random.default_rng(spec.seed)
     ppm = spec.px_per_mm
+    full_scale = 65535.0
 
     stamp_w_px = spec.width_mm * ppm
     stamp_h_px = spec.height_mm * ppm
-    margin_px = spec.margin_mm * ppm
-    # Scene large enough to contain the rotated stamp plus margin.
-    diag = int(np.ceil(np.hypot(stamp_w_px, stamp_h_px) + 2 * margin_px))
-    scene_w = scene_h = diag
 
-    full_scale = 65535.0
-    scene = np.full((scene_h, scene_w), spec.background_level * full_scale, dtype=np.float64)
-
-    # Haze: radial lift of blacks around where the stamp will sit.
-    yy, xx = np.mgrid[0:scene_h, 0:scene_w]
-    cx, cy = scene_w / 2.0, scene_h / 2.0
-    r = np.hypot(xx - cx, yy - cy)
-    r_norm = np.clip(r / (diag / 2.0), 0.0, 1.0)
-    scene += spec.haze_level * full_scale * (1.0 - r_norm)
-
-    if spec.strip_edge:
-        y0 = int(spec.strip_edge_y_frac * scene_h)
-        thickness = max(1, int(0.3 * ppm))
-        scene[max(0, y0 - thickness // 2) : y0 + thickness // 2, :] += (
-            spec.strip_edge_level * full_scale
-        )
-
-    # Render the stamp (paper + holes) in its own local, unrotated canvas.
     pad = int(np.ceil(0.5 * ppm)) + 4
     local_w = int(np.ceil(stamp_w_px)) + 2 * pad
     local_h = int(np.ceil(stamp_h_px)) + 2 * pad
@@ -188,7 +176,6 @@ def generate_synthetic_stamp(
         stamp_mask > 0, spec.paper_level * full_scale, spec.background_level * full_scale
     )
 
-    # Rotate the local stamp canvas and composite onto the scene.
     rot_centre = (local_w / 2.0, local_h / 2.0)
     rot_mat = cv2.getRotationMatrix2D(rot_centre, spec.rotation_deg, 1.0)
     rotated = cv2.warpAffine(
@@ -208,10 +195,59 @@ def generate_synthetic_stamp(
         borderValue=0,
     )
 
+    return RenderedStamp(
+        image=rotated,
+        mask=rotated_mask,
+        local_size=(local_w, local_h),
+        rot_centre=rot_centre,
+        stamp_size_px=(stamp_w_px, stamp_h_px),
+        holes=holes,
+    )
+
+
+def generate_synthetic_stamp(
+    spec: SynthSpec,
+) -> tuple[np.ndarray, SynthGroundTruth]:
+    """Render a synthetic stock-card scene with one stamp.
+
+    Returns a 16-bit single-channel image (the scanner's green/luminance
+    channel is representative enough for perforation work) and the ground
+    truth used to validate algorithms against.
+    """
+    rng = np.random.default_rng(spec.seed)
+    ppm = spec.px_per_mm
+
+    stamp_w_px = spec.width_mm * ppm
+    stamp_h_px = spec.height_mm * ppm
+    margin_px = spec.margin_mm * ppm
+    # Scene large enough to contain the rotated stamp plus margin.
+    diag = int(np.ceil(np.hypot(stamp_w_px, stamp_h_px) + 2 * margin_px))
+    scene_w = scene_h = diag
+
+    full_scale = 65535.0
+    scene = np.full((scene_h, scene_w), spec.background_level * full_scale, dtype=np.float64)
+
+    # Haze: radial lift of blacks around where the stamp will sit.
+    yy, xx = np.mgrid[0:scene_h, 0:scene_w]
+    cx, cy = scene_w / 2.0, scene_h / 2.0
+    r = np.hypot(xx - cx, yy - cy)
+    r_norm = np.clip(r / (diag / 2.0), 0.0, 1.0)
+    scene += spec.haze_level * full_scale * (1.0 - r_norm)
+
+    if spec.strip_edge:
+        y0 = int(spec.strip_edge_y_frac * scene_h)
+        thickness = max(1, int(0.3 * ppm))
+        scene[max(0, y0 - thickness // 2) : y0 + thickness // 2, :] += (
+            spec.strip_edge_level * full_scale
+        )
+
+    rendered = render_rotated_stamp(spec)
+    local_w, local_h = rendered.local_size
+
     off_x = int(round((scene_w - local_w) / 2.0))
     off_y = int(round((scene_h - local_h) / 2.0))
-    mask_bool = rotated_mask > 32
-    scene[off_y : off_y + local_h, off_x : off_x + local_w][mask_bool] = rotated[mask_bool]
+    mask_bool = rendered.mask > 32
+    scene[off_y : off_y + local_h, off_x : off_x + local_w][mask_bool] = rendered.image[mask_bool]
 
     if spec.blur_sigma_px > 0:
         k = max(3, int(2 * round(3 * spec.blur_sigma_px) + 1))
@@ -222,14 +258,14 @@ def generate_synthetic_stamp(
 
     scene = np.clip(scene, 0, full_scale).astype(np.uint16)
 
-    stamp_centre_scene = (off_x + rot_centre[0], off_y + rot_centre[1])
+    stamp_centre_scene = (off_x + rendered.rot_centre[0], off_y + rendered.rot_centre[1])
 
     ground_truth = SynthGroundTruth(
         spec=spec,
         scene_size_px=(scene_w, scene_h),
         stamp_centre_px=stamp_centre_scene,
-        stamp_size_px=(stamp_w_px, stamp_h_px),
+        stamp_size_px=rendered.stamp_size_px,
         rotation_deg=spec.rotation_deg,
-        holes=holes,
+        holes=rendered.holes,
     )
     return scene, ground_truth

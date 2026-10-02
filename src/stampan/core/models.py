@@ -185,10 +185,21 @@ class GeometryResult:
     width_mm: float | None = None
     height_mm: float | None = None
     rotation_deg: float | None = None
+    # The transform mapping this crop back to its sample-sheet coordinates
+    # (SPEC §5): rotate the crop by -rotation_deg about sample_centre_px,
+    # then translate so crop_size_px's centre lands on sample_centre_px.
+    sample_centre_px: tuple[float, float] | None = None
+    crop_size_px: tuple[int, int] | None = None
 
     @staticmethod
     def from_dict(d: dict[str, Any]) -> GeometryResult:
-        return GeometryResult(**d)
+        return GeometryResult(
+            width_mm=d.get("width_mm"),
+            height_mm=d.get("height_mm"),
+            rotation_deg=d.get("rotation_deg"),
+            sample_centre_px=tuple(d["sample_centre_px"]) if d.get("sample_centre_px") else None,
+            crop_size_px=tuple(d["crop_size_px"]) if d.get("crop_size_px") else None,
+        )
 
 
 @dataclass
@@ -322,6 +333,34 @@ class Sample:
     @staticmethod
     def from_json(text: str) -> Sample:
         return Sample.from_dict(json.loads(text))
+
+
+@dataclass
+class Project:
+    project_id: str
+    name: str
+    created: str  # ISO date
+    ref_id: str | None = None
+    notes: str = ""
+    sample_ids: list[str] = field(default_factory=list)
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), indent=2, ensure_ascii=False)
+
+    @staticmethod
+    def from_dict(d: dict[str, Any]) -> Project:
+        return Project(
+            project_id=d["project_id"],
+            name=d["name"],
+            created=d["created"],
+            ref_id=d.get("ref_id"),
+            notes=d.get("notes", ""),
+            sample_ids=list(d.get("sample_ids", [])),
+        )
+
+    @staticmethod
+    def from_json(text: str) -> Project:
+        return Project.from_dict(json.loads(text))
 
 
 def write_json(path: str | Path, obj: Any) -> None:

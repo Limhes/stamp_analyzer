@@ -10,7 +10,8 @@ The development phases and their acceptance criteria are in `docs/PHASES.md`.
 This project lives in `/home/limhes/git/stamps/stamp_analyzer/`. The sibling folders
 (`../rnd_projects`, `../ColorIdentification`, `../__android`) hold René's earlier
 experiments. SPEC §13 says what is worth borrowing and what is wrong. Never modify
-anything outside `stamp_analyzer/` and `../testdata/`.
+anything outside `stamp_analyzer/`. Test data lives at `stamp_analyzer/testdata/`
+(gitignored; see §11 below).
 
 ## Who you are working with
 
@@ -35,8 +36,9 @@ choices at an expert level. Do not simplify, and do not hand-wave.
 - **Colour.** All colour maths runs in float64 on linear scanner RGB, which the
   characterisation model maps to CIE XYZ D50 (2°) and then to CIELAB D50. 8-bit sRGB
   is only for display.
-- **Test data** lives outside the repo (see `docs/SPEC.md` §11). Do not commit
-  scans larger than 1 MB. Small synthetic fixtures are fine.
+- **Test data** lives in `stamp_analyzer/testdata/` (see `docs/SPEC.md` §11) and is
+  gitignored -- never committed. Do not commit scans larger than 1 MB directly;
+  small synthetic fixtures are fine.
 - When a spec decision turns out to be wrong or ambiguous, propose the change. Do
   not silently deviate from the spec.
 
