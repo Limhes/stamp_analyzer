@@ -172,7 +172,10 @@ def render_diagnostic(
 ) -> bytes:
     """Render the scan with every sampled patch area drawn and labelled."""
     display = np.stack([image] * 3, axis=-1) if image.ndim == 2 else image
-    display8 = (display.astype(np.float64) / display.max() * 255).astype(np.uint8)
+    # cv2.normalize avoids promoting the full (often reference-scan-sized,
+    # i.e. hundreds of MB) image to a second float64 array just to rescale
+    # it into 0-255.
+    display8 = cv2.normalize(display, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
     display8 = cv2.cvtColor(display8, cv2.COLOR_RGB2BGR) if display8.shape[-1] == 3 else display8
 
     pitch_px = _estimate_patch_pitch_px(corners)

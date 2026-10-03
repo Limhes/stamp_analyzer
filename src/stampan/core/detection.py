@@ -53,10 +53,18 @@ class DetectionResult:
 
 def _to_intensity(image: np.ndarray) -> np.ndarray:
     """A single-channel intensity image: max channel (brightest per spec's
-    "background is dark in L* or the max channel")."""
+    "background is dark in L* or the max channel").
+
+    Stays in the image's native dtype (uint8/uint16) rather than promoting
+    to float: on a full 1200dpi flatbed scan (hundreds of MB), a float64
+    copy is a multi-GB transient allocation for an operation that is just a
+    per-pixel max -- comfortably exceeds an "average PC"'s free RAM. Every
+    downstream step (GaussianBlur, normalize, Otsu threshold) handles
+    uint8/uint16 input natively, so no float promotion is needed here.
+    """
     if image.ndim == 2:
-        return image.astype(np.float64)
-    return image.astype(np.float64).max(axis=-1)
+        return image
+    return image.max(axis=-1)
 
 
 def _suppress_strip_edges(
@@ -125,6 +133,15 @@ def _split_touching_components(
     return pieces if len(pieces) >= 2 else [component_mask]
 
 
+def _offset_stamp(stamp: DetectedStamp, dx: float, dy: float) -> DetectedStamp:
+    """Translate a stamp's centre from a bounding-box-local frame back to
+    full-sample coordinates (SPEC §5 perf: per-component work is restricted
+    to each component's own bounding box, not the whole sheet)."""
+    cx, cy = stamp.centre_px
+    stamp.centre_px = (cx + dx, cy + dy)
+    return stamp
+
+
 def _local_maxima(distance: np.ndarray, min_distance_px: int, mask: np.ndarray) -> list:
     from skimage.feature import peak_local_max
 
@@ -169,12 +186,29 @@ def detect_stamps(
     max_side_px = max_side_mm * px_per_mm_avg
     min_distance_px = max(5, int(min_side_px * 0.5))
 
-    n_components, labels = cv2.connectedComponents(mask, connectivity=8)
+    n_components, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
 
     stamps: list[DetectedStamp] = []
     index = 0
+    # Padding around each component's bounding box: generous enough that a
+    # watershed split's distance transform isn't clipped at the edge, cheap
+    # since it only widens a small local crop, not the whole sheet.
+    bbox_pad_px = max(close_kernel_px, min_distance_px // 2) + 2
     for label in range(1, n_components):
-        component_mask = (labels == label).astype(np.uint8) * 255
+        # Restrict all per-component work to this component's own bounding
+        # box, not the full sheet. `labels == label` and especially
+        # distance_transform_edt (inside _split_touching_components) scale
+        # with the array they're given; on a full 1200dpi sheet, doing that
+        # once per detected stamp turned a handful of small local
+        # computations into dozens of multi-hundred-MB/GB ones.
+        bx, by, bw, bh, _area = stats[label]
+        x0 = max(0, bx - bbox_pad_px)
+        y0 = max(0, by - bbox_pad_px)
+        x1 = min(labels.shape[1], bx + bw + bbox_pad_px)
+        y1 = min(labels.shape[0], by + bh + bbox_pad_px)
+        local_labels = labels[y0:y1, x0:x1]
+        component_mask = (local_labels == label).astype(np.uint8) * 255
+
         direct_stamp, direct_warnings = _rect_from_mask(
             component_mask, index, min_side_px, max_side_px, min_fill_ratio
         )
@@ -185,7 +219,7 @@ def detect_stamps(
             and max(direct_stamp.size_px) <= max_side_px
         )
         if looks_like_one_stamp:
-            stamps.append(direct_stamp)
+            stamps.append(_offset_stamp(direct_stamp, x0, y0))
             index += 1
             continue
 
@@ -200,7 +234,7 @@ def detect_stamps(
                 stamp.warnings.extend(piece_warnings)
                 stamp.warnings.append("split from a touching-stamp blob by watershed")
                 stamp.confidence *= 0.7
-                stamps.append(stamp)
+                stamps.append(_offset_stamp(stamp, x0, y0))
                 index += 1
         elif direct_stamp is not None:
             direct_stamp.warnings.extend(direct_warnings)
@@ -209,7 +243,7 @@ def detect_stamps(
             )
             direct_stamp.confidence *= 0.5
             direct_stamp.flagged_for_manual_review = True
-            stamps.append(direct_stamp)
+            stamps.append(_offset_stamp(direct_stamp, x0, y0))
             index += 1
         else:
             warnings.append(
@@ -319,14 +353,39 @@ def extract_crop(
     crop_h = int(np.ceil(h + 2 * margin_px_y))
 
     if background_level is None:
+        # A full-sheet percentile is a reasonable one-off background
+        # estimate, but recomputing it (and the ROI cast below) per stamp
+        # doesn't scale: a sheet with dozens of stamps would re-sort the
+        # whole multi-hundred-MB sheet that many times. Callers extracting
+        # several stamps from the same sample should compute this once and
+        # pass it in (see cli.py's `detect` command).
         background_level = float(np.percentile(sample, 1))
 
-    rot_mat = cv2.getRotationMatrix2D(stamp.centre_px, angle, 1.0)
-    rot_mat[0, 2] += crop_w / 2.0 - stamp.centre_px[0]
-    rot_mat[1, 2] += crop_h / 2.0 - stamp.centre_px[1]
+    # Rotation only needs a neighbourhood around the stamp, not the whole
+    # sheet. Crop a generous axis-aligned ROI first with plain integer
+    # slicing (a cheap view, no dtype promotion), then float-cast and
+    # warpAffine only that ROI. Previously this cast the *entire* sample to
+    # float64 for every single stamp -- on a 1200dpi flatbed scan that's a
+    # multi-GB transient allocation per stamp, easily exhausting an
+    # "average PC"'s RAM on a sheet with more than a couple of stamps.
+    # `roi_radius` is sized so the ROI contains the full rotated crop
+    # region regardless of rotation angle (the crop's half-diagonal is the
+    # farthest any output pixel's source can be from the stamp centre).
+    roi_radius = int(np.ceil(np.hypot(crop_w, crop_h) / 2.0)) + 4
+    cx, cy = stamp.centre_px
+    x0 = max(0, int(cx) - roi_radius)
+    y0 = max(0, int(cy) - roi_radius)
+    x1 = min(sample.shape[1], int(cx) + roi_radius)
+    y1 = min(sample.shape[0], int(cy) + roi_radius)
+    roi = sample[y0:y1, x0:x1]
+    roi_centre = (cx - x0, cy - y0)
+
+    rot_mat = cv2.getRotationMatrix2D(roi_centre, angle, 1.0)
+    rot_mat[0, 2] += crop_w / 2.0 - roi_centre[0]
+    rot_mat[1, 2] += crop_h / 2.0 - roi_centre[1]
 
     crop = cv2.warpAffine(
-        sample.astype(np.float64),
+        roi.astype(np.float32),
         rot_mat,
         (crop_w, crop_h),
         flags=cv2.INTER_CUBIC,
@@ -348,21 +407,35 @@ def extract_crop(
 # --------------------------------------------------------------------------
 
 
+#: This is a visual "did detection look sane" diagnostic, not a measurement
+#: input -- a full 1200dpi sheet (~12000x9000px) encodes to 100+ MB of PNG
+#: and takes several seconds, for no inspection benefit over a downsampled
+#: version. Capping the long side keeps it fast and a few hundred KB.
+MAX_OVERVIEW_DIM_PX = 2400
+
+
 def render_overview(sample: np.ndarray, result: DetectionResult) -> bytes:
     """Sample overview with numbered rotated rectangles; flagged regions in
     a different colour (SPEC §5)."""
     intensity = _to_intensity(sample)
-    display = (intensity / max(intensity.max(), 1) * 255).astype(np.uint8)
+    # cv2.normalize does the same min-max scaling as the old
+    # `intensity / intensity.max() * 255` without promoting the full sheet
+    # to a second float64 array first.
+    display = cv2.normalize(intensity, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
     display = cv2.cvtColor(display, cv2.COLOR_GRAY2BGR)
+
+    scale = min(1.0, MAX_OVERVIEW_DIM_PX / max(display.shape[:2]))
+    if scale < 1.0:
+        display = cv2.resize(display, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
 
     for stamp in result.stamps:
         colour = (0, 165, 255) if stamp.flagged_for_manual_review else (0, 220, 0)
-        box = stamp.box_points().astype(np.int32)
+        box = (stamp.box_points() * scale).astype(np.int32)
         cv2.drawContours(display, [box], 0, colour, 2)
         cv2.putText(
             display,
             str(stamp.index),
-            (int(stamp.centre_px[0]), int(stamp.centre_px[1])),
+            (int(stamp.centre_px[0] * scale), int(stamp.centre_px[1] * scale)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.8,
             colour,
@@ -395,7 +468,16 @@ def render_contact_sheet(crops: list[np.ndarray], n_cols: int = 6) -> bytes:
         ax.axis("off")
         if i < len(crops):
             crop = crops[i]
-            display = (crop.astype(np.float64) / max(crop.max(), 1) * 255).astype(np.uint8)
+            # A thumbnail is all a contact sheet needs; the subplot itself
+            # renders at a few hundred px, so downsample before imshow
+            # rather than handing matplotlib a full-resolution crop (up to
+            # a few thousand px per side) to shrink on every draw.
+            thumb_scale = min(1.0, 300 / max(crop.shape[:2]))
+            if thumb_scale < 1.0:
+                crop = cv2.resize(
+                    crop, None, fx=thumb_scale, fy=thumb_scale, interpolation=cv2.INTER_AREA
+                )
+            display = cv2.normalize(crop, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
             ax.imshow(display, cmap="gray")
             ax.set_title(str(i), fontsize=9)
     fig.tight_layout()

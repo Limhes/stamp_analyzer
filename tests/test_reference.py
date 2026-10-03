@@ -12,7 +12,7 @@ from stampan.core.calibration.reference import (
     load_reference,
     save_reference,
 )
-from stampan.core.cgats import parse_cgats_file
+from stampan.core.cgats import lab_from_xyz_d50, parse_cgats_file
 from stampan.core.io import ScanMetadata
 
 REF_PATH = Path(__file__).parent.parent / "reference_data" / "R240103.txt"
@@ -34,9 +34,16 @@ _XYZ_TO_RGB = np.array(
 def _build_synthetic_reference_scan(
     pitch_px: float = 40.0,
     ruler_px_per_mm: float = 10.0,
+    gamma: float = 1.0,
 ) -> tuple[np.ndarray, IT8Corners, RulerAxisSpec, RulerAxisSpec]:
     table = parse_cgats_file(REF_PATH)
     by_id = table.by_sample_id()
+
+    def encode(rgb: np.ndarray) -> np.ndarray:
+        # linear camera RGB -> raw (possibly gamma-encoded) scanner RGB, the
+        # inverse of what grey-ramp linearisation must recover (SPEC §4.3).
+        linear = np.clip(rgb / 100.0, 0, 1)
+        return (linear**gamma) * 65535.0
 
     margin = 80
     it8_w = int(pitch_px * (N_COLS - 1) + pitch_px * 2)
@@ -58,7 +65,7 @@ def _build_synthetic_reference_scan(
             row = by_id[f"{row_letter}{ci + 1}"]
             xyz = np.array([row["XYZ_X"], row["XYZ_Y"], row["XYZ_Z"]])
             rgb = xyz @ _XYZ_TO_RGB.T
-            rgb_scaled = np.clip(rgb / 100.0 * 65535.0, 0, 65535)
+            rgb_scaled = encode(rgb)
             x0, x1 = int(cx - half), int(cx + half)
             y0, y1 = int(cy - half), int(cy + half)
             canvas[y0:y1, x0:x1] = rgb_scaled
@@ -70,7 +77,7 @@ def _build_synthetic_reference_scan(
         row = by_id[f"GS{gi}"]
         xyz = np.array([row["XYZ_X"], row["XYZ_Y"], row["XYZ_Z"]])
         rgb = xyz @ _XYZ_TO_RGB.T
-        rgb_scaled = np.clip(rgb / 100.0 * 65535.0, 0, 65535)
+        rgb_scaled = encode(rgb)
         x0, x1 = int(gx - half), int(gx + half)
         y0, y1 = int(gs_y_px - half), int(gs_y_px + half)
         canvas[y0:y1, x0:x1] = rgb_scaled
@@ -167,3 +174,40 @@ def test_save_and_load_reference_roundtrip(tmp_path):
     lab = model.predict_lab(rgb_sample)
     assert lab.shape == (1, 3)
     assert np.all(np.isfinite(lab))
+
+
+def test_load_colour_model_applies_grey_ramp_linearisation_to_new_pixels(tmp_path):
+    # Regression test: the grey-ramp linearisation curve fit in build_reference
+    # (SPEC §4.3) was discarded after training -- it was applied to the IT8
+    # patches used to fit the characterisation model, but never persisted or
+    # reapplied to any RGB predicted afterwards. Every real stamp crop (never
+    # itself an IT8 patch) was therefore fed to the model still gamma-encoded,
+    # landing outside the model's trained (linear) domain entirely. Found via
+    # 100% of pixels on a real scan coming back "outside the trained gamut".
+    scan, corners, x_axis, y_axis = _build_synthetic_reference_scan(gamma=2.2)
+    result = build_reference(
+        name="gamma test reference",
+        scan=scan,
+        scan_metadata=ScanMetadata(scanner_options={"resolution": 1200}),
+        x_axis=x_axis,
+        it8_corners=corners,
+        cgats_reference_path=REF_PATH,
+        y_axis=y_axis,
+    )
+    save_reference(result, tmp_path)
+    model = load_colour_model(tmp_path, result.reference.ref_id)
+
+    # A1's own raw (still gamma-encoded) pixel from the built scan -- not a
+    # value used to fit the model, just read back from the rendered canvas --
+    # must still map close to its known ground-truth Lab.
+    cx, cy = corners.a1
+    raw_rgb = scan[int(cy), int(cx)].astype(np.float64)[None, :]
+
+    table = parse_cgats_file(REF_PATH)
+    row = table.by_sample_id()["A1"]
+    expected_lab = np.array(lab_from_xyz_d50(row["XYZ_X"], row["XYZ_Y"], row["XYZ_Z"]))
+
+    predicted_lab = model.predict_lab(raw_rgb)[0]
+    assert np.all(np.isfinite(predicted_lab))
+    delta_e = np.linalg.norm(predicted_lab - expected_lab)
+    assert delta_e < 2.0, f"predicted {predicted_lab}, expected {expected_lab}"

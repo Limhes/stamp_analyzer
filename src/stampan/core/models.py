@@ -129,6 +129,11 @@ class ColourCluster:
     std_lab: tuple[float, float, float] | None = None
     mean_lch: tuple[float, float, float] | None = None
     delta_e00_spread: float | None = None
+    # "Core ink" (SPEC §8.3): mean Lab of the ink sub-population farthest
+    # from the paper centroid (top quartile by distance), as a solid-ink
+    # estimate less biased by fine-line/engraving dilution toward paper.
+    # None for non-ink clusters (e.g. paper itself).
+    core_mean_lab: tuple[float, float, float] | None = None
     munsell: str | None = None
     iscc_nbs_name: str | None = None
     srgb_swatch: tuple[int, int, int] | None = None
@@ -145,6 +150,7 @@ class ColourCluster:
             std_lab=_tuple3(d.get("std_lab")),
             mean_lch=_tuple3(d.get("mean_lch")),
             delta_e00_spread=d.get("delta_e00_spread"),
+            core_mean_lab=_tuple3(d.get("core_mean_lab")),
             munsell=d.get("munsell"),
             iscc_nbs_name=d.get("iscc_nbs_name"),
             srgb_swatch=tuple(d["srgb_swatch"]) if d.get("srgb_swatch") is not None else None,

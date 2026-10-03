@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import typer
 
 from stampan import __version__
+from stampan.core import colour as colour_mod
 from stampan.core import detection as detection_mod
 from stampan.core import perforation as perforation_mod
 from stampan.core import project as project_mod
@@ -16,6 +18,7 @@ from stampan.core.calibration import it8 as it8_mod
 from stampan.core.calibration import reference as ref_mod
 from stampan.core.io import ScanMetadata, read_tiff
 from stampan.core.models import GeometryResult, Stamp
+from stampan.core.naming import load_iscc_nbs_table
 
 app = typer.Typer(
     name="stampan",
@@ -27,6 +30,8 @@ app.add_typer(reference_app, name="reference")
 
 DEFAULT_LIBRARY_ROOT = Path.home() / "StampAnalyzer"
 DEFAULT_CGATS_PATH = Path("reference_data") / "R240103.txt"
+DEFAULT_ISCC_TABLE_PATH = Path("reference_data") / "iscc_nbs" / "color_names.txt"
+DEFAULT_INTERIOR_MARGIN_MM = 0.6  # typical perforation depth (~0.3-0.5mm) + 0.3mm safety
 
 
 @app.command()
@@ -102,6 +107,24 @@ def scan(
     from stampan.core.io import write_tiff
 
     image, _ = read_tiff(output)
+    extra: dict = {}
+    if image.dtype == np.uint8:
+        # This backend/device (e.g. the Epson 1200U via epson2: SPEC §2,
+        # Phase 1) may only offer 8-bit depth (see acquire_scan's own
+        # warning above). write_tiff enforces the pipeline's uint16
+        # convention; a caller that skips this step and just
+        # `.astype(np.uint16)`s an 8-bit array gets values still numerically
+        # in 0-255, silently outside the domain any reference's
+        # characterisation model was trained on (found exactly this way, on
+        # a real sample sheet: every single pixel came back as "outside the
+        # trained gamut"). Rescale losslessly (x257, so 0->0, 255->65535)
+        # rather than silently truncating precision we don't have.
+        typer.echo(
+            "warning: scanner wrote 8-bit; upscaling to 16-bit (x257) for pipeline consistency",
+            err=True,
+        )
+        image = (image.astype(np.uint16) * 257).astype(np.uint16)
+        extra["upscaled_from_8bit"] = True
     write_tiff(
         output,
         image,
@@ -109,9 +132,11 @@ def scan(
             scan_time=datetime.now(UTC).isoformat(),
             scanner_options=scanner_options,
             ref_id=ref_id,
+            extra=extra,
         ),
     )
-    typer.echo(f"wrote {output} ({result.bit_depth}-bit)")
+    note = ", upscaled to 16-bit" if extra.get("upscaled_from_8bit") else ""
+    typer.echo(f"wrote {output} ({result.bit_depth}-bit{note})")
 
 
 def _parse_floats(s: str) -> list[float]:
@@ -234,10 +259,21 @@ def detect(
     result = detection_mod.detect_stamps(scan_image, ref.scale.px_per_mm_x, ref.scale.px_per_mm_y)
     overview_png = detection_mod.render_overview(scan_image, result)
 
+    # Computed once per sheet (on a strided subsample -- the 1st percentile
+    # of a background-dominated scan is stable under heavy subsampling) and
+    # reused for every stamp: extract_crop's own fallback would otherwise
+    # re-sort the entire multi-hundred-MB sheet once per stamp.
+    background_level = float(np.percentile(scan_image[::8, ::8], 1))
+
     crops = []
     for i, detected in enumerate(result.stamps):
         crop, transform = detection_mod.extract_crop(
-            scan_image, detected, ref.scale.px_per_mm_x, ref.scale.px_per_mm_y, margin_mm
+            scan_image,
+            detected,
+            ref.scale.px_per_mm_x,
+            ref.scale.px_per_mm_y,
+            margin_mm,
+            background_level=background_level,
         )
         crops.append(crop)
         width_mm = detected.size_px[0] / ref.scale.px_per_mm_x
@@ -346,6 +382,100 @@ def perf(
             typer.echo(f"  warning: {w}", err=True)
 
     typer.echo(f"measured perforation on {n_ok}/{len(stamp_ids)} stamp(s)")
+
+
+@app.command()
+def colour(
+    project: str = typer.Argument(..., help="Project name or id."),
+    stamp: str | None = typer.Option(None, "--stamp", help="Only this stamp id."),
+    inks: int = typer.Option(1, "--inks", help="Number of ink clusters (N), SPEC §8.3."),
+    tau: float = typer.Option(0.9, "--tau", help="Posterior threshold for mixed pixels."),
+    margin_mm: float = typer.Option(
+        DEFAULT_INTERIOR_MARGIN_MM,
+        help="Interior-mask margin past the stamp edge, in mm (SPEC §8.1).",
+    ),
+    iscc_table_path: Path = typer.Option(DEFAULT_ISCC_TABLE_PATH, help="ISCC-NBS name table."),
+    library_root: Path = typer.Option(DEFAULT_LIBRARY_ROOT),
+) -> None:
+    """Measure paper/ink colour on all (or one) stamp(s) in a project (SPEC §8-9)."""
+    proj = _resolve_project(library_root, project)
+    iscc_table = load_iscc_nbs_table(iscc_table_path)
+
+    model_cache: dict[str, ref_mod.ColourModel] = {}
+    scale_cache: dict[str, tuple[float, float]] = {}
+    cv_delta_e00_cache: dict[str, float] = {}
+    stamp_to_sample: dict[str, str] = {}
+    for sample_id in proj.sample_ids:
+        sample = project_mod.load_sample(library_root, proj.project_id, sample_id)
+        for stamp_id in sample.stamp_ids:
+            stamp_to_sample[stamp_id] = sample_id
+        if sample.ref_id not in model_cache:
+            ref = ref_mod.load_reference(library_root, sample.ref_id)
+            if ref.scale is None or ref.colour_model is None:
+                typer.echo(
+                    f"reference {sample.ref_id} missing scale or colour model; skipping its stamps",
+                    err=True,
+                )
+                continue
+            model_cache[sample.ref_id] = ref_mod.load_colour_model(library_root, sample.ref_id)
+            scale_cache[sample.ref_id] = (ref.scale.px_per_mm_x, ref.scale.px_per_mm_y)
+            cv_delta_e00_cache[sample.ref_id] = ref.colour_model.cv_delta_e00.get("mean")
+
+    stamp_ids = [stamp] if stamp else list(stamp_to_sample.keys())
+    if not stamp_ids:
+        typer.echo("no stamps found in this project.", err=True)
+        raise typer.Exit(code=1)
+
+    n_ok = 0
+    for stamp_id in stamp_ids:
+        sample_id = stamp_to_sample.get(stamp_id)
+        if sample_id is None:
+            typer.echo(f"warning: stamp {stamp_id} not found in project", err=True)
+            continue
+        sample = project_mod.load_sample(library_root, proj.project_id, sample_id)
+        if sample.ref_id not in model_cache:
+            typer.echo(f"warning: no usable reference for stamp {stamp_id}; skipping", err=True)
+            continue
+        px_per_mm_x, px_per_mm_y = scale_cache[sample.ref_id]
+        model = model_cache[sample.ref_id]
+
+        crop = project_mod.load_stamp_crop(library_root, proj.project_id, stamp_id)
+        analysis = colour_mod.analyse_colour(
+            crop,
+            model.predict_lab,
+            px_per_mm_x,
+            px_per_mm_y,
+            perforation_margin_mm=margin_mm,
+            n_inks=inks,
+            tau=tau,
+            iscc_table=iscc_table,
+            ref_id=sample.ref_id,
+            colour_model_cv_delta_e00=cv_delta_e00_cache[sample.ref_id],
+        )
+
+        diagnostics = {
+            "colour_clusters.png": colour_mod.render_cluster_overlay(crop, analysis),
+            "colour_scatter.png": colour_mod.render_scatter_plots(analysis),
+            "colour_swatches.png": colour_mod.render_swatch_card(analysis),
+        }
+
+        stamp_obj = project_mod.load_stamp(library_root, proj.project_id, stamp_id)
+        stamp_obj.colour = analysis.result
+        stamp_obj.colour.meta.diagnostic_image = "diagnostics/colour_swatches.png"
+        project_mod.save_stamp_results(
+            library_root, proj.project_id, stamp_obj, diagnostics=diagnostics
+        )
+
+        n_ok += 1
+        summary = ", ".join(
+            f"{c.label}={c.munsell or '?'} ({c.iscc_nbs_name or '?'})"
+            for c in analysis.result.clusters
+        )
+        typer.echo(f"{stamp_id}: {summary or 'no clusters'}")
+        for w in analysis.warnings:
+            typer.echo(f"  warning: {w}", err=True)
+
+    typer.echo(f"measured colour on {n_ok}/{len(stamp_ids)} stamp(s)")
 
 
 if __name__ == "__main__":

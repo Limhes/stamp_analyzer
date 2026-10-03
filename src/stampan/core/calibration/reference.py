@@ -119,6 +119,7 @@ def build_reference(
 
     # Grey-ramp linearisation (SPEC §4.3): fit from GS patches, apply to all.
     gs_mask = [pid.startswith("GS") for pid in patch_ids]
+    lin_curve: char.LinearisationCurve | None = None
     if sum(gs_mask) >= 4:
         gs_rgb = rgb[gs_mask]
         gs_y = xyz[gs_mask, 1]
@@ -140,6 +141,9 @@ def build_reference(
     )
 
     model_arrays: dict[str, Any] = {"kind": best_kind, "patch_ids": np.array(patch_ids)}
+    model_arrays["has_linearisation"] = lin_curve is not None
+    if lin_curve is not None:
+        model_arrays.update(char.linearisation_to_arrays(lin_curve))
     if best_kind in ("matrix3x3", "root_poly2", "root_poly3"):
         degree = {"matrix3x3": 1, "root_poly2": 2, "root_poly3": 3}[best_kind]
         model = (
@@ -248,6 +252,18 @@ def load_colour_model(library_root: str | Path, ref_id: str) -> ColourModel:
     data = np.load(ref_dir / "model.npz", allow_pickle=True)
     kind = str(data["kind"])
 
+    # SPEC §4.3: the characterisation models are fit on grey-ramp-linearised
+    # RGB, so any RGB predicted against them (new stamp crops included) must
+    # go through the same per-channel curve first. References built before
+    # this curve was persisted have no "has_linearisation" key at all; those
+    # fall back to the identity (the old, buggy behaviour) rather than
+    # crashing, since rebuilding them requires a rescan.
+    has_lin = bool(data["has_linearisation"]) if "has_linearisation" in data else False
+    lin_curve = char.linearisation_from_arrays(data) if has_lin else None
+
+    def _linearise(rgb: np.ndarray) -> np.ndarray:
+        return lin_curve.apply(rgb) if lin_curve is not None else np.asarray(rgb, dtype=np.float64)
+
     if kind in ("matrix3x3", "root_poly2", "root_poly3"):
         ccm = data["ccm"]
         degree = int(data["degree"])
@@ -256,7 +272,7 @@ def load_colour_model(library_root: str | Path, ref_id: str) -> ColourModel:
         from stampan.core.calibration.characterisation import xyz_to_lab_array
 
         def predict(rgb: np.ndarray) -> np.ndarray:
-            xyz = apply_matrix_colour_correction_Finlayson2015(rgb, ccm, degree=degree)
+            xyz = apply_matrix_colour_correction_Finlayson2015(_linearise(rgb), ccm, degree=degree)
             return xyz_to_lab_array(xyz)
 
         return ColourModel(kind=kind, predict_fn=predict)
@@ -265,7 +281,11 @@ def load_colour_model(library_root: str | Path, ref_id: str) -> ColourModel:
         rgb_train = data["rgb_train"]
         lab_train = data["lab_train"]
         model = char.fit_linear_nd_interpolator(rgb_train, lab_train)
-        return ColourModel(kind=kind, predict_fn=model.predict_lab)
+
+        def predict(rgb: np.ndarray) -> np.ndarray:
+            return model.predict_lab(_linearise(rgb))
+
+        return ColourModel(kind=kind, predict_fn=predict)
 
     raise ValueError(f"unknown stored model kind: {kind}")
 

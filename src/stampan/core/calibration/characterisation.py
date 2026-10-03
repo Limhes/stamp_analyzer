@@ -91,6 +91,29 @@ def fit_linearisation(gs_rgb: np.ndarray, gs_y: np.ndarray) -> LinearisationCurv
     return LinearisationCurve(channel_splines=splines)
 
 
+def linearisation_to_arrays(curve: LinearisationCurve) -> dict[str, np.ndarray]:
+    """Serialise a curve's per-channel breakpoints for ``np.savez`` storage.
+
+    ``PchipInterpolator`` objects themselves aren't picklable into a plain
+    npz array; the (x, y) breakpoints that rebuild an identical spline are.
+    """
+    arrays: dict[str, np.ndarray] = {}
+    for c, spline in enumerate(curve.channel_splines):
+        x = spline.x
+        arrays[f"lin_x_{c}"] = x
+        arrays[f"lin_y_{c}"] = spline(x)  # PchipInterpolator exposes x but not y directly
+    return arrays
+
+
+def linearisation_from_arrays(data) -> LinearisationCurve:
+    """Inverse of :func:`linearisation_to_arrays`."""
+    splines = [
+        PchipInterpolator(data[f"lin_x_{c}"], data[f"lin_y_{c}"], extrapolate=True)
+        for c in range(3)
+    ]
+    return LinearisationCurve(channel_splines=splines)
+
+
 # --------------------------------------------------------------------------
 # Models (a), (b): matrix + root-polynomial, via colour-science Finlayson2015
 # --------------------------------------------------------------------------

@@ -110,7 +110,7 @@ def _notation(gauge: float) -> str:
     return f"{whole}{frac_str}"
 
 
-def _segment(crop: np.ndarray) -> np.ndarray:
+def segment_stamp(crop: np.ndarray) -> np.ndarray:
     """Foreground (stamp) mask. Perforation holes are deliberately *not*
     closed (they are tens of px across and are exactly what this module
     measures) -- but a tiny morphological closing (a few px) is applied to
@@ -505,7 +505,7 @@ def analyse_perforation(
 ) -> PerforationAnalysis:
     """Measure perforation gauge on all four sides of an upright stamp crop
     (SPEC §6)."""
-    mask = _segment(crop)
+    mask = segment_stamp(crop)
     contour_px = _outer_contour(mask)
     edge_frames = _edge_frames(mask)
     side_labels = _classify_side(contour_px, edge_frames)

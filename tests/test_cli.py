@@ -1,4 +1,6 @@
 import json
+import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -6,12 +8,14 @@ from typer.testing import CliRunner
 
 from stampan.cli import app
 from stampan.core.calibration import reference as ref_mod
-from stampan.core.io import ScanMetadata, write_tiff
+from stampan.core.io import ScanMetadata, read_tiff, write_tiff
 from tests.synth import SideSpec, SynthSpec
 from tests.synth_sheet import SheetSpec, StampPlacement, generate_synthetic_sheet
 from tests.test_reference import _build_synthetic_reference_scan
 
 runner = CliRunner()
+
+FAKE_SCANIMAGE = [sys.executable, str(Path(__file__).parent / "fakes" / "fake_scanimage.py")]
 
 
 def test_version():
@@ -185,3 +189,46 @@ def test_detect_command_writes_project_and_stamps(tmp_path):
             / "perforation.png"
         )
         assert diag_path.exists()
+
+
+def test_scan_command_upscales_8bit_scanner_output_to_16bit(tmp_path, monkeypatch):
+    # Regression test: the Epson 1200U (real hardware, Phase 1) only offers
+    # 8-bit depth. Before this fix, `stampan scan` would crash in
+    # write_tiff (uint8 != uint16) or -- worse, if that check were ever
+    # loosened -- silently save values still numerically in 0-255 typed as
+    # uint16, outside the domain any reference's colour model was trained
+    # on. Found exactly that way on a real sample sheet.
+    import subprocess
+
+    import stampan.core.scanner as scanner_mod
+
+    monkeypatch.setenv("FAKE_SCANNER_STATE", str(tmp_path / "state.json"))
+    monkeypatch.setenv("FAKE_SCANNER_DEPTH_INACTIVE", "1")  # backend stuck at 8-bit
+
+    def fake_run(args):
+        return subprocess.run(
+            [*FAKE_SCANIMAGE, *args[1:]], capture_output=True, text=True, check=False
+        )
+
+    monkeypatch.setattr(scanner_mod, "_run", fake_run)
+
+    options_path = tmp_path / "options.json"
+    # "depth" deliberately omitted: apply_and_verify would pass it straight
+    # through to scanimage, and this backend reports --depth inactive (would
+    # abort with "attempted to set inactive option"). acquire_scan's own
+    # depth-handling (the thing under test) checks for that and skips it.
+    options_path.write_text(json.dumps({"resolution": 1200, "mode": "Color"}))
+    output_path = tmp_path / "scan.tif"
+
+    result = runner.invoke(
+        app,
+        ["scan", "-o", str(output_path), "--options-from", str(options_path)],
+    )
+    assert result.exit_code == 0, result.stdout
+    assert "upscaling to 16-bit" in result.stdout or "upscaling to 16-bit" in (result.stderr or "")
+
+    image, meta = read_tiff(output_path)
+    assert image.dtype == np.uint16
+    # the fake backend writes all-zero pixels; the real assertion that
+    # matters is that write_tiff didn't crash and the upscale flag is set.
+    assert meta.extra.get("upscaled_from_8bit") is True

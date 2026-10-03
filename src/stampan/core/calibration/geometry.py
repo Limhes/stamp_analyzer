@@ -69,17 +69,35 @@ def extract_ruler_profile(
     ``angle_deg`` is the direction of increasing tick position, measured
     from the +x axis.
     """
-    if image.ndim == 3:
-        image = image.mean(axis=-1)
-
     size = (int(round(length_px)), int(round(width_px)))
-    # getRectSubPix doesn't rotate, so rotate the image about the strip
+
+    # Crop a generous ROI around the ruler strip *before* rotating or
+    # collapsing channels: `image` here is the full reference/sample scan
+    # (hundreds of MB at 1200dpi), and both `.mean(axis=-1)` and the
+    # subsequent warpAffine used to run on the whole thing just to read out
+    # a thin strip a few hundred px long. Sized so the ROI contains the
+    # strip for any rotation angle (its half-diagonal is the farthest any
+    # output pixel's source can be from the strip centre).
+    roi_radius = int(np.ceil(np.hypot(length_px, width_px) / 2.0)) + 4
+    cx, cy = centre_xy
+    h, w = image.shape[:2]
+    x0 = max(0, int(cx) - roi_radius)
+    y0 = max(0, int(cy) - roi_radius)
+    x1 = min(w, int(cx) + roi_radius)
+    y1 = min(h, int(cy) + roi_radius)
+    roi = image[y0:y1, x0:x1]
+    roi_centre = (cx - x0, cy - y0)
+
+    if roi.ndim == 3:
+        roi = roi.mean(axis=-1)
+
+    # getRectSubPix doesn't rotate, so rotate the ROI about the strip
     # centre first (so increasing x in the crop is the ruler's own axis),
     # then crop.
-    rot_mat = cv2.getRotationMatrix2D(centre_xy, angle_deg, 1.0)
-    h, w = image.shape[:2]
-    rotated = cv2.warpAffine(image.astype(np.float32), rot_mat, (w, h), flags=cv2.INTER_LINEAR)
-    straightened = cv2.getRectSubPix(rotated, size, centre_xy)
+    rot_mat = cv2.getRotationMatrix2D(roi_centre, angle_deg, 1.0)
+    rh, rw = roi.shape[:2]
+    rotated = cv2.warpAffine(roi.astype(np.float32), rot_mat, (rw, rh), flags=cv2.INTER_LINEAR)
+    straightened = cv2.getRectSubPix(rotated, size, roi_centre)
     # getRectSubPix returns shape (size[1], size[0]) = (width_px, length_px);
     # collapse across the strip width (axis 0) to get the 1-D profile.
     profile = straightened.mean(axis=0)

@@ -924,7 +924,6 @@ def find_color(hue, chroma, value):
 				Level3Index = 126
 			else:
 				print("no match")
-			end
 
 		elif hue >= 34 and hue < 38:
 			if chroma > 0.5 and chroma <= 1.2 and value >= 8.5:
@@ -967,7 +966,6 @@ def find_color(hue, chroma, value):
 				Level3Index = 126
 			else:
 				print("no match")
-			end
 
 		elif hue >= 38 and hue < 43:
 			if chroma > 0.5 and chroma <= 1.2 and value >= 8.5:
