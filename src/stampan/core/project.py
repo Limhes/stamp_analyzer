@@ -156,6 +156,23 @@ def save_stamp(
     return stamp_dir
 
 
+def save_stamp_results(
+    library_root: str | Path,
+    project_id: str,
+    stamp: Stamp,
+    diagnostics: dict[str, bytes] | None = None,
+) -> Path:
+    """Update an existing stamp's stamp.json (and diagnostics) in place,
+    without touching its crop.tif -- for analysis steps (perforation,
+    colour, ...) that run on an already-extracted crop."""
+    stamp_dir = project_dir(library_root, project_id) / "stamps" / stamp.stamp_id
+    (stamp_dir / "diagnostics").mkdir(parents=True, exist_ok=True)
+    (stamp_dir / "stamp.json").write_text(stamp.to_json(), encoding="utf-8")
+    for filename, data in (diagnostics or {}).items():
+        (stamp_dir / "diagnostics" / filename).write_bytes(data)
+    return stamp_dir
+
+
 def load_stamp(library_root: str | Path, project_id: str, stamp_id: str) -> Stamp:
     stamp_dir = project_dir(library_root, project_id) / "stamps" / stamp_id
     return Stamp.from_json((stamp_dir / "stamp.json").read_text(encoding="utf-8"))

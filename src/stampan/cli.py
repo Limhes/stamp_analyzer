@@ -9,6 +9,7 @@ import typer
 
 from stampan import __version__
 from stampan.core import detection as detection_mod
+from stampan.core import perforation as perforation_mod
 from stampan.core import project as project_mod
 from stampan.core import scanner as scanner_mod
 from stampan.core.calibration import it8 as it8_mod
@@ -272,6 +273,79 @@ def detect(
     typer.echo(
         f"wrote sample {sample.sample_id} and {len(result.stamps)} stamp(s) to {project_dir}"
     )
+
+
+def _resolve_project(library_root: Path, project: str) -> project_mod.Project:
+    by_name = project_mod.find_project_by_name(library_root, project)
+    if by_name is not None:
+        return by_name
+    return project_mod.load_project(library_root, project)
+
+
+@app.command()
+def perf(
+    project: str = typer.Argument(..., help="Project name or id."),
+    stamp: str | None = typer.Option(None, "--stamp", help="Only this stamp id."),
+    library_root: Path = typer.Option(DEFAULT_LIBRARY_ROOT),
+) -> None:
+    """Measure perforation gauge on all (or one) stamp(s) in a project (SPEC §6)."""
+    proj = _resolve_project(library_root, project)
+
+    scale_cache: dict[str, tuple[float, float]] = {}
+    stamp_to_sample: dict[str, str] = {}
+    for sample_id in proj.sample_ids:
+        sample = project_mod.load_sample(library_root, proj.project_id, sample_id)
+        for stamp_id in sample.stamp_ids:
+            stamp_to_sample[stamp_id] = sample_id
+        if sample.ref_id not in scale_cache:
+            ref = ref_mod.load_reference(library_root, sample.ref_id)
+            if ref.scale is None:
+                typer.echo(f"reference {sample.ref_id} has no scale; skipping its stamps", err=True)
+                continue
+            scale_cache[sample.ref_id] = (ref.scale.px_per_mm_x, ref.scale.px_per_mm_y)
+
+    stamp_ids = [stamp] if stamp else list(stamp_to_sample.keys())
+    if not stamp_ids:
+        typer.echo("no stamps found in this project.", err=True)
+        raise typer.Exit(code=1)
+
+    n_ok = 0
+    for stamp_id in stamp_ids:
+        sample_id = stamp_to_sample.get(stamp_id)
+        if sample_id is None:
+            typer.echo(f"warning: stamp {stamp_id} not found in project", err=True)
+            continue
+        sample = project_mod.load_sample(library_root, proj.project_id, sample_id)
+        scale = scale_cache.get(sample.ref_id)
+        if scale is None:
+            typer.echo(f"warning: no scale for stamp {stamp_id}'s reference; skipping", err=True)
+            continue
+        px_per_mm_x, px_per_mm_y = scale
+
+        crop = project_mod.load_stamp_crop(library_root, proj.project_id, stamp_id)
+        analysis = perforation_mod.analyse_perforation(crop, px_per_mm_x, px_per_mm_y)
+        diagnostic_png = perforation_mod.render_diagnostic(crop, analysis)
+        notation = perforation_mod.perforation_result_notation(analysis.sides)
+
+        stamp_obj = project_mod.load_stamp(library_root, proj.project_id, stamp_id)
+        stamp_obj.perforation.auto = {
+            name: side.to_persisted() for name, side in analysis.sides.items()
+        }
+        stamp_obj.perforation.meta.confidence = analysis.confidence
+        stamp_obj.perforation.meta.warnings = analysis.warnings
+        stamp_obj.perforation.meta.diagnostic_image = "diagnostics/perforation.png"
+        project_mod.save_stamp_results(
+            library_root,
+            proj.project_id,
+            stamp_obj,
+            diagnostics={"perforation.png": diagnostic_png},
+        )
+        n_ok += 1
+        typer.echo(f"{stamp_id}: {notation} (confidence {analysis.confidence:.2f})")
+        for w in analysis.warnings:
+            typer.echo(f"  warning: {w}", err=True)
+
+    typer.echo(f"measured perforation on {n_ok}/{len(stamp_ids)} stamp(s)")
 
 
 if __name__ == "__main__":

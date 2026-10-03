@@ -160,3 +160,28 @@ def test_detect_command_writes_project_and_stamps(tmp_path):
         / f"{sample.sample_id}_overview.png"
     )
     assert overview_path.exists()
+
+    perf_result = runner.invoke(
+        app,
+        [
+            "perf",
+            project.project_id,
+            "--library-root",
+            str(library_root),
+        ],
+    )
+    assert perf_result.exit_code == 0, perf_result.stdout
+    assert "measured perforation on 3/3" in perf_result.stdout
+
+    for stamp_id in sample.stamp_ids:
+        stamp = project_mod.load_stamp(library_root, project.project_id, stamp_id)
+        assert stamp.perforation.auto  # all 4 sides populated
+        assert stamp.perforation.meta.diagnostic_image == "diagnostics/perforation.png"
+        diag_path = (
+            project_mod.project_dir(library_root, project.project_id)
+            / "stamps"
+            / stamp_id
+            / "diagnostics"
+            / "perforation.png"
+        )
+        assert diag_path.exists()
