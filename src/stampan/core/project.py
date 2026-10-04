@@ -186,3 +186,31 @@ def load_stamp_crop(library_root: str | Path, project_id: str, stamp_id: str) ->
 
 def next_stamp_id(sample: Sample, index: int) -> str:
     return f"{sample.sample_id}_stamp{index:03d}"
+
+
+def save_stamp_roi_mask(
+    library_root: str | Path, project_id: str, stamp_id: str, roi_name: str, mask: np.ndarray
+) -> str:
+    """Write a single-channel ROI mask PNG next to stamp.json (the GUI's
+    per-colour inclusion ROIs, SPEC §8.1). Returns the path relative to the
+    project directory, for storing on the owning ``ColourCluster.mask_path``."""
+    import cv2
+
+    stamp_dir = project_dir(library_root, project_id) / "stamps" / stamp_id / "colour_rois"
+    stamp_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"{_slugify(roi_name)}.png"
+    cv2.imwrite(str(stamp_dir / filename), mask)
+    return f"stamps/{stamp_id}/colour_rois/{filename}"
+
+
+def load_stamp_roi_mask(library_root: str | Path, project_id: str, path: str) -> np.ndarray | None:
+    """Load a mask PNG saved by :func:`save_stamp_roi_mask`, given the
+    project-relative path stored on ``ColourCluster.mask_path``."""
+    import cv2
+
+    if not path:
+        return None
+    full_path = project_dir(library_root, project_id) / path
+    if not full_path.exists():
+        return None
+    return cv2.imread(str(full_path), cv2.IMREAD_GRAYSCALE)

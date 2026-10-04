@@ -1,11 +1,18 @@
 """Paper/ink colour analysis in CIELAB D50 (SPEC §8).
 
 Pipeline: interior mask (stamp mask eroded past the perforation zone) minus
-exclusions (cancellation mask, user zones, specular pixels) -> convert to
-Lab D50 via the reference's characterisation model -> Gaussian-mixture
-cluster into paper + N inks -> per-cluster statistics (mean/median/std/
-covariance Lab, circular-mean LCh, core-ink estimate, ΔE00 spread,
-ink-paper ΔE00, Munsell/ISCC-NBS name, display sRGB swatch).
+exclusions (user-drawn zones, specular pixels) -> convert to Lab D50 via the
+reference's characterisation model -> Gaussian-mixture cluster into paper +
+N inks -> per-cluster statistics (mean/median/std/covariance Lab,
+circular-mean LCh, core-ink estimate, ΔE00 spread, ink-paper ΔE00,
+Munsell notation, a philatelic colour name (core.philatelic_colours),
+display sRGB swatch).
+
+There is no automatic cancellation detection feeding into this (an earlier
+classical pipeline was tried and dropped as unreliable). Cancelled/soiled
+areas are kept out of the statistics by having the user select the area to
+analyse directly (``user_inclusion_mask``), not by auto-detecting and
+excluding the cancellation.
 """
 
 from __future__ import annotations
@@ -25,7 +32,22 @@ from scipy import ndimage as ndi
 from sklearn.mixture import GaussianMixture
 
 from stampan.core.models import ColourCluster, ColourResult
-from stampan.core.naming import ISCCNBSTable, name_lab_colour
+from stampan.core.naming import munsell_notation
+from stampan.core.philatelic_colours import (
+    PhilatelicColourEntry,
+    load_philatelic_colours,
+    name_philatelic_colour,
+)
+
+_DEFAULT_PHILATELIC_TABLE: list[PhilatelicColourEntry] | None = None
+
+
+def _default_philatelic_table() -> list[PhilatelicColourEntry]:
+    global _DEFAULT_PHILATELIC_TABLE
+    if _DEFAULT_PHILATELIC_TABLE is None:
+        _DEFAULT_PHILATELIC_TABLE = load_philatelic_colours()
+    return _DEFAULT_PHILATELIC_TABLE
+
 
 _OBSERVER = "CIE 1931 2 Degree Standard Observer"
 _D50_XY = colour.CCS_ILLUMINANTS[_OBSERVER]["D50"]
@@ -97,27 +119,23 @@ def exclude_artifacts(
     crop: np.ndarray,
     lab: np.ndarray,
     mask: np.ndarray,
-    cancel_mask: np.ndarray | None = None,
-    cancel_dilate_mm: float = 0.2,
-    px_per_mm: float = 1.0,
     user_exclusion_mask: np.ndarray | None = None,
     specular_l_threshold: float = DEFAULT_SPECULAR_L_THRESHOLD,
 ) -> tuple[np.ndarray, list[str]]:
-    """Remove the cancellation mask (dilated), user-drawn exclusions, and
-    near-specular pixels from ``mask``. Strip-edge-line exclusion is a
-    documented no-op hook (SPEC mentions it; stamp crops in practice don't
-    carry strip-edge lines once extracted, since those live in the
-    background margin that's already outside the stamp mask)."""
+    """Remove user-drawn exclusions and near-specular pixels from ``mask``.
+
+    There is no automatic cancellation-mask exclusion: an earlier classical
+    cancellation-segmentation pipeline (SPEC §7) was tried and dropped --
+    its output wasn't reliable enough to exclude automatically. Instead, the
+    user selects the area to analyse directly (``analyse_colour``'s
+    ``user_inclusion_mask``, e.g. "just this clean patch of paper" or "just
+    this part of the design ink"), which sidesteps needing to detect
+    cancellation at all. Strip-edge-line exclusion is a documented no-op
+    hook (SPEC mentions it; stamp crops in practice don't carry strip-edge
+    lines once extracted, since those live in the background margin that's
+    already outside the stamp mask)."""
     warnings: list[str] = []
     result = mask.copy()
-
-    if cancel_mask is not None:
-        kernel_px = max(1, int(round(cancel_dilate_mm * px_per_mm)))
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * kernel_px + 1,) * 2)
-        dilated = cv2.dilate(cancel_mask, kernel)
-        result = cv2.bitwise_and(result, cv2.bitwise_not(dilated))
-    else:
-        warnings.append("no cancellation mask given; any cancellation ink counts as 'ink'")
 
     if user_exclusion_mask is not None:
         result = cv2.bitwise_and(result, cv2.bitwise_not(user_exclusion_mask))
@@ -264,12 +282,30 @@ def lab_to_display_srgb(lab: np.ndarray) -> tuple[tuple[int, int, int], bool]:
     return srgb_255, out_of_gamut
 
 
+def lab_image_to_display_rgb(lab: np.ndarray) -> np.ndarray:
+    """Vectorised Lab D50 (H, W, 3) -> display sRGB uint8 (display only,
+    e.g. the report's calibrated stamp photo; never feeds back into
+    measurements). NaN Lab (pixels outside the colour model's trained
+    gamut, SPEC §4.3) is replaced with a neutral mid-grey rather than left
+    to propagate into an invalid-cast warning."""
+    xyz = colour.Lab_to_XYZ(lab, illuminant=_D50_XY)
+    rgb = colour.XYZ_to_RGB(
+        xyz,
+        "sRGB",
+        illuminant=_D50_XY,
+        chromatic_adaptation_transform="Bradford",
+        apply_cctf_encoding=True,
+    )
+    rgb = np.nan_to_num(rgb, nan=0.5, posinf=1.0, neginf=0.0)
+    return (np.clip(rgb, 0.0, 1.0) * 255).astype(np.uint8)
+
+
 def compute_cluster_stats(
     label: str,
     lab_pixels: np.ndarray,  # this cluster's non-mixed pixels
     paper_mean_lab: np.ndarray | None,
     total_pixel_count: int,
-    iscc_table: ISCCNBSTable | None,
+    philatelic_table: list[PhilatelicColourEntry] | None = None,
 ) -> ColourCluster:
     lch = lab_to_lch(lab_pixels[:, None, :])[:, 0, :]
     mean_lab = lab_pixels.mean(axis=0)
@@ -292,13 +328,9 @@ def compute_cluster_stats(
 
     srgb_swatch, out_of_gamut = lab_to_display_srgb(mean_lab)
 
-    munsell_name = None
-    iscc_name = None
-    if iscc_table is not None:
-        naming_result = name_lab_colour(mean_lab, iscc_table)
-        munsell_name = naming_result.munsell
-        if naming_result.iscc_nbs is not None:
-            iscc_name = naming_result.iscc_nbs.level3_name
+    munsell_name = munsell_notation(mean_lab).munsell
+    table = philatelic_table if philatelic_table is not None else _default_philatelic_table()
+    naming_result = name_philatelic_colour(mean_lab, table)
 
     return ColourCluster(
         label=label,
@@ -311,7 +343,8 @@ def compute_cluster_stats(
         delta_e00_spread=de00_spread,
         core_mean_lab=core_mean_lab,
         munsell=munsell_name,
-        iscc_nbs_name=iscc_name,
+        philatelic_name=naming_result.full_name,
+        philatelic_match_delta_e00=naming_result.delta_e00,
         srgb_swatch=srgb_swatch,
         out_of_gamut=out_of_gamut,
     )
@@ -335,6 +368,85 @@ class ColourAnalysis:
     warnings: list[str] = field(default_factory=list)
 
 
+# --------------------------------------------------------------------------
+# Direct ROI measurement (the GUI's primary colour workflow): the user draws
+# one ROI per colour they want measured, and that colour is read directly
+# from it -- no GMM clustering, since the user has already done the
+# separation by hand. GMM-based `analyse_colour` below remains available
+# (the CLI's default, unattended path), but the GUI builds its results this
+# way instead.
+# --------------------------------------------------------------------------
+
+
+def measure_roi_colour(
+    crop: np.ndarray,
+    predict_lab_fn,
+    mask: np.ndarray,
+    label: str,
+    total_pixel_count: int | None = None,
+    philatelic_table: list[PhilatelicColourEntry] | None = None,
+) -> tuple[ColourCluster | None, list[str]]:
+    """Measure one user-drawn ROI directly (SPEC §8, ROI-first colour
+    workflow). ``median_lab`` (already computed by ``compute_cluster_stats``)
+    is the more bleed-through-robust of the two reported means: a minority
+    of mixed-colour pixels at a ROI's edge pulls the mean but not the
+    median. No outlier trimming beyond that -- a cleanly drawn ROI is the
+    primary defence against contamination, not post-hoc statistics.
+    """
+    warnings: list[str] = []
+    lab = rgb_to_lab_d50(crop, predict_lab_fn)
+    rows, cols = np.nonzero(mask)
+    if len(rows) == 0:
+        return None, ["empty ROI; draw a region on the image first"]
+
+    lab_pixels = lab[rows, cols, :]
+    finite = np.all(np.isfinite(lab_pixels), axis=1)
+    if not np.all(finite):
+        n_dropped = int((~finite).sum())
+        warnings.append(
+            f"{n_dropped} pixel(s) outside the colour model's trained gamut (NaN Lab); excluded"
+        )
+        lab_pixels = lab_pixels[finite]
+
+    if len(lab_pixels) < 4:
+        warnings.append(f"only {len(lab_pixels)} pixel(s) in ROI; too few to measure reliably")
+        return None, warnings
+
+    cluster = compute_cluster_stats(
+        label, lab_pixels, None, total_pixel_count or len(rows), philatelic_table
+    )
+    return cluster, warnings
+
+
+def build_colour_result_from_rois(
+    crop: np.ndarray,
+    predict_lab_fn,
+    rois: list[tuple[str, np.ndarray]],
+    philatelic_table: list[PhilatelicColourEntry] | None = None,
+) -> ColourResult:
+    """Assemble a ``ColourResult`` from a list of ``(name, mask)`` ROIs --
+    the GUI's colour workflow. Each ROI is measured independently
+    (``measure_roi_colour``); a ROI that fails (empty/too few pixels) is
+    skipped with its warning kept, not silently dropped."""
+    warnings: list[str] = []
+    clusters: list[ColourCluster] = []
+    stamp_mask = stamp_mask_from_crop(crop)
+    total_pixel_count = int(np.count_nonzero(stamp_mask))
+
+    for name, mask in rois:
+        cluster, roi_warnings = measure_roi_colour(
+            crop, predict_lab_fn, mask, name, total_pixel_count, philatelic_table
+        )
+        warnings.extend(f"{name}: {w}" for w in roi_warnings)
+        if cluster is not None:
+            clusters.append(cluster)
+
+    result = ColourResult(n_inks=len(clusters), clusters=clusters)
+    result.meta.warnings = warnings
+    result.meta.confidence = 1.0 if clusters else 0.0
+    return result
+
+
 def analyse_colour(
     crop: np.ndarray,
     predict_lab_fn,
@@ -343,32 +455,39 @@ def analyse_colour(
     perforation_margin_mm: float = DEFAULT_INTERIOR_MARGIN_MM,
     n_inks: int = 1,
     tau: float = 0.9,
-    cancel_mask: np.ndarray | None = None,
     user_exclusion_mask: np.ndarray | None = None,
     user_inclusion_mask: np.ndarray | None = None,
-    iscc_table: ISCCNBSTable | None = None,
+    philatelic_table: list[PhilatelicColourEntry] | None = None,
     ref_id: str | None = None,
     colour_model_cv_delta_e00: float | None = None,
 ) -> ColourAnalysis:
-    """Full colour pipeline for one stamp crop (SPEC §8)."""
+    """Full colour pipeline for one stamp crop (SPEC §8).
+
+    There is no automatic cancellation exclusion (see the module docstring).
+    When a stamp is cancelled, pass ``user_inclusion_mask`` to restrict the
+    analysis to a cancellation-free area chosen by the user -- this is the
+    intended way to get a clean paper/ink reading on a cancelled stamp, not
+    an optional extra."""
     warnings: list[str] = []
     mask = stamp_mask_from_crop(crop)
     interior = interior_mask(mask, perforation_margin_mm, px_per_mm_x, px_per_mm_y)
 
     lab = rgb_to_lab_d50(crop, predict_lab_fn)
-    px_per_mm_avg = (px_per_mm_x + px_per_mm_y) / 2.0
     analysed, excl_warnings = exclude_artifacts(
         crop,
         lab,
         interior,
-        cancel_mask=cancel_mask,
-        px_per_mm=px_per_mm_avg,
         user_exclusion_mask=user_exclusion_mask,
     )
     warnings.extend(excl_warnings)
 
     if user_inclusion_mask is not None:
         analysed = cv2.bitwise_and(analysed, user_inclusion_mask)
+    else:
+        warnings.append(
+            "no inclusion area selected; analysing the full stamp interior, which may "
+            "include cancellation ink or other artifacts as 'ink'"
+        )
 
     rows, cols = np.nonzero(analysed)
     pixel_coords = np.stack([rows, cols], axis=1)
@@ -427,7 +546,7 @@ def analyse_colour(
         if len(cluster_pixels) == 0:
             warnings.append(f"cluster {name} has no non-mixed pixels")
             continue
-        stats = compute_cluster_stats(name, cluster_pixels, paper_mean, len(rows), iscc_table)
+        stats = compute_cluster_stats(name, cluster_pixels, paper_mean, len(rows), philatelic_table)
         clusters.append(stats)
         cluster_lab_means[name] = np.array(stats.mean_lab)
 
@@ -576,6 +695,106 @@ def render_scatter_plots(analysis: ColourAnalysis) -> bytes:
     return buf.getvalue()
 
 
+def render_roi_scatter(crop: np.ndarray, predict_lab_fn, mask: np.ndarray, label: str) -> bytes:
+    """a*b* and C*-L* scatter of one ROI's own pixels (not aggregated
+    cluster means) -- the per-colour plot shown under the GUI's colour
+    panel when a ROI is selected."""
+    rows, cols = np.nonzero(mask)
+    if len(rows) == 0:
+        return _render_placeholder("empty ROI")
+    lab = rgb_to_lab_d50(crop, predict_lab_fn)
+    lab_pixels = lab[rows, cols, :]
+    finite = np.all(np.isfinite(lab_pixels), axis=1)
+    lab_pixels = lab_pixels[finite]
+    if len(lab_pixels) == 0:
+        return _render_placeholder("no in-gamut pixels in ROI")
+
+    subsample = lab_pixels[
+        np.random.default_rng(0).choice(len(lab_pixels), min(3000, len(lab_pixels)), replace=False)
+    ]
+    mean_lab = lab_pixels.mean(axis=0)
+    swatch_rgb, _ = lab_to_display_srgb(mean_lab)
+    swatch = tuple(v / 255.0 for v in swatch_rgb)
+
+    fig, (ax_ab, ax_cl) = plt.subplots(1, 2, figsize=(7.5, 3.6))
+    ax_ab.scatter(subsample[:, 1], subsample[:, 2], s=3, color=swatch, alpha=0.4)
+    _draw_cov_ellipse(ax_ab, lab_pixels[:, 1:3], swatch)
+    ax_ab.set_xlabel("a*")
+    ax_ab.set_ylabel("b*")
+    ax_ab.set_title(f"{label}: a*b*")
+    ax_ab.axhline(0, color="grey", lw=0.3)
+    ax_ab.axvline(0, color="grey", lw=0.3)
+
+    chroma = np.hypot(subsample[:, 1], subsample[:, 2])
+    ax_cl.scatter(chroma, subsample[:, 0], s=3, color=swatch, alpha=0.4)
+    ax_cl.set_xlabel("C*")
+    ax_cl.set_ylabel("L*")
+    ax_cl.set_title("C*-L*")
+
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=130)
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def render_colour_overview(entries: list[tuple[str, ColourCluster]]) -> bytes:
+    """All given clusters' colours plotted together in CIELAB a*b* and
+    CIELCh (C*-h, polar) -- a cross-stamp comparison, not a per-stamp
+    diagnostic. Typically called with every stamp's ink cluster(s) in a
+    project (SPEC §9/§10), so colours can be compared to each other
+    directly rather than one stamp at a time.
+
+    ``entries`` is ``(label, cluster)``, where ``label`` is whatever the
+    caller wants shown next to the point -- e.g. ``f"{stamp_id}/{cluster.label}"``.
+    """
+    if not entries:
+        return _render_placeholder("no clusters to plot")
+
+    fig = plt.figure(figsize=(11, 5.2))
+    ax_ab = fig.add_subplot(1, 2, 1)
+    ax_lch = fig.add_subplot(1, 2, 2, projection="polar")
+
+    plotted = 0
+    for label, cluster in entries:
+        if cluster.mean_lab is None or cluster.mean_lch is None:
+            continue
+        plotted += 1
+        _lightness, a_star, b_star = cluster.mean_lab
+        swatch = tuple(v / 255.0 for v in (cluster.srgb_swatch or (128, 128, 128)))
+
+        ax_ab.scatter(a_star, b_star, s=36, color=swatch, edgecolor="black", linewidth=0.4)
+        ax_ab.annotate(
+            label, (a_star, b_star), fontsize=6, xytext=(3, 3), textcoords="offset points"
+        )
+
+        _mean_l, chroma, hue = cluster.mean_lch
+        ax_lch.scatter(
+            np.radians(hue), chroma, s=36, color=swatch, edgecolor="black", linewidth=0.4
+        )
+
+    if plotted == 0:
+        plt.close(fig)
+        return _render_placeholder("no clusters with Lab stats to plot")
+
+    ax_ab.set_xlabel("a*")
+    ax_ab.set_ylabel("b*")
+    ax_ab.set_title("CIELAB a*b*")
+    ax_ab.axhline(0, color="grey", lw=0.3)
+    ax_ab.axvline(0, color="grey", lw=0.3)
+    ax_ab.set_aspect("equal", adjustable="datalim")
+
+    ax_lch.set_theta_zero_location("E")
+    ax_lch.set_title("CIELCh (C*, h)", pad=20)
+
+    fig.suptitle(f"Colour overview -- {plotted} cluster(s)")
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=130)
+    plt.close(fig)
+    return buf.getvalue()
+
+
 def _draw_cov_ellipse(ax, xy: np.ndarray, colour_rgb: tuple[float, float, float]) -> None:
     if len(xy) < 3:
         return
@@ -610,7 +829,7 @@ def render_swatch_card(analysis: ColourAnalysis) -> bytes:
             f"Lab=({cluster.mean_lab[0]:.1f}, {cluster.mean_lab[1]:.1f}, "
             f"{cluster.mean_lab[2]:.1f})  dE00 spread={cluster.delta_e00_spread:.2f}  "
             f"area={cluster.area_fraction * 100:.1f}%\n"
-            f"Munsell: {cluster.munsell or 'n/a'}   ISCC-NBS: {cluster.iscc_nbs_name or 'n/a'}"
+            f"Munsell: {cluster.munsell or 'n/a'}   {cluster.philatelic_name or 'n/a'}"
         )
         ax.text(1.15, 0.5, text, fontsize=7, va="center", transform=ax.transAxes)
         ax.set_xlim(0, 4)

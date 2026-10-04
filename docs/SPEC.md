@@ -8,10 +8,12 @@ The application measures postage stamps from flatbed scans with known geometric 
 colorimetric calibration. For every stamp it determines:
 
 1. **Perforation gauge per side**, as teeth per 20 mm, or imperforate.
-2. **Cancellation**, as an optional segmentation mask with its colour.
-3. **Colour**: paper colour and N ink colours (usually N = 1) in CIELAB/LCh D50,
-   with dispersion statistics, ΔE00 values and ISCC–NBS names.
-4. **Geometry**: stamp dimensions in mm.
+2. **Colour**: paper colour and N ink colours (usually N = 1) in CIELAB/LCh D50,
+   with dispersion statistics, ΔE00 values and a philatelic colour name (§9, not
+   ISCC–NBS), measured over a user-selected inclusion area so a cancellation doesn't
+   contaminate the reading (§7: automatic cancellation segmentation was tried and
+   dropped).
+3. **Geometry**: stamp dimensions in mm.
 
 It then produces a PDF report with one page per stamp and an overview page.
 
@@ -66,9 +68,9 @@ stampan/
       reference.py      # Reference object: save/load/verify
     detection.py        # stamp detection + rotated crops
     perforation.py
-    cancellation.py
     colour.py           # masks, clustering, statistics
-    naming.py           # Munsell + ISCC–NBS
+    naming.py           # Munsell notation
+    philatelic_colours.py   # Lab -> philatelic colour name (§9, replaces ISCC–NBS)
     project.py          # sample/project persistence
     report/             # Jinja2 templates + WeasyPrint
   cli.py                # `stampan` command (typer or argparse)
@@ -216,6 +218,17 @@ Definition: gauge = number of perforation holes (equivalently, teeth) per 20 mm.
 The plausible range is 6–18. **Imperforate** sides are reported as `imperf` (gauge 0)
 and straight-edged sheet-margin sides as `straight edge`.
 
+**Condition and multiplicity (added 2026-10-04, not yet consumed by the algorithm
+below).** `Stamp.condition` (`on_paper` | `soaked_off` | unrecorded) and
+`Stamp.multiplicity` (`single` | `pair` | `strip` | `block`, with `multiplicity_count`
+for the latter three) are now captured on the Stamp tab, since they change which
+perforation approach is even correct: an on-paper specimen's measured edge is
+contaminated by the backing paper's own cut/torn edge, not just the stamp's own
+perforation; a block/pair/strip shares perforation lines between neighbours rather
+than having four free edges. Neither is wired into §6.1's algorithm yet -- that's the
+next step, not done in this pass. Both default to `None` ("not recorded"), never
+assumed, since guessing wrong here would silently apply the wrong algorithm.
+
 ### 6.1 Algorithm per side
 
 1. Segment the stamp, paper included, against the black background (threshold on the
@@ -277,50 +290,30 @@ chosen peak.
   edges. Requirement: |error| < 0.05 gauge for all sides with at least 10 holes.
 - **Real tests:** compare with René's hand-gauged stamps (§11).
 
-## 7. Cancellation (optional per stamp)
+## 7. Cancellation -- dropped
 
-Cancellation inks are mostly black or dark grey, sometimes blue/violet or red, and
-sometimes faint. They overlie both the design ink and the paper.
+**Status (2026-10-03): removed.** A classical pipeline (colour-model outlier map +
+cancel-colour priors + Hough circle/line shape evidence + hysteresis fusion) was
+built and run against the real stamps in `testdata/`. It did not produce reliable
+masks: most real stamps came back flagged as the pipeline's own "ill-posed" case
+(detected cancel colour too close to the design ink to separate), and the few
+confident results weren't trustworthy on inspection. Rather than keep an automatic
+step that the user cannot rely on, cancellation detection -- automatic or
+hint-assisted -- is out of scope for this project. `core/cancellation.py` and its
+tests were deleted; `Stamp.cancellation` no longer exists.
 
-### 7.1 Classical pipeline (v1)
+**Replacement approach:** §8.1's inclusion ROI is now the primary (not optional)
+way to get a clean colour reading on a cancelled stamp. The user selects a region
+that is unambiguously *only* the colour they want measured (a clean patch of paper,
+or a clean patch of design ink, away from any cancellation), via
+`analyse_colour`'s `user_inclusion_mask` (CLI: `stampan colour --include-rect`,
+GUI: Phase 7's inclusion ROI tool). `analyse_colour` warns when no inclusion area
+is given, since the full stamp interior may then include cancellation ink
+miscounted as a design-ink cluster.
 
-1. Work in CIELAB (from the characterised image) inside the stamp interior mask.
-2. Optional user hint: an ellipse or circle where the cancellation (datestamp) is.
-   Inside the hint, the detector's prior is raised; outside it, lowered.
-3. Candidate pixels are those that are not explained by the paper or design-ink
-   clusters. Initialise the clusters from the colour module (§8) with k = paper +
-   inks, then flag pixels with low likelihood under those clusters, or pixels
-   matching a cancel-colour prior (low L* with low C* for black, or a hue window
-   for blue/violet/red).
-4. Shape cues: Hough circles and arcs for circular datestamps, line and bar detection
-   for obliterators, and the connectedness and stroke width of the candidate regions.
-5. Combine the evidence into a probability map and threshold it with hysteresis. The
-   threshold can be adjusted with a slider in the GUI.
-6. Faint cancellations: local contrast normalisation on the Lab difference from the
-   expected ink/paper colour.
-
-When the cancel colour is close to the ink colour (black cancel on dark ink), the
-problem is ill-posed. The module must report low confidence in that case and not
-pretend.
-
-### 7.2 Manual editing
-
-The user can add or remove mask regions with a brush or lasso. The mask is stored as
-a PNG next to the auto mask.
-
-### 7.3 Outputs
-
-- The mask, plus the mean colour of the cancellation (Lab/LCh) and a cancel-colour
-  class (black / blue / violet / red / other).
-- A visualisation: the stamp rendered very light and desaturated (L* raised, C*
-  reduced), with the cancellation in its own colour, darkened, on top. Also an
-  "isolated cancellation" image on white.
-
-### 7.4 Future
-
-The mask interface must let a learned segmenter replace the classical one later
-(SAM-assisted annotation, or a small U-Net trained on corrected masks). Store every
-manually corrected mask together with its crop, so a training set accumulates for free.
+If cancellation segmentation is revisited later, a learned approach (SAM-assisted
+annotation or a small trained segmenter) is likely the right starting point rather
+than another classical pipeline -- but that is explicitly future work, not planned.
 
 ## 8. Colour
 
@@ -328,12 +321,14 @@ manually corrected mask together with its crop, so a training set accumulates fo
 
 - Interior mask: the stamp mask eroded inward past the perforation zone (hole-bottom
   line plus a margin of ≥ 0.3 mm). Imperforate sides use an equivalent margin.
-- Exclusions: the cancellation mask dilated by about 0.2 mm (if the cancellation step
-  ran; otherwise the cancellation counts as ink and the report says so), any
-  user-drawn exclusion zones (repairs, stains, hinge remnants showing through), and
-  specular or glassine artefacts (pixels near saturation, strip-edge lines).
-- The user can also draw an **inclusion ROI** to restrict the analysis, e.g. to the
-  frame only.
+- Exclusions: any user-drawn exclusion zones (repairs, stains, hinge remnants
+  showing through), and specular or glassine artefacts (pixels near saturation,
+  strip-edge lines). There is no automatic cancellation exclusion (§7).
+- **Inclusion ROI**, the primary tool for a cancelled stamp: the user draws a region
+  that is unambiguously only the colour they want measured (clean paper, or clean
+  design ink), restricting the analysis to it. Without one, the full stamp interior
+  is analysed and a cancellation counts as ink; `analyse_colour` warns when this
+  happens.
 
 ### 8.2 Colour space
 
@@ -343,8 +338,7 @@ the cylindrical, HSL-like view René asked for. ΔE00 is the difference metric.
 
 ### 8.3 Clustering
 
-- k = 1 (paper) + N inks. N is chosen by the user, default 1. Optionally include a
-  cancellation class if no cancellation mask exists.
+- k = 1 (paper) + N inks. N is chosen by the user, default 1.
 - Method: a **Gaussian mixture model** in Lab (full covariance), initialised by
   k-means. Subsample for fitting (e.g. 200k pixels), then predict all pixels.
 - Cluster identity: paper is the cluster with the highest L* and lowest C*. The user
@@ -393,37 +387,44 @@ them into `testdata/colour_key/` when needed. They can become a named reference-
 set once they are measured with the same pipeline. Do **not** reuse the existing
 `color_key_calibrated.csv` (§13): its Lab values are systematically biased.
 
-## 9. Colour naming (ISCC–NBS)
+## 9. Colour naming (philatelic reference, not ISCC–NBS)
 
-Use the proper ISCC–NBS block system, not the nearest centroid:
+**Status (2026-10-04): ISCC–NBS dropped.** The original plan used Centore's ISCC–NBS
+block-boundary system (`reference_data/iscc_nbs/`) for colour naming. René flagged
+this as flawed for stamp work and asked for a dedicated reference built from
+stamp-catalogue/printing-ink vocabulary instead (carmine, ultramarine, cobalt blue,
+...), combined with an ISCC–NBS-*like* structure (a lightness/chroma modifier
+composed with a hue name) rather than Centore's block geometry. `reference_data/
+iscc_nbs/` has been deleted; nothing in the codebase references it.
 
-1. Lab D50 → XYZ D50 → chromatic adaptation (CAT02 or Bradford; document which) to
-   **illuminant C** → xyY.
-2. xyY → Munsell (`colour.notation.munsell.xyY_to_munsell_colour`, based on the
-   renotation data). Handle failures outside the renotation gamut gracefully: report
-   "outside Munsell renotation range".
-3. Munsell → ISCC–NBS Level 1/2/3 category and name with Centore's block-boundary
-   implementation. The sources are in `reference_data/iscc_nbs/`:
-   - `MunsellToISCCNBS.m`: Centore's MATLAB original (**the authority**)
-   - `MunsellToISCCNBS_adapt.m` and `MunsellToISCCNBS_adapt.py`: René's adaptation and
-     Python port
-   - `ISCCNBSnameFromNumber.m` and `color_names.txt`: Level 1/2/3 designators and
-     abbreviations
-   - `xyYtoMunsell.m`: Centore's xyY → Munsell, as a cross-check for colour-science
+1. Munsell notation is still computed as before (`core/naming.py`): Lab D50 → XYZ D50
+   → Bradford chromatic adaptation to **illuminant C** → xyY →
+   `colour.notation.munsell.xyY_to_munsell_colour`. This stands on its own as a
+   standard scientific colour specification; it no longer feeds a name lookup.
+2. Naming goes through `core/philatelic_colours.py` instead, directly from Lab (no
+   Munsell step): nearest reference colour by ΔE00 against
+   `reference_data/philatelic_colours.csv`, then a modifier ("pale"/"light",
+   "dark"/"deep", "grayish", "vivid") from how the input's L*/C* compare to the
+   matched entry's own L*/C* — e.g. "deep carmine", "grayish ultramarine".
+3. **Provenance caveat, load-bearing for anyone using this for catalogue work:** the
+   reference table is a compilation from general colour-science/printing-ink
+   knowledge of what these classic names typically look like on paper. It is *not*
+   digitised from a specific philatelic catalogue (Yvert, Stanley Gibbons, Michel) or
+   measured from real ink swatches. Good for a human-readable, domain-appropriate name
+   and for comparing stamps to each other; not yet calibrated catalogue ground truth.
+   Replacing or extending the CSV with measured/catalogue-sourced values is the
+   intended upgrade path if exact catalogue-colour matching is needed later.
+4. Output: the full name (e.g. "deep grayish bluish green"), the matched reference
+   entry's own name and family, the ΔE00 to that match (how confident the name is —
+   surfaced, not hidden), and the Munsell notation.
+5. **Colour overview** (SPEC §10 extension, requested by René): all of a project's
+   ink clusters (across every stamp) plotted together in CIELAB a*b* and CIELCh
+   (C*-h polar), via `core.colour.render_colour_overview`. Embedded as its own section
+   on the report's overview page and also written standalone as
+   `<project>/colour_overview.png`, so stamps can be compared to each other directly,
+   not just read one at a time.
 
-   A second, **diverging** Python port exists in
-   `../ColorIdentification/color_detect_gui/stampcolor/color_func.py`
-   (`munsellToISCCNBS`). It returns different Level-3 indices for the same hue band, so at
-   least one of the two ports is wrong. Port fresh from the MATLAB original (or verify
-   one existing port line by line against it), and wrap it in a clean module with tests.
-
-   Regression test: Centore's sRGB → Munsell → ISCC–NBS table,
-   `../rnd_projects/rgb_to_munsell/sRGBToMunsellAndISCCNBS.csv` (~135k rows). It tests
-   the whole chain sRGB → XYZ → illuminant C → Munsell → ISCC–NBS.
-4. Output: the Level 3 name (e.g. "dark grayish bluish green"), the abbreviation, the
-   Level 1/2 names and the Munsell notation (e.g. "7.5BG 3.2/2.1").
-
-Note on the report that ISCC–NBS assumes illuminant C viewing.
+Note on the report that the Munsell notation assumes illuminant C viewing.
 
 ## 10. Report
 
@@ -432,7 +433,7 @@ Generated with Jinja2 + WeasyPrint, A4.
 **Overview page(s):** project name, date, reference used (ID, date, colour-model CV
 ΔE00, scale uncertainty), and the known limitations (glassine, gloss). Then a table
 of all stamps: thumbnail, ID/catalogue number, gauge notation, ink name, ink LCh,
-paper LCh, cancellation yes/no, and flags (low confidence, manual override).
+paper LCh, and flags (low confidence, manual override).
 
 **One page per stamp (as much information as fits cleanly):**
 
@@ -443,9 +444,9 @@ paper LCh, cancellation yes/no, and flags (low confidence, manual override).
 - Perforation: the annotated diagnostic image, a per-side table (gauge ± u, notation,
   hole count, regularity, hole diameter, auto/manual, confidence), and the compound
   notation.
-- Cancellation (if run): the isolated cancellation image plus its colour and class.
 - Colour: swatches for paper and ink(s); a table of L*, C*, h, a*, b* (mean ± std),
-  the ΔE00 spread, ink-paper ΔE00, Munsell and ISCC–NBS name; a small a*b* scatter
+  the ΔE00 spread, ink-paper ΔE00, Munsell notation and philatelic colour name (§9,
+  with its match ΔE00); a small a*b* scatter
   plot and a C*–L* plot with the cluster ellipses; the mixed-pixel fraction; and the τ
   used.
 - Footer: software version, reference ID, and a hash of the analysis parameters.
@@ -470,11 +471,13 @@ Also export all results as CSV and JSON.
 - **Main window.** The left side has a library tree (References / Projects → Samples
   → Stamps). The centre has an image viewer (QGraphicsView): smooth zoom and pan,
   a pixel readout (px, mm, RGB, Lab), and overlay layers. The right side has a
-  context panel with tabs: Detection, Perforation, Cancellation, Colour, Notes.
+  context panel with tabs: Detection, Perforation, Colour, Notes.
 - **Viewer tools:** rotated rectangle, ellipse, polygon, point markers, brush/lasso
-  (add/remove), and inclusion/exclusion ROIs. Every tool has undo/redo.
-- **Workflow mode:** a step bar (Reference → Scan → Detect → per stamp: Perf → Cancel
-  → Colour → Report), with per-stamp status icons (todo / auto / reviewed / manual).
+  (add/remove), and inclusion/exclusion ROIs -- the inclusion ROI is how the user
+  selects a clean, cancellation-free area for Colour to analyse (§7, §8.1). Every
+  tool has undo/redo.
+- **Workflow mode:** a step bar (Reference → Scan → Detect → per stamp: Perf →
+  Colour → Report), with per-stamp status icons (todo / auto / reviewed / manual).
 - Long computations run in worker threads with progress and cancel.
 - Display colour management: display sRGB is computed from Lab (assume an sRGB
   monitor). The display never feeds back into measurements.
@@ -495,7 +498,15 @@ colour maths is wrong for this application. Paths below are relative to `stamp_a
 | `../ColorIdentification/color_detect_web` | JS/plotly version | 3D plotly ideas only | n/a |
 | `../ColorIdentification/color_detect_gui/icc_profiles/epson1200u.icc` | A 105 kB LUT input profile (scnrRGB → Lab, description "it8-target-scan", Perfection 1200U), made earlier from an IT8 scan with unknown settings | A cross-check for the new characterisation (§4.3) | It is not the reference. `../rnd_projects/icc_profile/icc_profiles/icc_profile_epson1200u.icm` (16 kB) is a different, simpler profile. |
 | `../rnd_projects/color_spaces/calibration.ipynb` | René's notes on SANE raw capture (all automatic processing off) and a `LinearNDInterpolator` idea | The capture checklist (it matches §2/§4.1). The interpolator becomes candidate model (d) in §4.3. | n/a |
-| `../rnd_projects/rgb_to_munsell/sRGBToMunsellAndISCCNBS.csv` | Centore's conversion table | The regression test for §9 | n/a |
+| `../rnd_projects/rgb_to_munsell/sRGBToMunsellAndISCCNBS.csv` | Centore's conversion table | n/a (§9 no longer uses ISCC–NBS) | n/a |
+
+Note (2026-10-04): the rows above that point at ISCC–NBS as "the authority" for colour
+naming are superseded by §9's decision to drop it. `../ColorIdentification/color_key`'s
+"200 colour names and the idea" is now the more relevant lead if
+`reference_data/philatelic_colours.csv` is ever upgraded with catalogue-sourced
+values -- but per that row's own warning, `color_key_calibrated.csv`'s Lab values
+are themselves biased and would need re-measuring through this project's own
+characterisation pipeline first, not copied as-is.
 | `../rnd_projects/stamp_feature_detect`, `../__android` | Machin template matching; an Android skeleton with a mocked perforation result | Out of scope | n/a |
 
 Do not modify anything outside `stamp_analyzer/` (which now also contains `testdata/`).

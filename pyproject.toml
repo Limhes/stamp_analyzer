@@ -1,7 +1,7 @@
 [project]
 name = "stampan"
 version = "0.1.0"
-description = "Calibrated measurement of postage stamps from flatbed scans: perforation gauge, cancellation segmentation, and CIELAB/ISCC-NBS colour."
+description = "Calibrated measurement of postage stamps from flatbed scans: perforation gauge and CIELAB/ISCC-NBS colour."
 authors = [
     { name = "Rene Becker", email = "accounts@limhes.net" }
 ]

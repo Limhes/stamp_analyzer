@@ -1,0 +1,45 @@
+name,family,hex,L,a,b
+black,neutral,#1a1a1a,9.26,0.00,0.00
+grey,neutral,#808080,53.59,0.00,0.00
+white,neutral,#f2f2ee,95.41,-0.51,1.94
+carmine,red,#96131f,32.56,51.90,31.54
+rose,red,#c06080,53.41,41.80,0.89
+rose red,red,#b23a52,43.43,50.51,14.36
+crimson,red,#8c1c3c,31.67,47.77,11.11
+scarlet,red,#c62a1e,44.66,60.31,47.32
+vermilion,red,#c7401f,47.58,53.37,49.24
+red,red,#a4231c,36.99,51.96,38.68
+brick red,red,#9a3324,37.24,43.06,33.62
+orange,orange,#c96a1e,55.49,35.15,55.99
+orange brown,orange,#9a5a28,45.15,23.94,39.49
+chrome yellow,yellow,#d9a518,71.19,11.66,70.38
+yellow,yellow,#cbb226,73.10,-0.69,67.73
+orange yellow,yellow,#d08d1e,64.33,20.18,63.27
+olive,yellow-green,#6f6c28,44.82,-5.72,37.23
+olive green,yellow-green,#5a6b2a,42.70,-14.60,33.34
+olive brown,yellow-green,#6a5a2e,39.07,2.24,27.65
+yellow green,yellow-green,#7a8c3a,55.47,-16.12,40.50
+green,green,#2e6b3e,40.31,-28.88,19.03
+emerald,green,#2f8f5e,52.95,-38.09,17.65
+myrtle green,green,#1f4a38,27.99,-19.45,6.04
+blue green,blue-green,#1f7a6e,45.91,-29.43,-1.40
+turquoise,blue-green,#2e8f8a,53.86,-29.79,-6.01
+blue,blue,#1f4e8c,32.61,1.86,-39.82
+ultramarine,blue,#20267a,19.60,21.93,-49.62
+cobalt blue,blue,#1a4f9c,33.67,5.95,-47.81
+prussian blue,blue,#17334a,19.96,-4.52,-17.71
+indigo,blue,#2e2566,18.97,19.50,-37.70
+dull blue,blue,#3a4f6e,32.90,-1.34,-20.72
+violet,violet,#5a3e7a,31.60,22.47,-29.98
+purple,violet,#6a2e5e,29.01,32.26,-15.99
+mauve,violet,#8a6080,46.11,21.59,-10.82
+lilac,violet,#8a76a0,52.70,14.37,-19.74
+magenta,red-violet,#9c2e5e,37.90,48.86,-1.63
+lake,red,#7a1c2e,27.65,41.36,14.32
+claret,red,#6a1f33,24.92,35.01,6.60
+brown,brown,#6b4226,32.47,16.09,24.57
+red brown,brown,#7a3626,32.01,29.39,24.78
+chocolate,brown,#4a2e1e,22.16,11.76,15.82
+sepia,brown,#4a3626,24.59,7.47,13.72
+bistre,brown,#3a2c1e,19.33,4.98,11.69
+slate,neutral,#53606e,40.01,-2.58,-9.74

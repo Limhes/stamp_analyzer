@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{{ report.project_name }} -- Stamp Analyzer report</title>
+<style>
+  @page {
+    size: A4;
+    margin: 16mm 14mm;
+    @bottom-right { content: "page " counter(page) " / " counter(pages); font-size: 8pt; color: #666; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: "DejaVu Sans", "Helvetica Neue", Arial, sans-serif;
+    font-size: 9.5pt;
+    color: #1a1a1a;
+    line-height: 1.35;
+  }
+  h1 { font-size: 16pt; margin: 0 0 2mm 0; }
+  h2 { font-size: 12pt; margin: 0 0 2mm 0; border-bottom: 0.5pt solid #999; padding-bottom: 1mm; }
+  h3 { font-size: 10pt; margin: 3mm 0 1mm 0; }
+  .muted { color: #666; }
+  .mono { font-variant-numeric: tabular-nums; }
+  table { border-collapse: collapse; width: 100%; margin: 2mm 0; }
+  th, td { text-align: left; padding: 1mm 2mm; font-size: 8.5pt; }
+  thead th { border-bottom: 0.75pt solid #333; font-weight: 600; }
+  tbody tr { border-bottom: 0.25pt solid #ddd; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .swatch { display: inline-block; width: 4mm; height: 4mm; border: 0.25pt solid #999; vertical-align: middle; margin-right: 1.5mm; }
+  .flag { display: inline-block; background: #fdeeca; border: 0.25pt solid #e0b84c; color: #6b4e00; padding: 0.3mm 1.5mm; border-radius: 1mm; font-size: 7.5pt; margin-right: 1mm; }
+  .warning { color: #9a4b00; font-size: 8pt; }
+  .overview-header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4mm; }
+  .stamp-page { page-break-before: always; }
+  .stamp-header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 2mm; }
+  .stamp-body { display: flex; gap: 5mm; }
+  .stamp-image-col { flex: 0 0 55mm; }
+  .stamp-image-col img { width: 100%; border: 0.25pt solid #ccc; }
+  .stamp-data-col { flex: 1; min-width: 0; }
+  .diag-row { display: flex; gap: 3mm; margin: 2mm 0; }
+  .diag-row img { max-width: 100%; border: 0.25pt solid #ccc; }
+  .diag-row > div { flex: 1; min-width: 0; }
+  footer.page-footer { margin-top: 4mm; font-size: 7.5pt; color: #888; border-top: 0.25pt solid #ccc; padding-top: 1mm; }
+</style>
+</head>
+<body>
+
+<section>
+  <div class="overview-header">
+    <div>
+      <h1>{{ report.project_name }}</h1>
+      <div class="muted">Stamp Analyzer report -- generated {{ report.generated_at }}</div>
+    </div>
+    <div class="muted">v{{ report.software_version }}</div>
+  </div>
+
+  <h2>References used</h2>
+  <table>
+    <thead>
+      <tr><th>ID</th><th>Name</th><th>Created</th><th>Colour model</th><th class="num">CV &Delta;E00 (mean)</th><th class="num">Scale uncertainty (px/mm)</th></tr>
+    </thead>
+    <tbody>
+      {% for ref in report.references %}
+      <tr>
+        <td class="mono">{{ ref.ref_id }}</td>
+        <td>{{ ref.name }}</td>
+        <td>{{ ref.created }}</td>
+        <td>{{ ref.colour_model_kind }}</td>
+        <td class="num">{{ ref.cv_delta_e00_mean }}</td>
+        <td class="num">{{ ref.scale_uncertainty }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  {% if report.notes %}
+  <p class="warning">
+    {% for note in report.notes %}{{ note }}<br>{% endfor %}
+  </p>
+  {% endif %}
+
+  <h2>Stamps ({{ report.stamps|length }})</h2>
+  <table>
+    <thead>
+      <tr>
+        <th></th><th>ID</th><th>Catalogue</th><th>Gauge</th>
+        <th>Ink</th><th class="num">Ink L* C* h</th><th>Paper</th><th class="num">Paper L* C* h</th>
+        <th>Flags</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for s in report.stamps %}
+      {% set paper = s.colour_rows | selectattr("label", "equalto", "paper") | first %}
+      {% set ink = s.colour_rows | rejectattr("label", "equalto", "paper") | first %}
+      <tr>
+        <td>{% if s.crop_image %}<img src="{{ s.crop_image }}" style="width:10mm;">{% endif %}</td>
+        <td class="mono">{{ s.stamp_id }}</td>
+        <td>{{ s.catalogue_numbers | join(", ") }}</td>
+        <td>{{ s.perforation_notation }}</td>
+        <td>{% if ink %}<span class="swatch" style="background:{{ ink.swatch_hex }};"></span>{{ ink.philatelic_name }}{% endif %}</td>
+        <td class="num">{% if ink %}{{ ink.lightness }} / {{ ink.chroma }} / {{ ink.hue }}{% endif %}</td>
+        <td>{% if paper %}<span class="swatch" style="background:{{ paper.swatch_hex }};"></span>{{ paper.philatelic_name }}{% endif %}</td>
+        <td class="num">{% if paper %}{{ paper.lightness }} / {{ paper.chroma }} / {{ paper.hue }}{% endif %}</td>
+        <td>{% for f in s.flags %}<span class="flag">{{ f }}</span>{% endfor %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  {% if report.colour_overview_image %}
+  <h2>Colour overview -- all inks</h2>
+  <img src="{{ report.colour_overview_image }}" style="width:100%; max-width:180mm;">
+  {% endif %}
+</section>
+
+{% for s in report.stamps %}
+<section class="stamp-page">
+  <div class="stamp-header">
+    <div>
+      <h2>{{ s.stamp_id }}{% if s.catalogue_numbers %} -- {{ s.catalogue_numbers | join(", ") }}{% endif %}</h2>
+      <div class="muted">{{ s.country_issue or "" }}{% if s.notes %} &middot; {{ s.notes }}{% endif %}</div>
+    </div>
+    <div>{% for f in s.flags %}<span class="flag">{{ f }}</span>{% endfor %}</div>
+  </div>
+
+  <div class="stamp-body">
+    <div class="stamp-image-col">
+      {% if s.crop_image %}<img src="{{ s.crop_image }}">{% endif %}
+      <div class="muted" style="margin-top:1mm;">{{ s.width_mm }} &times; {{ s.height_mm }}</div>
+    </div>
+    <div class="stamp-data-col">
+
+      <h3>Perforation -- {{ s.perforation_notation }} <span class="muted">(confidence {{ "%.2f"|format(s.perforation_confidence) }})</span></h3>
+      <table>
+        <thead>
+          <tr><th>Side</th><th>Kind</th><th>Gauge</th><th>Notation</th><th class="num">Holes</th><th class="num">Diameter</th><th class="num">Regularity</th><th>Source</th></tr>
+        </thead>
+        <tbody>
+          {% for row in s.perforation_rows %}
+          <tr>
+            <td>{{ row.side }}</td>
+            <td>{{ row.kind }}</td>
+            <td class="num">{{ row.gauge }}</td>
+            <td>{{ row.notation }}</td>
+            <td class="num">{{ row.hole_count }}</td>
+            <td class="num">{{ row.hole_diameter_mm }}</td>
+            <td class="num">{{ row.regularity_mm }}</td>
+            <td>{{ row.source }}{% if row.manual_reason %} <span class="muted">({{ row.manual_reason }})</span>{% endif %}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% if s.perforation_diagnostic %}
+      <div class="diag-row"><div><img src="{{ s.perforation_diagnostic }}"></div></div>
+      {% endif %}
+      {% for w in s.perforation_warnings %}<div class="warning">{{ w }}</div>{% endfor %}
+
+      <h3>Colour -- N={{ s.n_inks }}, &tau;={{ s.tau }} <span class="muted">(confidence {{ "%.2f"|format(s.colour_confidence) }}, {{ s.mixed_pixel_fraction }} mixed pixels)</span></h3>
+      <table>
+        <thead>
+          <tr>
+            <th></th><th>Cluster</th><th class="num">L*</th><th class="num">C*</th><th class="num">h</th>
+            <th class="num">a*</th><th class="num">b*</th><th class="num">&Delta;E00 spread</th>
+            <th class="num">core &Delta;E</th><th>Munsell</th><th>Philatelic name</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in s.colour_rows %}
+          <tr>
+            <td><span class="swatch" style="background:{{ row.swatch_hex }};"></span></td>
+            <td>{{ row.label }}{% if row.out_of_gamut %} <span class="muted">(display out of gamut)</span>{% endif %}</td>
+            <td class="num">{{ row.lightness }}</td>
+            <td class="num">{{ row.chroma }}</td>
+            <td class="num">{{ row.hue }}</td>
+            <td class="num">{{ row.a_star }}</td>
+            <td class="num">{{ row.b_star }}</td>
+            <td class="num">{{ row.delta_e00_spread }}</td>
+            <td class="num">{{ row.core_delta_e or "—" }}</td>
+            <td>{{ row.munsell }}</td>
+            <td>{{ row.philatelic_name }} <span class="muted">(&Delta;E00={{ row.philatelic_match_delta_e00 }})</span></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% if s.ink_paper_delta_e00 %}
+      <div class="muted">Ink-paper &Delta;E00: {% for k, v in s.ink_paper_delta_e00.items() %}{{ k }}={{ v }} {% endfor %}</div>
+      {% endif %}
+      {% if s.colour_cluster_image or s.colour_scatter_image %}
+      <div class="diag-row">
+        {% if s.colour_cluster_image %}<div><img src="{{ s.colour_cluster_image }}"></div>{% endif %}
+        {% if s.colour_scatter_image %}<div><img src="{{ s.colour_scatter_image }}"></div>{% endif %}
+      </div>
+      {% endif %}
+      {% for w in s.colour_warnings %}<div class="warning">{{ w }}</div>{% endfor %}
+
+    </div>
+  </div>
+
+  <footer class="page-footer">Stamp Analyzer v{{ report.software_version }} &middot; {{ s.stamp_id }} &middot; generated {{ report.generated_at }}</footer>
+</section>
+{% endfor %}
+
+</body>
+</html>

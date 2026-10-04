@@ -12,13 +12,13 @@ from stampan import __version__
 from stampan.core import colour as colour_mod
 from stampan.core import detection as detection_mod
 from stampan.core import perforation as perforation_mod
+from stampan.core import philatelic_colours as philatelic_colours_mod
 from stampan.core import project as project_mod
 from stampan.core import scanner as scanner_mod
 from stampan.core.calibration import it8 as it8_mod
 from stampan.core.calibration import reference as ref_mod
 from stampan.core.io import ScanMetadata, read_tiff
 from stampan.core.models import GeometryResult, Stamp
-from stampan.core.naming import load_iscc_nbs_table
 
 app = typer.Typer(
     name="stampan",
@@ -30,7 +30,7 @@ app.add_typer(reference_app, name="reference")
 
 DEFAULT_LIBRARY_ROOT = Path.home() / "StampAnalyzer"
 DEFAULT_CGATS_PATH = Path("reference_data") / "R240103.txt"
-DEFAULT_ISCC_TABLE_PATH = Path("reference_data") / "iscc_nbs" / "color_names.txt"
+DEFAULT_PHILATELIC_TABLE_PATH = philatelic_colours_mod.DEFAULT_TABLE_PATH
 DEFAULT_INTERIOR_MARGIN_MM = 0.6  # typical perforation depth (~0.3-0.5mm) + 0.3mm safety
 
 
@@ -359,11 +359,20 @@ def perf(
         px_per_mm_x, px_per_mm_y = scale
 
         crop = project_mod.load_stamp_crop(library_root, proj.project_id, stamp_id)
-        analysis = perforation_mod.analyse_perforation(crop, px_per_mm_x, px_per_mm_y)
+        stamp_obj = project_mod.load_stamp(library_root, proj.project_id, stamp_id)
+        analysis = perforation_mod.analyse_perforation(
+            crop,
+            px_per_mm_x,
+            px_per_mm_y,
+            manual_roi=stamp_obj.perforation.roi_override_mm or None,
+            manual_box_px=stamp_obj.perforation.box_override_px,
+            condition=stamp_obj.condition,
+            multiplicity=stamp_obj.multiplicity,
+            multiplicity_count=stamp_obj.multiplicity_count,
+        )
         diagnostic_png = perforation_mod.render_diagnostic(crop, analysis)
         notation = perforation_mod.perforation_result_notation(analysis.sides)
 
-        stamp_obj = project_mod.load_stamp(library_root, proj.project_id, stamp_id)
         stamp_obj.perforation.auto = {
             name: side.to_persisted() for name, side in analysis.sides.items()
         }
@@ -394,12 +403,53 @@ def colour(
         DEFAULT_INTERIOR_MARGIN_MM,
         help="Interior-mask margin past the stamp edge, in mm (SPEC §8.1).",
     ),
-    iscc_table_path: Path = typer.Option(DEFAULT_ISCC_TABLE_PATH, help="ISCC-NBS name table."),
+    philatelic_table_path: Path = typer.Option(
+        DEFAULT_PHILATELIC_TABLE_PATH, help="Philatelic colour-name reference (SPEC §9)."
+    ),
+    include_rect: str | None = typer.Option(
+        None,
+        "--include-rect",
+        help=(
+            "Restrict analysis to this crop-px rectangle 'x0,y0,x1,y1' -- e.g. a clean "
+            "patch of paper or design ink, away from any cancellation (SPEC §8.1's "
+            "inclusion ROI; there is no automatic cancellation exclusion, see colour.py)."
+        ),
+    ),
+    include_mask: Path | None = typer.Option(
+        None,
+        "--include-mask",
+        help=(
+            "Restrict analysis to this single-channel mask PNG (same px size as the "
+            "crop; nonzero = included) -- for an arbitrary (non-rectangular) inclusion "
+            "ROI, e.g. one drawn in the GUI. Mutually exclusive with --include-rect."
+        ),
+    ),
     library_root: Path = typer.Option(DEFAULT_LIBRARY_ROOT),
 ) -> None:
     """Measure paper/ink colour on all (or one) stamp(s) in a project (SPEC §8-9)."""
+    if include_rect is not None and include_mask is not None:
+        typer.echo("--include-rect and --include-mask are mutually exclusive", err=True)
+        raise typer.Exit(code=1)
+
     proj = _resolve_project(library_root, project)
-    iscc_table = load_iscc_nbs_table(iscc_table_path)
+    philatelic_table = philatelic_colours_mod.load_philatelic_colours(philatelic_table_path)
+
+    inclusion_rect: tuple[int, int, int, int] | None = None
+    if include_rect is not None:
+        values = _parse_floats(include_rect)
+        if len(values) != 4:
+            typer.echo("--include-rect must be 'x0,y0,x1,y1'", err=True)
+            raise typer.Exit(code=1)
+        inclusion_rect = tuple(int(v) for v in values)
+
+    inclusion_mask_from_file = None
+    if include_mask is not None:
+        import cv2
+
+        inclusion_mask_from_file = cv2.imread(str(include_mask), cv2.IMREAD_GRAYSCALE)
+        if inclusion_mask_from_file is None:
+            typer.echo(f"could not read --include-mask {include_mask}", err=True)
+            raise typer.Exit(code=1)
 
     model_cache: dict[str, ref_mod.ColourModel] = {}
     scale_cache: dict[str, tuple[float, float]] = {}
@@ -440,6 +490,15 @@ def colour(
         model = model_cache[sample.ref_id]
 
         crop = project_mod.load_stamp_crop(library_root, proj.project_id, stamp_id)
+
+        inclusion_mask = None
+        if inclusion_rect is not None:
+            x0, y0, x1, y1 = inclusion_rect
+            inclusion_mask = np.zeros(crop.shape[:2], dtype=np.uint8)
+            inclusion_mask[y0:y1, x0:x1] = 255
+        elif inclusion_mask_from_file is not None:
+            inclusion_mask = inclusion_mask_from_file
+
         analysis = colour_mod.analyse_colour(
             crop,
             model.predict_lab,
@@ -448,7 +507,8 @@ def colour(
             perforation_margin_mm=margin_mm,
             n_inks=inks,
             tau=tau,
-            iscc_table=iscc_table,
+            user_inclusion_mask=inclusion_mask,
+            philatelic_table=philatelic_table,
             ref_id=sample.ref_id,
             colour_model_cv_delta_e00=cv_delta_e00_cache[sample.ref_id],
         )
@@ -468,7 +528,7 @@ def colour(
 
         n_ok += 1
         summary = ", ".join(
-            f"{c.label}={c.munsell or '?'} ({c.iscc_nbs_name or '?'})"
+            f"{c.label}={c.munsell or '?'} ({c.philatelic_name or '?'})"
             for c in analysis.result.clusters
         )
         typer.echo(f"{stamp_id}: {summary or 'no clusters'}")
@@ -476,6 +536,88 @@ def colour(
             typer.echo(f"  warning: {w}", err=True)
 
     typer.echo(f"measured colour on {n_ok}/{len(stamp_ids)} stamp(s)")
+
+
+@app.command()
+def report(
+    project: str = typer.Argument(..., help="Project name or id."),
+    output: Path | None = typer.Option(
+        None, "-o", "--output", help="PDF path (default: <project>/report.pdf)."
+    ),
+    library_root: Path = typer.Option(DEFAULT_LIBRARY_ROOT),
+) -> None:
+    """Generate the PDF report plus CSV/JSON export for a project (SPEC §10)."""
+    from stampan.core.report import generator as report_mod
+
+    proj = _resolve_project(library_root, project)
+    context = report_mod.build_report_context(library_root, proj)
+    if not context.stamps:
+        typer.echo("no stamps with a usable reference in this project.", err=True)
+        raise typer.Exit(code=1)
+
+    html = report_mod.render_html(context)
+    pdf_bytes = report_mod.render_pdf(html)
+
+    project_root = project_mod.project_dir(library_root, proj.project_id)
+    pdf_path = output or (project_root / "report.pdf")
+    pdf_path.parent.mkdir(parents=True, exist_ok=True)
+    pdf_path.write_bytes(pdf_bytes)
+
+    csv_path = pdf_path.with_suffix(".csv")
+    csv_path.write_text(report_mod.export_csv(context), encoding="utf-8")
+    json_path = pdf_path.with_suffix(".json")
+    json_path.write_text(report_mod.export_json(context), encoding="utf-8")
+
+    overview_note = ""
+    if context.colour_overview_image:
+        import base64
+
+        overview_path = pdf_path.parent / "colour_overview.png"
+        overview_path.write_bytes(base64.b64decode(context.colour_overview_image.split(",", 1)[1]))
+        overview_note = f", {overview_path.name}"
+
+    for note in context.notes:
+        typer.echo(f"warning: {note}", err=True)
+    typer.echo(
+        f"wrote {pdf_path}, {csv_path.name}, {json_path.name}{overview_note} "
+        f"({len(context.stamps)} stamp(s))"
+    )
+
+
+@app.command()
+def run(
+    sample_path: Path = typer.Argument(..., help="Sample-sheet scan TIFF."),
+    reference: str = typer.Option(..., "--reference", help="Reference id (for px/mm scale)."),
+    project: str = typer.Option(..., "--project", help="Project name (reused if it exists)."),
+    inks: int = typer.Option(1, "--inks", help="Number of ink clusters (N), SPEC §8.3."),
+    library_root: Path = typer.Option(DEFAULT_LIBRARY_ROOT),
+) -> None:
+    """Run detect -> perf -> colour -> report fully automatically (SPEC Phase 6).
+
+    Each step is the same command `stampan detect|perf|colour|report` would
+    run, invoked in-process (so typer's own option defaults resolve
+    correctly) rather than duplicated here. `colour` runs without an
+    inclusion ROI, since this is unattended -- see its own warning about
+    cancellation ink then counting as design ink.
+    """
+    steps = [
+        ["detect", str(sample_path), "--reference", reference, "--project", project],
+        ["perf", project],
+        ["colour", project, "--inks", str(inks)],
+        ["report", project],
+    ]
+    for step in steps:
+        step_args = [*step, "--library-root", str(library_root)]
+        typer.echo(f"$ stampan {' '.join(step_args)}")
+        try:
+            app(step_args, standalone_mode=False)
+        except SystemExit as exc:
+            if exc.code:
+                typer.echo(f"'{step[0]}' failed (exit {exc.code}); stopping.", err=True)
+                raise typer.Exit(code=exc.code) from exc
+        except Exception as exc:  # noqa: BLE001 -- surface any step's failure and stop the chain
+            typer.echo(f"'{step[0]}' failed: {exc}; stopping.", err=True)
+            raise typer.Exit(code=1) from exc
 
 
 if __name__ == "__main__":

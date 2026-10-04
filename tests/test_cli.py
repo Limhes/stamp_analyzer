@@ -191,6 +191,155 @@ def test_detect_command_writes_project_and_stamps(tmp_path):
         assert diag_path.exists()
 
 
+def test_colour_and_report_commands_produce_outputs(tmp_path):
+    from stampan.core import project as project_mod
+
+    scan, corners, x_axis, y_axis = _build_synthetic_reference_scan()
+    library_root = tmp_path / "library"
+    ref_result = ref_mod.build_reference(
+        name="report-test reference",
+        scan=scan,
+        scan_metadata=ScanMetadata(scanner_options={"resolution": 1200}),
+        x_axis=x_axis,
+        it8_corners=corners,
+        cgats_reference_path="reference_data/R240103.txt",
+        y_axis=y_axis,
+    )
+    ref_mod.save_reference(ref_result, library_root)
+    ref_id = ref_result.reference.ref_id
+
+    placements = [
+        StampPlacement(
+            spec=SynthSpec(
+                width_mm=20,
+                height_mm=25,
+                px_per_mm=10,
+                sides={s: SideSpec(gauge=12.0) for s in ("top", "bottom", "left", "right")},
+                seed=i,
+            ),
+            centre_mm=(25 + i * 35, 30),
+        )
+        for i in range(2)
+    ]
+    sheet = SheetSpec(width_mm=95, height_mm=60, px_per_mm=10, seed=1)
+    sample_img, _ = generate_synthetic_sheet(sheet, placements)
+    # generate_synthetic_sheet renders a single grayscale channel (fine for
+    # detect/perf, which handle 2D); colour.py, like a real scanner, needs
+    # 3-channel RGB, so replicate it the way a neutral/grey synthetic
+    # subject actually would appear on an RGB scan.
+    sample_img_rgb = np.stack([sample_img] * 3, axis=-1)
+    sample_path = tmp_path / "sample_sheet.tif"
+    write_tiff(sample_path, sample_img_rgb.astype(np.uint16))
+
+    result = runner.invoke(
+        app,
+        [
+            "detect",
+            str(sample_path),
+            "--reference",
+            ref_id,
+            "--project",
+            "report cli test",
+            "--library-root",
+            str(library_root),
+        ],
+    )
+    assert result.exit_code == 0, result.stdout
+
+    project = project_mod.list_projects(library_root)[0]
+
+    perf_result = runner.invoke(
+        app, ["perf", project.project_id, "--library-root", str(library_root)]
+    )
+    assert perf_result.exit_code == 0, perf_result.stdout
+
+    colour_result = runner.invoke(
+        app, ["colour", project.project_id, "--library-root", str(library_root)]
+    )
+    assert colour_result.exit_code == 0, colour_result.stdout
+    assert "no inclusion area selected" in colour_result.output
+
+    report_result = runner.invoke(
+        app, ["report", project.project_id, "--library-root", str(library_root)]
+    )
+    assert report_result.exit_code == 0, report_result.stdout
+
+    project_dir = project_mod.project_dir(library_root, project.project_id)
+    pdf_path = project_dir / "report.pdf"
+    csv_path = project_dir / "report.csv"
+    json_path = project_dir / "report.json"
+    assert pdf_path.exists() and pdf_path.stat().st_size > 1000
+    assert pdf_path.read_bytes().startswith(b"%PDF")
+    assert csv_path.exists()
+
+    csv_text = csv_path.read_text(encoding="utf-8")
+    report_data = json.loads(json_path.read_text(encoding="utf-8"))
+    assert len(report_data["stamps"]) == 2
+    for stamp in report_data["stamps"]:
+        assert stamp["stamp_id"] in csv_text
+        # the big embedded images are stripped from the JSON export
+        assert "crop_image" not in stamp
+
+
+def test_run_command_chains_detect_perf_colour_report(tmp_path):
+    from stampan.core import project as project_mod
+
+    scan, corners, x_axis, y_axis = _build_synthetic_reference_scan()
+    library_root = tmp_path / "library"
+    ref_result = ref_mod.build_reference(
+        name="run-test reference",
+        scan=scan,
+        scan_metadata=ScanMetadata(scanner_options={"resolution": 1200}),
+        x_axis=x_axis,
+        it8_corners=corners,
+        cgats_reference_path="reference_data/R240103.txt",
+        y_axis=y_axis,
+    )
+    ref_mod.save_reference(ref_result, library_root)
+    ref_id = ref_result.reference.ref_id
+
+    placements = [
+        StampPlacement(
+            spec=SynthSpec(
+                width_mm=20,
+                height_mm=25,
+                px_per_mm=10,
+                sides={s: SideSpec(gauge=12.0) for s in ("top", "bottom", "left", "right")},
+                seed=0,
+            ),
+            centre_mm=(25, 30),
+        )
+    ]
+    sheet = SheetSpec(width_mm=60, height_mm=60, px_per_mm=10, seed=1)
+    sample_img, _ = generate_synthetic_sheet(sheet, placements)
+    sample_img_rgb = np.stack([sample_img] * 3, axis=-1)
+    sample_path = tmp_path / "sample_sheet.tif"
+    write_tiff(sample_path, sample_img_rgb.astype(np.uint16))
+
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            str(sample_path),
+            "--reference",
+            ref_id,
+            "--project",
+            "run cli test",
+            "--library-root",
+            str(library_root),
+        ],
+    )
+    assert result.exit_code == 0, result.stdout
+    assert "detected 1 stamp(s)" in result.stdout
+    assert "measured perforation on 1/1" in result.stdout
+    assert "measured colour on 1/1" in result.stdout
+
+    project = project_mod.list_projects(library_root)[0]
+    report_path = project_mod.project_dir(library_root, project.project_id) / "report.pdf"
+    assert report_path.exists()
+    assert report_path.read_bytes().startswith(b"%PDF")
+
+
 def test_scan_command_upscales_8bit_scanner_output_to_16bit(tmp_path, monkeypatch):
     # Regression test: the Epson 1200U (real hardware, Phase 1) only offers
     # 8-bit depth. Before this fix, `stampan scan` would crash in

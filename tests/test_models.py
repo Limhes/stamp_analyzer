@@ -1,6 +1,6 @@
+from stampan.core import models as models_mod
 from stampan.core.models import (
     AnalysisMeta,
-    CancellationResult,
     ColourCluster,
     ColourModelInfo,
     ColourResult,
@@ -26,13 +26,6 @@ def _sample_stamp() -> Stamp:
         manual_reason={"left": "auto mis-detected imperf; holes visible under magnification"},
         meta=AnalysisMeta(confidence=0.92, warnings=["corner exclusion widened"]),
     )
-    cancellation = CancellationResult(
-        present=True,
-        auto_mask_path="diagnostics/cancel_auto.png",
-        colour_lab=(25.1, 2.3, -4.0),
-        colour_class="black",
-        meta=AnalysisMeta(confidence=0.4, warnings=["cancel colour close to ink colour"]),
-    )
     colour = ColourResult(
         n_inks=1,
         tau=0.9,
@@ -45,7 +38,8 @@ def _sample_stamp() -> Stamp:
                 std_lab=(1.1, 0.4, 0.5),
                 mean_lch=(88.1, 3.6, 109.4),
                 munsell="N 9/",
-                iscc_nbs_name="white",
+                philatelic_name="white",
+                philatelic_match_delta_e00=4.2,
                 srgb_swatch=(230, 228, 220),
             ),
             ColourCluster(
@@ -54,7 +48,8 @@ def _sample_stamp() -> Stamp:
                 area_fraction=0.18,
                 mean_lab=(32.0, 45.0, -20.0),
                 munsell="5P 3/8",
-                iscc_nbs_name="deep purplish red",
+                philatelic_name="deep carmine",
+                philatelic_match_delta_e00=6.1,
             ),
         ],
         mixed_pixel_fraction=0.06,
@@ -67,15 +62,28 @@ def _sample_stamp() -> Stamp:
         catalogue_numbers=["NVPH 12", "Mi 10"],
         country_issue="Netherlands 1872",
         notes="corner crease",
+        condition=models_mod.CONDITION_SOAKED_OFF,
+        multiplicity=models_mod.MULTIPLICITY_BLOCK,
+        multiplicity_count=4,
         geometry=GeometryResult(width_mm=20.1, height_mm=25.3, rotation_deg=0.4),
         perforation=perforation,
-        cancellation=cancellation,
         colour=colour,
     )
 
 
 def test_stamp_json_roundtrip():
     stamp = _sample_stamp()
+    restored = Stamp.from_json(stamp.to_json())
+    assert restored == stamp
+
+
+def test_stamp_condition_and_multiplicity_default_to_unrecorded():
+    # Never assumed -- these change which perforation approach is correct,
+    # so "unknown" must stay distinguishable from any real value.
+    stamp = Stamp(stamp_id="s1")
+    assert stamp.condition is None
+    assert stamp.multiplicity is None
+    assert stamp.multiplicity_count is None
     restored = Stamp.from_json(stamp.to_json())
     assert restored == stamp
 

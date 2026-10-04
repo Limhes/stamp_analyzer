@@ -3,10 +3,10 @@
 
 Every analysis result carries an :class:`AnalysisMeta` (confidence, warnings,
 the parameters used, and a path to its diagnostic image). Where a human can
-correct an automatic result (perforation sides, colour cluster labels,
-cancellation masks, ...) the manual value is stored in a separate field next
-to the automatic one — the automatic result is never overwritten, so "auto"
-vs "manual" stays traceable and auditable.
+correct an automatic result (perforation sides, colour cluster labels, ...)
+the manual value is stored in a separate field next to the automatic one —
+the automatic result is never overwritten, so "auto" vs "manual" stays
+traceable and auditable.
 """
 
 from __future__ import annotations
@@ -65,9 +65,16 @@ class PerforationSide:
     spacing_max_dev_mm: float | None = None
     hole_diameter_mm: float | None = None
     tooth_roughness: float | None = None
+    # (start_mm, end_mm) interval(s) along the profile actually used for the
+    # gauge estimate -- excludes noisy stretches (cancellation ink, broken
+    # teeth) or reflects a user's manual override (SPEC §6).
+    roi_mm: list[tuple[float, float]] | None = None
 
     @staticmethod
     def from_dict(d: dict[str, Any]) -> PerforationSide:
+        d = dict(d)
+        roi = d.get("roi_mm")
+        d["roi_mm"] = [tuple(pair) for pair in roi] if roi is not None else None
         return PerforationSide(**d)
 
 
@@ -76,7 +83,26 @@ class PerforationResult:
     auto: dict[PerfSide, PerforationSide] = field(default_factory=dict)
     manual: dict[PerfSide, PerforationSide] = field(default_factory=dict)
     manual_reason: dict[PerfSide, str] = field(default_factory=dict)
+    # A user's manual ROI override per side (SPEC §6: when auto ROI
+    # detection gets the noisy/clean split wrong), fed back into
+    # ``analyse_perforation`` on the next run -- distinct from ``manual``
+    # (a result override), this overrides an *input* to the automatic
+    # algorithm, which then still computes the gauge itself.
+    roi_override_mm: dict[PerfSide, list[tuple[float, float]]] = field(default_factory=dict)
+    # A user-adjusted stamp rectangle (4 (x, y) px corners, sequential
+    # winding), overriding the auto-detected box every side's geometry is
+    # built from -- for when segmentation gets dragged off-rectangle (e.g.
+    # cancellation ink merging with a dark mount/paper background). None
+    # means "use the auto-detected box".
+    box_override_px: list[tuple[float, float]] | None = None
     meta: AnalysisMeta = field(default_factory=AnalysisMeta)
+
+    def effective(self) -> dict[PerfSide, PerforationSide]:
+        """Per-side results with any manual correction applied over the
+        automatic one -- the auto result itself is never mutated (kept
+        separately for auditability), but every consumer (report, GUI)
+        wants "the current best value per side", not the raw auto dict."""
+        return {**self.auto, **self.manual}
 
     @staticmethod
     def from_dict(d: dict[str, Any]) -> PerforationResult:
@@ -84,32 +110,15 @@ class PerforationResult:
             auto={k: PerforationSide.from_dict(v) for k, v in d.get("auto", {}).items()},
             manual={k: PerforationSide.from_dict(v) for k, v in d.get("manual", {}).items()},
             manual_reason=dict(d.get("manual_reason", {})),
-            meta=AnalysisMeta.from_dict(d.get("meta", {})),
-        )
-
-
-# --------------------------------------------------------------------------
-# Cancellation (SPEC §7)
-# --------------------------------------------------------------------------
-
-
-@dataclass
-class CancellationResult:
-    present: bool | None = None
-    auto_mask_path: str | None = None
-    manual_mask_path: str | None = None
-    colour_lab: tuple[float, float, float] | None = None
-    colour_class: str | None = None  # "black" | "blue" | "violet" | "red" | "other"
-    meta: AnalysisMeta = field(default_factory=AnalysisMeta)
-
-    @staticmethod
-    def from_dict(d: dict[str, Any]) -> CancellationResult:
-        return CancellationResult(
-            present=d.get("present"),
-            auto_mask_path=d.get("auto_mask_path"),
-            manual_mask_path=d.get("manual_mask_path"),
-            colour_lab=_tuple3(d.get("colour_lab")),
-            colour_class=d.get("colour_class"),
+            roi_override_mm={
+                side: [tuple(pair) for pair in intervals]
+                for side, intervals in d.get("roi_override_mm", {}).items()
+            },
+            box_override_px=(
+                [tuple(pair) for pair in d["box_override_px"]]
+                if d.get("box_override_px") is not None
+                else None
+            ),
             meta=AnalysisMeta.from_dict(d.get("meta", {})),
         )
 
@@ -135,9 +144,18 @@ class ColourCluster:
     # None for non-ink clusters (e.g. paper itself).
     core_mean_lab: tuple[float, float, float] | None = None
     munsell: str | None = None
-    iscc_nbs_name: str | None = None
+    # From core.philatelic_colours (replaces the earlier ISCC-NBS naming,
+    # which was dropped as an unreliable match for this domain). The
+    # distance is the ΔE00 to the matched reference colour -- how
+    # confident the name is, not a measurement in its own right.
+    philatelic_name: str | None = None
+    philatelic_match_delta_e00: float | None = None
     srgb_swatch: tuple[int, int, int] | None = None
     out_of_gamut: bool = False
+    # Project-relative path to this ROI's own mask PNG (the GUI's
+    # draw-a-ROI-per-colour workflow); None for a cluster that didn't come
+    # from a saved ROI (e.g. the CLI's GMM-based `analyse_colour`).
+    mask_path: str | None = None
 
     @staticmethod
     def from_dict(d: dict[str, Any]) -> ColourCluster:
@@ -152,9 +170,11 @@ class ColourCluster:
             delta_e00_spread=d.get("delta_e00_spread"),
             core_mean_lab=_tuple3(d.get("core_mean_lab")),
             munsell=d.get("munsell"),
-            iscc_nbs_name=d.get("iscc_nbs_name"),
+            philatelic_name=d.get("philatelic_name"),
+            philatelic_match_delta_e00=d.get("philatelic_match_delta_e00"),
             srgb_swatch=tuple(d["srgb_swatch"]) if d.get("srgb_swatch") is not None else None,
             out_of_gamut=d.get("out_of_gamut", False),
+            mask_path=d.get("mask_path"),
         )
 
 
@@ -208,6 +228,25 @@ class GeometryResult:
         )
 
 
+#: Whether the specimen is still affixed to (a piece of) its original
+#: paper/envelope, or has been soaked off. ``core.perforation.analyse_perforation``
+#: uses this: an on-paper stamp's edge profile can be contaminated by the
+#: backing paper's own torn/cut edge, so it caps confidence and warns
+#: instead of trying to auto-separate paper from stamp (SPEC §6).
+CONDITION_ON_PAPER = "on_paper"
+CONDITION_SOAKED_OFF = "soaked_off"
+
+#: How many stamps are physically joined in this one specimen.
+#: ``core.perforation.analyse_perforation`` warns when this isn't "single"
+#: (a block's internal perforation lines are shared between neighbours, so
+#: an imperf/straight_edge side here may not be the stamp's own free edge)
+#: but does not attempt to identify which side(s) are shared (SPEC §6).
+MULTIPLICITY_SINGLE = "single"
+MULTIPLICITY_PAIR = "pair"
+MULTIPLICITY_STRIP = "strip"
+MULTIPLICITY_BLOCK = "block"
+
+
 @dataclass
 class Stamp:
     stamp_id: str
@@ -215,9 +254,15 @@ class Stamp:
     catalogue_numbers: list[str] = field(default_factory=list)
     country_issue: str | None = None
     notes: str = ""
+    # None means "not yet recorded by the user" -- never assumed, since it
+    # changes which perforation approach is correct (SPEC §6).
+    condition: str | None = None
+    multiplicity: str | None = None
+    # Stamp count within this one specimen, e.g. 4 for a block of 4.
+    # Meaningless (left None) for "single".
+    multiplicity_count: int | None = None
     geometry: GeometryResult = field(default_factory=GeometryResult)
     perforation: PerforationResult = field(default_factory=PerforationResult)
-    cancellation: CancellationResult = field(default_factory=CancellationResult)
     colour: ColourResult = field(default_factory=ColourResult)
 
     def to_json(self) -> str:
@@ -231,9 +276,11 @@ class Stamp:
             catalogue_numbers=list(d.get("catalogue_numbers", [])),
             country_issue=d.get("country_issue"),
             notes=d.get("notes", ""),
+            condition=d.get("condition"),
+            multiplicity=d.get("multiplicity"),
+            multiplicity_count=d.get("multiplicity_count"),
             geometry=GeometryResult.from_dict(d.get("geometry", {})),
             perforation=PerforationResult.from_dict(d.get("perforation", {})),
-            cancellation=CancellationResult.from_dict(d.get("cancellation", {})),
             colour=ColourResult.from_dict(d.get("colour", {})),
         )
 

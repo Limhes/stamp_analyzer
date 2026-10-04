@@ -154,7 +154,7 @@ Report the repeatability: analyse the same stamp from two separate scans (if the
 test data has them) and give the ΔE00 between runs. Stop and report.
 ```
 
-## Phase 5: Cancellation
+## Phase 5: Cancellation -- built, then dropped (2026-10-03)
 
 ```
 Phase 5, following SPEC §7. Build the classical pipeline: the colour-model-based
@@ -174,6 +174,16 @@ per stamp for René to judge, and report honestly where it fails (e.g. a black
 cancel on dark ink). Stop and report.
 ```
 
+This was built exactly as specified and run against the real stamps. René's review:
+it didn't work well enough to trust -- most real stamps landed in the pipeline's own
+"ill-posed" bucket, and the confident-looking results weren't reliable either.
+Decision: drop automatic cancellation detection entirely (SPEC §7) rather than ship
+something unreliable. `core/cancellation.py` and its tests were deleted; `colour.py`'s
+mandatory inclusion-ROI workflow (SPEC §8.1) replaces it -- the user selects a
+cancellation-free area directly instead of relying on auto-exclusion. See SPEC §7
+for the full record. Phases 6/7 below are adjusted accordingly (no cancel step, no
+Cancellation GUI panel).
+
 ## Phase 6: Report (headless pipeline complete)
 
 ```
@@ -183,10 +193,11 @@ consistent typography, numbers aligned with units, swatches with their numerical
 values, small plots generated with matplotlib as SVG. Also add the CSV/JSON export.
 
 Add `stampan run <sample.tif> --reference <id> --project <name>`, which runs
-detect → perf → colour (→ cancel if --cancel) → report fully automatically, and
-`stampan report <project>`. Generate a report from the test data for review.
-Stop and report.
+detect → perf → colour → report fully automatically, and `stampan report
+<project>`. Generate a report from the test data for review. Stop and report.
 ```
+
+(No `--cancel` step: cancellation detection was dropped, see Phase 5 above.)
 
 ## Phase 7: GUI
 
@@ -203,9 +214,10 @@ gamut boundary. Re-implement them cleanly instead of copying its colour code:
    inclusion/exclusion ROIs, all with undo/redo.
 3. Panels: Detection (edit/add/delete rectangles, re-extract), Perforation (a
    dedicated view, click-to-mark teeth/holes with snapping, per-side overrides with a
-   reason), Cancellation (hint ellipse, threshold slider, brush edits), Colour (a
-   pyqtgraph.opengl 3D cloud with ellipsoids and centroids, a linked 2D overlay, N/τ
-   controls, draggable centroids, Accept), and Notes (catalogue numbers etc.).
+   reason), Colour (a pyqtgraph.opengl 3D cloud with ellipsoids and centroids, a
+   linked 2D overlay, N/τ controls, draggable centroids, Accept, and the inclusion
+   ROI tool for selecting a cancellation-free area -- no separate Cancellation panel,
+   see Phase 5 above), and Notes (catalogue numbers etc.).
 4. A workflow step bar with per-stamp status, worker threads with progress/cancel,
    and Generate report.
 

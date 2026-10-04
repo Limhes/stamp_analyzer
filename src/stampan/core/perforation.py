@@ -23,7 +23,7 @@ with a materially anisotropic x/y scale.
 from __future__ import annotations
 
 import io
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import cv2
 import matplotlib
@@ -31,9 +31,14 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.ndimage import median_filter
 from scipy.signal import find_peaks
 
-from stampan.core.models import PerforationSide
+from stampan.core.models import (
+    CONDITION_ON_PAPER,
+    MULTIPLICITY_SINGLE,
+    PerforationSide,
+)
 
 SIDES = ("top", "bottom", "left", "right")
 
@@ -78,6 +83,11 @@ class SideAnalysis:
     spectral_peak_freq: float | None
     tip_line: tuple[np.ndarray, np.ndarray]  # (origin_px, unit_direction_px)
     bottom_line: tuple[np.ndarray, np.ndarray] | None
+    # The (start_mm, end_mm) interval(s) along the profile actually used for
+    # the spectral/hole-regression estimate -- excludes stretches flagged as
+    # noisy (cancellation, broken teeth) or a user's manual override.
+    roi_mm: list[tuple[float, float]] = field(default_factory=list)
+    roi_manual: bool = False
 
     def to_persisted(self) -> PerforationSide:
         return PerforationSide(
@@ -91,6 +101,7 @@ class SideAnalysis:
             spacing_max_dev_mm=self.spacing_max_dev_mm,
             hole_diameter_mm=self.hole_diameter_mm,
             tooth_roughness=self.tooth_roughness_mm,
+            roi_mm=self.roi_mm,
         )
 
 
@@ -132,6 +143,71 @@ def segment_stamp(crop: np.ndarray) -> np.ndarray:
         return mask
     largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
     return np.where(labels == largest, 255, 0).astype(np.uint8)
+
+
+def _robust_poly_fit(
+    x: np.ndarray, y: np.ndarray, degree: int, n_iter: int = 5, k: float = 2.5
+) -> tuple[np.ndarray, np.ndarray]:
+    """OLS polynomial fit with iterative sigma-clipping (SPEC §6: "the line
+    isn't on the teeth" -- an unweighted fit through the tooth-tip envelope
+    is dragged off the true envelope by any stretch of contour corrupted by
+    cancellation ink merging with the background, even though that stretch
+    is usually a minority of the side's points). Returns (coeffs, inlier
+    mask); ``coeffs`` is unchanged from a plain ``np.polyfit`` when nothing
+    gets rejected.
+    """
+    mask = np.ones(len(x), dtype=bool)
+    coeffs = np.polyfit(x, y, degree)
+    for _ in range(n_iter):
+        residuals = y - np.polyval(coeffs, x)
+        # A plain std is itself inflated by the very outliers being
+        # rejected -- with a contiguous corrupted stretch covering a
+        # material fraction of the side (seen on real cancelled stamps,
+        # 20%+), that inflation can be enough that nothing ever clears the
+        # threshold. MAD (median-based) stays robust up to ~50% outliers.
+        median_resid = np.median(residuals[mask])
+        mad = np.median(np.abs(residuals[mask] - median_resid))
+        scale = mad * 1.4826  # consistent estimator of std under Gaussian inliers
+        if scale < 1e-9:
+            break
+        new_mask = np.abs(residuals - median_resid) <= k * scale
+        # Never reject so much that the fit is left with too little to mean
+        # anything -- a genuinely corrupted majority is a different problem
+        # (ROI exclusion / manual override), not one a line fit can solve.
+        if new_mask.sum() < max(degree + 4, int(0.3 * len(x))):
+            break
+        if np.array_equal(new_mask, mask):
+            break
+        mask = new_mask
+        coeffs = np.polyfit(x[mask], y[mask], degree)
+    return coeffs, mask
+
+
+def _robust_envelope_fit(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Robust tip/bottom envelope fit, preferring a straight line (the
+    physically expected shape for a flat rectangular stamp) but allowing a
+    gentle quadratic curve when it demonstrably fits much better -- found on
+    a real stamp where the envelope was clearly bowed (a ~35% RMS
+    improvement from the quadratic term), not just noisy, most likely from
+    a residual sub-degree error in the overall crop's rotation-to-upright
+    estimate (small, but perforation depth itself is only tenths of a mm).
+    A plain per-side line fit cannot absorb a curved bias no matter how
+    robust its outlier handling is, since the whole side is biased the same
+    smooth way, not a minority stretch -- hence allowing degree 2 here,
+    gated on a clear improvement so flat/clean sides still get the simpler,
+    more constrained line.
+    """
+    linear, linear_mask = _robust_poly_fit(x, y, degree=1)
+    if len(x) < 25:
+        return linear, linear_mask  # too little data to trust a 2nd-order term
+    linear_rms = float(np.std((y - np.polyval(linear, x))[linear_mask]))
+
+    quad, quad_mask = _robust_poly_fit(x, y, degree=2)
+    quad_rms = float(np.std((y - np.polyval(quad, x))[quad_mask]))
+
+    if linear_rms > 1e-9 and quad_rms < 0.85 * linear_rms:
+        return quad, quad_mask
+    return linear, linear_mask
 
 
 def _polygon_area(points: np.ndarray) -> float:
@@ -181,11 +257,20 @@ class EdgeFrame:
         return along, outward
 
 
-def _edge_frames(mask: np.ndarray) -> dict[str, EdgeFrame]:
+def detect_stamp_box(crop: np.ndarray) -> np.ndarray:
+    """Auto-detected stamp rectangle (4 corners, px, sequential winding) from
+    the crop's own segmentation -- this is what ``_edge_frames`` uses
+    internally, but also what the GUI seeds its editable perforation-box
+    overlay with before the user adjusts it (SPEC §6: "you see the four
+    autodetected lines, that the user can then change if necessary")."""
+    mask = segment_stamp(crop)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contour = max(contours, key=cv2.contourArea)
     rect = cv2.minAreaRect(contour)
-    box = cv2.boxPoints(rect)  # 4 corners, unambiguous regardless of angle convention
+    return cv2.boxPoints(rect)  # 4 corners, unambiguous regardless of angle convention
+
+
+def _edge_frames_from_box(box: np.ndarray) -> dict[str, EdgeFrame]:
     centre = box.mean(axis=0)
 
     raw_edges = []
@@ -219,6 +304,14 @@ def _edge_frames(mask: np.ndarray) -> dict[str, EdgeFrame]:
     }
 
 
+def _edge_frames(mask: np.ndarray) -> dict[str, EdgeFrame]:
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contour = max(contours, key=cv2.contourArea)
+    rect = cv2.minAreaRect(contour)
+    box = cv2.boxPoints(rect)
+    return _edge_frames_from_box(box)
+
+
 def _classify_side(points: np.ndarray, frames: dict[str, EdgeFrame]) -> np.ndarray:
     """Nearest edge LINE (by perpendicular distance) for each contour point."""
     dists = np.stack([np.abs(f.project(points)[1]) for f in frames.values()], axis=1)
@@ -233,6 +326,7 @@ def analyse_side(
     px_per_mm_x: float,
     px_per_mm_y: float,
     corner_exclusion_mm: float = DEFAULT_CORNER_EXCLUSION_MM,
+    manual_roi_mm: list[tuple[float, float]] | None = None,
 ) -> SideAnalysis:
     along_scale = px_per_mm_x if side in ("top", "bottom") else px_per_mm_y
     outward_scale = px_per_mm_y if side in ("top", "bottom") else px_per_mm_x
@@ -264,12 +358,19 @@ def analyse_side(
     tip_pts = np.array(tip_pts)
     bottom_pts = np.array(bottom_pts)
 
-    tip_fit = np.polyfit(tip_pts[:, 0], tip_pts[:, 1], 1)
+    tip_fit, tip_inliers = _robust_envelope_fit(tip_pts[:, 0], tip_pts[:, 1])
     tooth_roughness_mm = float(
-        np.std(tip_pts[:, 1] - np.polyval(tip_fit, tip_pts[:, 0])) / outward_scale
+        np.std(tip_pts[tip_inliers, 1] - np.polyval(tip_fit, tip_pts[tip_inliers, 0]))
+        / outward_scale
     )
+    rejected_frac = 1.0 - tip_inliers.mean()
+    if rejected_frac > 0.1:
+        warnings.append(
+            f"tip-line fit rejected {rejected_frac * 100:.0f}% of the tooth-tip envelope as "
+            "outliers (likely cancellation ink or damage distorting the contour there)"
+        )
 
-    bottom_fit = np.polyfit(bottom_pts[:, 0], bottom_pts[:, 1], 1)
+    bottom_fit, _bottom_inliers = _robust_envelope_fit(bottom_pts[:, 0], bottom_pts[:, 1])
 
     # Depth profile: distance from the tip line to the contour, uniformly
     # resampled in mm along the side.
@@ -279,13 +380,43 @@ def analyse_side(
     depth_grid_px = np.interp(s_grid, along_mm, depth_px)
     depth_grid_mm = depth_grid_px / outward_scale
 
-    perf_depth_mm = float(np.polyval(bottom_fit, 0) - tip_fit[1]) / outward_scale
+    perf_depth_mm = float(np.polyval(bottom_fit, 0) - np.polyval(tip_fit, 0)) / outward_scale
 
-    result = _estimate_period(s_grid, depth_grid_mm)
+    # Provisional full-profile estimate, used only to size the ROI-detection
+    # windows below -- a rough gauge guess is enough for that, and this
+    # runs before any noise exclusion so it has to tolerate noisy input.
+    provisional_gauge, *_ = _estimate_period(s_grid, depth_grid_mm)
+    pitch_hint_mm = 20.0 / provisional_gauge if provisional_gauge else 20.0 / 12.0
+
+    if manual_roi_mm is not None:
+        roi_mm = manual_roi_mm
+        good_mask = _mask_from_roi(s_grid, roi_mm)
+        roi_manual = True
+    else:
+        good_mask = _detect_profile_roi(s_grid, depth_grid_mm, pitch_hint_mm)
+        roi_mm = _roi_runs_from_mask(s_grid, good_mask)
+        roi_manual = False
+        if roi_mm and not (len(roi_mm) == 1 and roi_mm[0] == (float(s_grid[0]), float(s_grid[-1]))):
+            excluded_mm = length_mm - sum(e - s for s, e in roi_mm)
+            if excluded_mm > 0.5:
+                warnings.append(
+                    f"excluded {excluded_mm:.1f}mm of noisy profile (cancellation/broken "
+                    "teeth) from the gauge estimate; see the ROI on the diagnostic"
+                )
+        elif not roi_mm:
+            # Nothing passed the minimum-run-length bar; fall back to the
+            # full profile rather than estimating from nothing (SPEC: never
+            # invent a result, but an empty ROI is worse than an honestly
+            # unfiltered one when every stretch is short).
+            good_mask = np.ones(len(s_grid), dtype=bool)
+            roi_mm = [(float(s_grid[0]), float(s_grid[-1]))]
+            warnings.append("ROI detection found no stable stretch; using the full profile")
+
+    result = _estimate_period(s_grid[good_mask], depth_grid_mm[good_mask])
     gauge_spectral, spectral_snr, freqs, mag, peak_freq = result
 
     holes, gauge_holes, spacing_std, spacing_max_dev = _detect_holes(
-        s_grid, depth_grid_mm, gauge_spectral
+        s_grid, depth_grid_mm, gauge_spectral, good_mask=good_mask
     )
 
     hole_diameters = [h.diameter_mm for h in holes if h.diameter_mm is not None]
@@ -304,10 +435,14 @@ def analyse_side(
     notation = _notation(gauge) if gauge is not None else None
 
     # Tip line back in pixel space, for diagnostics: at along_mm=0 the tip
-    # line sits at outward=tip_fit[1] px from edge.origin; its direction in
-    # (along, outward) pixel units is (along_scale, tip_fit[0]) per mm along.
-    tip_origin_px = edge.origin + edge.normal * tip_fit[1]
-    tip_dir_px = edge.direction * along_scale + edge.normal * tip_fit[0]
+    # line sits at outward=tip_fit(0) px from edge.origin; its direction in
+    # (along, outward) pixel units is (along_scale, tip_fit'(0)) per mm
+    # along -- the slope *at the origin*, degree-agnostic (tip_fit may be
+    # linear or a gently-bowed quadratic, see _robust_envelope_fit), since
+    # this is only a straight dashed line drawn on the diagnostic image.
+    tip_origin_px = edge.origin + edge.normal * np.polyval(tip_fit, 0)
+    tip_slope_at_origin = np.polyval(np.polyder(tip_fit), 0)
+    tip_dir_px = edge.direction * along_scale + edge.normal * tip_slope_at_origin
     tip_dir_px = tip_dir_px / np.linalg.norm(tip_dir_px)
 
     return SideAnalysis(
@@ -334,7 +469,92 @@ def analyse_side(
         spectral_peak_freq=peak_freq,
         tip_line=(tip_origin_px, tip_dir_px),
         bottom_line=None,
+        roi_mm=roi_mm,
+        roi_manual=roi_manual,
     )
+
+
+#: A local noise level more than this multiple of the profile's own median
+#: local noise is flagged as an anomalous stretch (cancellation ink reading
+#: as background, a torn/broken run of teeth) rather than normal tooth
+#: shape -- the "high-amplitude noise on a baseline that should look like a
+#: sine wave" René described.
+ROI_NOISE_FACTOR = 2.5
+#: A detected bad stretch is widened by this many mm each side, so the
+#: transition into/out of the anomaly (which itself isn't clean signal)
+#: doesn't leak into the kept ROI.
+ROI_MARGIN_MM = 0.3
+#: A good run shorter than this isn't enough to estimate a period from on
+#: its own; such slivers are dropped rather than kept as a near-useless ROI.
+ROI_MIN_RUN_MM = 2.5
+
+
+def _detect_profile_roi(
+    s_grid: np.ndarray, depth_mm: np.ndarray, pitch_hint_mm: float
+) -> np.ndarray:
+    """Per-sample boolean mask: True where the profile looks like normal,
+    regular tooth shape; False in anomalous stretches (SPEC §6: cancellation
+    ink misread as background, broken/missing teeth).
+
+    Method: a robust local baseline (median filter, window ~1 pitch) gives
+    the expected smooth envelope; the residual's local RMS (same window)
+    is the "roughness" at each point. A healthy profile's roughness is
+    fairly uniform along its length (teeth are teeth), so the profile's own
+    median roughness is a robust reference -- no absolute threshold, no
+    gauge-accuracy dependency (``pitch_hint_mm`` only sizes the windows, a
+    rough guess is enough for that).
+    """
+    n = len(depth_mm)
+    step = s_grid[1] - s_grid[0] if n > 1 else PROFILE_STEP_MM
+    window = max(5, int(round(pitch_hint_mm / step)))
+    if window % 2 == 0:
+        window += 1
+    if n < 3 * window:
+        return np.ones(n, dtype=bool)  # too short to judge locally; trust it whole
+
+    baseline = median_filter(depth_mm, size=window, mode="nearest")
+    residual = depth_mm - baseline
+    local_rms = np.sqrt(
+        median_filter(residual**2, size=window, mode="nearest")
+    )  # a robust (median, not mean) local-energy estimate
+
+    reference = float(np.median(local_rms))
+    if reference < 1e-6:
+        return np.ones(n, dtype=bool)  # flat/near-zero signal; nothing to flag
+
+    bad = local_rms > reference * ROI_NOISE_FACTOR
+    margin_samples = max(1, int(round(ROI_MARGIN_MM / step)))
+    bad = np.convolve(bad.astype(np.uint8), np.ones(2 * margin_samples + 1), mode="same") > 0
+    return ~bad
+
+
+def _roi_runs_from_mask(s_grid: np.ndarray, good: np.ndarray) -> list[tuple[float, float]]:
+    """Contiguous True runs of ``good``, as (start_mm, end_mm) pairs, with
+    runs shorter than ``ROI_MIN_RUN_MM`` dropped."""
+    if not np.any(good):
+        return []
+    edges = np.diff(good.astype(np.int8))
+    starts = list(np.where(edges == 1)[0] + 1)
+    ends = list(np.where(edges == -1)[0] + 1)
+    if good[0]:
+        starts = [0, *starts]
+    if good[-1]:
+        ends = [*ends, len(good)]
+    runs = []
+    for s, e in zip(starts, ends, strict=True):
+        start_mm, end_mm = s_grid[s], s_grid[e - 1]
+        if end_mm - start_mm >= ROI_MIN_RUN_MM:
+            runs.append((float(start_mm), float(end_mm)))
+    return runs
+
+
+def _mask_from_roi(s_grid: np.ndarray, roi_mm: list[tuple[float, float]]) -> np.ndarray:
+    if not roi_mm:
+        return np.ones(len(s_grid), dtype=bool)
+    mask = np.zeros(len(s_grid), dtype=bool)
+    for start, end in roi_mm:
+        mask |= (s_grid >= start) & (s_grid <= end)
+    return mask
 
 
 def _estimate_period(
@@ -379,8 +599,19 @@ def _estimate_period(
 
 
 def _detect_holes(
-    s_grid: np.ndarray, depth_mm: np.ndarray, gauge_hint: float | None
+    s_grid: np.ndarray,
+    depth_mm: np.ndarray,
+    gauge_hint: float | None,
+    good_mask: np.ndarray | None = None,
 ) -> tuple[list[HoleDetection], float | None, float | None, float | None]:
+    """Peak-find holes on the full profile, then keep only those inside
+    ``good_mask`` (the ROI, SPEC §6) for the gauge regression -- a hole
+    right at a masked region's edge is still real, just not usable for the
+    period fit. Index assignment uses *position*, not detection order
+    (``round((s - s0) / pitch)``), so a masked gap or a missed hole
+    anywhere doesn't throw off every hole counted after it -- the
+    rectangular/periodic assumption René asked to lean on.
+    """
     pitch_hint_mm = 20.0 / gauge_hint if gauge_hint else 20.0 / 12.0
     min_distance = max(1, int(0.5 * pitch_hint_mm / PROFILE_STEP_MM))
     amplitude = depth_mm.max() - depth_mm.min()
@@ -388,6 +619,8 @@ def _detect_holes(
         return [], None, None, None
 
     peaks, _ = find_peaks(depth_mm, distance=min_distance, prominence=amplitude * 0.25)
+    if good_mask is not None:
+        peaks = np.array([p for p in peaks if good_mask[p]], dtype=int)
     if len(peaks) < 2:
         return [], None, None, None
 
@@ -397,11 +630,15 @@ def _detect_holes(
         for i, (s, p) in enumerate(zip(s_peaks, peaks, strict=True))
     ]
 
-    idx = np.arange(len(s_peaks))
+    raw_spacing = np.median(np.diff(s_peaks)) if len(s_peaks) > 1 else pitch_hint_mm
+    idx = np.round((s_peaks - s_peaks[0]) / raw_spacing)
     period, origin = np.polyfit(idx, s_peaks, 1)
     gauge_holes = 20.0 / period if period > 0 else None
 
-    spacings = np.diff(s_peaks)
+    # Spacing regularity is only meaningful between *physically adjacent*
+    # holes -- a masked gap's jump must not count as one giant "spacing".
+    adjacent = np.diff(idx) <= 1.5
+    spacings = np.diff(s_peaks)[adjacent]
     spacing_std = float(np.std(spacings)) if len(spacings) else None
     spacing_max_dev = float(np.max(np.abs(spacings - period))) if len(spacings) else None
 
@@ -502,12 +739,50 @@ def analyse_perforation(
     px_per_mm_x: float,
     px_per_mm_y: float,
     corner_exclusion_mm: float = DEFAULT_CORNER_EXCLUSION_MM,
+    manual_roi: dict[str, list[tuple[float, float]]] | None = None,
+    manual_box_px: np.ndarray | list[tuple[float, float]] | None = None,
+    condition: str | None = None,
+    multiplicity: str | None = None,
+    multiplicity_count: int | None = None,
 ) -> PerforationAnalysis:
     """Measure perforation gauge on all four sides of an upright stamp crop
-    (SPEC §6)."""
+    (SPEC §6). ``manual_roi``, keyed by side name, overrides auto ROI
+    detection for that side with the given (start_mm, end_mm) interval(s).
+    ``manual_box_px``, 4 (x, y) corners in sequential winding order, overrides
+    the auto-detected stamp rectangle (``detect_stamp_box``) that every
+    side's geometry is built from -- the GUI's editable perforation-box
+    overlay, for when the segmentation-derived rectangle doesn't actually
+    hug the stamp (e.g. cancellation ink merging with a dark mount/paper
+    background corrupts the outer contour).
+
+    ``condition``/``multiplicity``/``multiplicity_count`` are ``Stamp``'s
+    own catalogue fields (SPEC §12), threaded through here because they
+    bear directly on how trustworthy a measured gauge is, even though
+    neither changes the measurement itself:
+
+    - ``condition == CONDITION_ON_PAPER``: the backing paper/mount's own
+      torn or cut edge can run close to, or merge with, the stamp's true
+      edge in the segmentation mask, the same way cancellation ink merging
+      with a dark background corrupts a contour (``segment_stamp``'s own
+      docstring). There is no reliable way to separate "paper's edge" from
+      "stamp's edge" automatically here, so rather than silently returning
+      a number that may actually be describing the paper, every side's
+      confidence is capped and an explicit warning is attached -- "say so
+      instead of returning a plausible-looking number" (CLAUDE.md).
+    - ``multiplicity`` other than single: a pair/strip/block shares
+      perforation lines between neighbours, so a side classified here as
+      ``imperf``/``straight_edge`` is not necessarily the stamp's own
+      natural edge -- it may be the (unmeasured) line shared with a
+      neighbour that this crop simply doesn't show. Flagged as a warning
+      rather than guessed at, since which side(s) are shared isn't
+      information this function has.
+    """
     mask = segment_stamp(crop)
     contour_px = _outer_contour(mask)
-    edge_frames = _edge_frames(mask)
+    if manual_box_px is not None:
+        edge_frames = _edge_frames_from_box(np.asarray(manual_box_px, dtype=np.float64))
+    else:
+        edge_frames = _edge_frames(mask)
     side_labels = _classify_side(contour_px, edge_frames)
 
     sides: dict[str, SideAnalysis] = {}
@@ -541,11 +816,44 @@ def analyse_perforation(
             )
             continue
         sides[side] = analyse_side(
-            side, contour_px[sel], edge_frames[side], px_per_mm_x, px_per_mm_y, corner_exclusion_mm
+            side,
+            contour_px[sel],
+            edge_frames[side],
+            px_per_mm_x,
+            px_per_mm_y,
+            corner_exclusion_mm,
+            manual_roi_mm=(manual_roi or {}).get(side),
+        )
+
+    on_paper = condition == CONDITION_ON_PAPER
+    if on_paper:
+        on_paper_warning = (
+            "stamp is on paper: the backing paper/mount's own edge can "
+            "contaminate the segmentation near the stamp's true edge the "
+            "same way cancellation ink does -- gauge values below are "
+            "provisional, confidence capped"
+        )
+        for side in sides.values():
+            if side.confidence > 0.0:
+                side.confidence = min(side.confidence, 0.5)
+                side.warnings.append(on_paper_warning)
+
+    grouped = multiplicity is not None and multiplicity != MULTIPLICITY_SINGLE
+    multiplicity_warning = None
+    if grouped:
+        count_str = f" of {multiplicity_count}" if multiplicity_count else ""
+        multiplicity_warning = (
+            f"stamp is recorded as a {multiplicity}{count_str}: a side "
+            "classified as imperf/straight_edge here may actually be a "
+            "perforation line shared with a neighbouring stamp, not this "
+            "stamp's own natural edge -- which side(s) are shared is not "
+            "determined automatically"
         )
 
     confidences = [s.confidence for s in sides.values()]
     overall_warnings = [w for s in sides.values() for w in s.warnings]
+    if multiplicity_warning:
+        overall_warnings.append(multiplicity_warning)
     return PerforationAnalysis(
         sides=sides,
         confidence=float(np.mean(confidences)) if confidences else 0.0,
@@ -602,6 +910,45 @@ def manual_side_from_points(
 # --------------------------------------------------------------------------
 
 
+def _shade_roi(ax, side: SideAnalysis) -> None:
+    """Shade the profile's excluded (non-ROI) stretches in red and the
+    kept ROI in green, so a noisy/masked region is visible on the plot
+    itself (SPEC §6), not just implied by the gauge number."""
+    if not len(side.profile_s_mm):
+        return
+    s_min, s_max = float(side.profile_s_mm[0]), float(side.profile_s_mm[-1])
+    roi = sorted(side.roi_mm) if side.roi_mm else [(s_min, s_max)]
+    cursor = s_min
+    for start, end in roi:
+        if start > cursor:
+            ax.axvspan(cursor, start, color="red", alpha=0.12, lw=0)
+        ax.axvspan(start, end, color="green", alpha=0.08, lw=0)
+        cursor = max(cursor, end)
+    if cursor < s_max:
+        ax.axvspan(cursor, s_max, color="red", alpha=0.12, lw=0)
+
+
+def render_side_profile(side: SideAnalysis) -> bytes:
+    """One side's profile plot alone (no spectrum, no stamp photo) -- for
+    the GUI's per-side ROI range-slider, drawn directly under this image so
+    the user can see exactly what stretch they're selecting (SPEC §6: "I
+    would like to select a region from that plot to run the fft on")."""
+    fig, ax = plt.subplots(figsize=(5.0, 1.8))
+    if len(side.profile_s_mm):
+        ax.plot(side.profile_s_mm, side.profile_depth_mm, lw=0.6)
+        for h in side.holes:
+            ax.axvline(h.s_mm, color="red", lw=0.3, alpha=0.5)
+        _shade_roi(ax, side)
+        ax.set_xlim(float(side.profile_s_mm[0]), float(side.profile_s_mm[-1]))
+    ax.set_title(f"{side.side} profile ({side.hole_count} holes)", fontsize=8)
+    ax.tick_params(labelsize=6)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=130)
+    plt.close(fig)
+    return buf.getvalue()
+
+
 def render_diagnostic(crop: np.ndarray, analysis: PerforationAnalysis) -> bytes:
     """Annotated crop with fitted lines, detected holes, and per-side
     profile/spectrum mini-plots."""
@@ -650,7 +997,9 @@ def render_diagnostic(crop: np.ndarray, analysis: PerforationAnalysis) -> bytes:
             ax_p.plot(side.profile_s_mm, side.profile_depth_mm, lw=0.6)
             for h in side.holes:
                 ax_p.axvline(h.s_mm, color="red", lw=0.3, alpha=0.5)
-        ax_p.set_title(f"{side_name} profile ({side.hole_count} holes)", fontsize=8)
+            _shade_roi(ax_p, side)
+        roi_tag = " [manual ROI]" if side.roi_manual else ""
+        ax_p.set_title(f"{side_name} profile ({side.hole_count} holes){roi_tag}", fontsize=8)
         ax_p.set_xlabel("mm", fontsize=7)
         ax_p.tick_params(labelsize=6)
 
