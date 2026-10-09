@@ -15,7 +15,6 @@ from stampan.core import perforation as perforation_mod
 from stampan.core import philatelic_colours as philatelic_colours_mod
 from stampan.core import project as project_mod
 from stampan.core import scanner as scanner_mod
-from stampan.core.calibration import it8 as it8_mod
 from stampan.core.calibration import reference as ref_mod
 from stampan.core.io import ScanMetadata, read_tiff
 from stampan.core.models import GeometryResult, Stamp
@@ -147,70 +146,38 @@ def _parse_floats(s: str) -> list[float]:
 def reference_create(
     scan_path: Path = typer.Option(..., "--scan", help="Reference scan TIFF."),
     name: str = typer.Option(...),
-    it8_corners: str = typer.Option(
-        ..., help="a1x,a1y,a22x,a22y,l1x,l1y,l22x,l22y (patch centres, in px)"
-    ),
-    it8_gs_corners: str | None = typer.Option(
+    dpi: float | None = typer.Option(
         None,
-        help="gs0x,gs0y,gs23x,gs23y (grey-ramp row centres, in px). Strongly recommended: "
-        "the GS row is a separate strip, not a simple extrapolation below row L -- see "
-        "core/calibration/it8.py. Omitting it falls back to that unreliable extrapolation.",
+        help="Scan resolution (dpi), for px/mm (SPEC §4.1/§4.2 -- no ruler). Defaults to the "
+        "scan's own embedded scanner_options['resolution'] if present (a verified setting, "
+        "for a scan this app itself captured); otherwise required.",
     ),
-    ruler_x: str | None = typer.Option(
-        None,
-        help="cx,cy,length_px,width_px,angle_deg,tick_spacing_mm,px_per_mm_hint. "
-        "Omit if the scan has no ruler -- the reference is then colour-only, with no scale.",
-    ),
-    ruler_y: str | None = typer.Option(
-        None, help="Same format as --ruler-x; omit to assume y scale = x scale."
+    dpi_y: float | None = typer.Option(
+        None, help="Y resolution, if it differs from --dpi. Omit to assume isotropic."
     ),
     cgats: Path = typer.Option(DEFAULT_CGATS_PATH, help="CGATS/IT8 reference data file."),
     library_root: Path = typer.Option(DEFAULT_LIBRARY_ROOT),
     notes: str = typer.Option(""),
 ) -> None:
-    """Build and save a Reference from a scan, IT8 corners, and (optionally) ruler region(s)."""
+    """Build and save a Reference from a scan. IT8 patch location is fully
+    automatic via ArgyllCMS's `scanin` (SPEC §4.3) -- no corners needed."""
     scan_image, scan_metadata = read_tiff(scan_path)
 
-    x_axis = None
-    if ruler_x:
-        rx = _parse_floats(ruler_x)
-        x_axis = ref_mod.RulerAxisSpec(
-            centre_xy=(rx[0], rx[1]),
-            length_px=rx[2],
-            width_px=rx[3],
-            angle_deg=rx[4],
-            tick_spacing_mm=rx[5],
-            px_per_mm_hint=rx[6],
-        )
-    y_axis = None
-    if ruler_y:
-        ry = _parse_floats(ruler_y)
-        y_axis = ref_mod.RulerAxisSpec(
-            centre_xy=(ry[0], ry[1]),
-            length_px=ry[2],
-            width_px=ry[3],
-            angle_deg=ry[4],
-            tick_spacing_mm=ry[5],
-            px_per_mm_hint=ry[6],
-        )
-
-    c = _parse_floats(it8_corners)
-    gs0 = gs23 = None
-    if it8_gs_corners:
-        g = _parse_floats(it8_gs_corners)
-        gs0, gs23 = (g[0], g[1]), (g[2], g[3])
-    corners = it8_mod.IT8Corners(
-        a1=(c[0], c[1]), a22=(c[2], c[3]), l1=(c[4], c[5]), l22=(c[6], c[7]), gs0=gs0, gs23=gs23
-    )
+    dpi_source = "typed by hand (--dpi)"
+    if dpi is None:
+        embedded = scan_metadata.scanner_options.get("resolution")
+        if embedded is not None:
+            dpi = float(embedded)
+            dpi_source = "verified scanner setting (embedded scan metadata)"
 
     result = ref_mod.build_reference(
         name=name,
         scan=scan_image,
         scan_metadata=scan_metadata,
-        x_axis=x_axis,
-        it8_corners=corners,
+        dpi_x=dpi,
+        dpi_y=dpi_y,
+        dpi_source=dpi_source,
         cgats_reference_path=cgats,
-        y_axis=y_axis,
         notes=notes,
     )
     ref_dir = ref_mod.save_reference(result, library_root)
@@ -360,6 +327,11 @@ def perf(
 
         crop = project_mod.load_stamp_crop(library_root, proj.project_id, stamp_id)
         stamp_obj = project_mod.load_stamp(library_root, proj.project_id, stamp_id)
+        # Respect a previously-saved box/gauge-range (e.g. from the GUI --
+        # a bulk re-measure shouldn't throw away a hand-corrected box or a
+        # deliberately narrowed gauge range), falling back to the same
+        # defaults the GUI itself starts a never-touched stamp at.
+        gauge_range = stamp_obj.perforation.gauge_range or perforation_mod.DEFAULT_GAUGE_RANGE
         analysis = perforation_mod.analyse_perforation(
             crop,
             px_per_mm_x,
@@ -369,13 +341,19 @@ def perf(
             condition=stamp_obj.condition,
             multiplicity=stamp_obj.multiplicity,
             multiplicity_count=stamp_obj.multiplicity_count,
+            gauge_range=gauge_range,
         )
         diagnostic_png = perforation_mod.render_diagnostic(crop, analysis)
+        side_pngs = {
+            f"perforation_{name}.png": perforation_mod.render_side_profile(side)
+            for name, side in analysis.sides.items()
+        }
         notation = perforation_mod.perforation_result_notation(analysis.sides)
 
         stamp_obj.perforation.auto = {
             name: side.to_persisted() for name, side in analysis.sides.items()
         }
+        stamp_obj.perforation.gauge_range = gauge_range
         stamp_obj.perforation.meta.confidence = analysis.confidence
         stamp_obj.perforation.meta.warnings = analysis.warnings
         stamp_obj.perforation.meta.diagnostic_image = "diagnostics/perforation.png"
@@ -383,7 +361,7 @@ def perf(
             library_root,
             proj.project_id,
             stamp_obj,
-            diagnostics={"perforation.png": diagnostic_png},
+            diagnostics={"perforation.png": diagnostic_png, **side_pngs},
         )
         n_ok += 1
         typer.echo(f"{stamp_id}: {notation} (confidence {analysis.confidence:.2f})")

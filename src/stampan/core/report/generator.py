@@ -374,8 +374,9 @@ def build_report_context(library_root: str | Path, project: Project) -> ReportCo
                 )
             )
             for cluster in stamp.colour.clusters:
-                if cluster.label != "paper":
-                    ink_cluster_entries.append((f"{stamp.stamp_id}/{cluster.label}", cluster))
+                if cluster.label != "paper" and cluster.overview_included:
+                    label = cluster.overview_label or f"{stamp.stamp_id}/{cluster.label}"
+                    ink_cluster_entries.append((label, cluster))
 
     colour_overview_image = None
     if ink_cluster_entries:

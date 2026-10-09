@@ -1,14 +1,27 @@
 """Build, save and load a :class:`~stampan.core.models.Reference` (SPEC §3.1, §4.4).
 
-Ties together geometry (ruler) and colour (IT8) calibration into one
+Ties together geometry (scanner DPI) and colour (IT8) calibration into one
 persisted object: `<library_root>/references/<ref_id>/` holding
 `reference.json`, `reference_scan.tif`, `model.npz`, and `diagnostics/*.png`.
+
+Geometric (px/mm) calibration used to come from a ruler scanned alongside
+the IT8 target (a fitted tick-spacing regression) -- removed at René's
+explicit direction once a real scanner was available to test against:
+the scanner's own resolution setting, read back and confirmed by
+``core.scanner.apply_and_verify`` before the scan is taken, is a direct
+hardware-reported value rather than something inferred from the image, and
+is simpler and no less trustworthy than a ruler fit for a flatbed scanner
+(unlike, say, a photographed stamp at an unknown, uncalibrated distance).
+A DPI value from anywhere *other* than that verified setting -- typed by
+hand for an externally-captured scan, or read from a TIFF's own resolution
+tag -- is not inherently trustworthy and is surfaced as such (SPEC §4.1/§4.2).
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import tempfile
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -16,21 +29,18 @@ from typing import Any
 import numpy as np
 
 from stampan.core.calibration import characterisation as char
-from stampan.core.calibration import geometry as geom
 from stampan.core.calibration import it8
+from stampan.core.calibration import scanin as scanin_mod
 from stampan.core.cgats import parse_cgats_file
 from stampan.core.io import ScanMetadata, read_tiff, write_tiff
 from stampan.core.models import ColourModelInfo, Reference, ScaleCalibration
 
+#: mm per inch, for dpi -> px/mm.
+MM_PER_INCH = 25.4
 
-@dataclass
-class RulerAxisSpec:
-    centre_xy: tuple[float, float]
-    length_px: float
-    width_px: float
-    angle_deg: float
-    tick_spacing_mm: float
-    px_per_mm_hint: float
+
+def px_per_mm_from_dpi(dpi: float) -> float:
+    return dpi / MM_PER_INCH
 
 
 @dataclass
@@ -39,6 +49,13 @@ class ReferenceBuildResult:
     diagnostics: dict[str, bytes]  # relative filename -> PNG bytes
     model_arrays: dict[str, Any]  # for np.savez
     scan: np.ndarray
+    # Every candidate colour-model kind's own cv ΔE00 stats, keyed by kind
+    # -- the wizard's review table (SPEC §4.4/§8: "review the validation
+    # (ΔE00 table...)"), so the user can see *why* the best one was chosen,
+    # not just its own number in isolation. Same data as the persisted
+    # model_comparison.json diagnostic, just available without a round
+    # trip through disk for the GUI's review step.
+    model_comparison: dict[str, dict[str, float]] = field(default_factory=dict)
 
 
 def _new_ref_id() -> str:
@@ -65,57 +82,90 @@ def build_reference(
     name: str,
     scan: np.ndarray,
     scan_metadata: ScanMetadata,
-    it8_corners: it8.IT8Corners,
     cgats_reference_path: str | Path,
-    x_axis: RulerAxisSpec | None = None,
-    y_axis: RulerAxisSpec | None = None,
+    dpi_x: float | None = None,
+    dpi_y: float | None = None,
+    dpi_source: str = "unspecified",
     notes: str = "",
+    scanin_cmd: str = "scanin",
+    cht_path: str | Path | None = None,
 ) -> ReferenceBuildResult:
+    """``dpi_x``/``dpi_y`` give the geometric (px/mm) calibration directly
+    from the scanner's own resolution setting -- no ruler (SPEC §4.1/§4.2,
+    removed at René's direction). ``dpi_y`` omitted assumes an isotropic
+    scanner (true of virtually all flatbeds; most don't even expose
+    separate x/y resolution). ``dpi_source`` is recorded in the reference's
+    notes for traceability -- e.g. "verified scanner setting" (the GUI's
+    live-scan wizard path, where ``apply_and_verify`` already confirmed
+    this exact value was in effect) versus "typed by hand" (an externally
+    captured scan, where it is only as trustworthy as whoever supplied it).
+
+    IT8 patch location is entirely automatic via ArgyllCMS's `scanin`
+    (SPEC §4.3) -- no corner marking. The earlier "click 4-6 corner
+    points, bilinearly interpolate" approach needed pixel-precise manual
+    clicks (small errors compound across the 22x12 grid) and its point
+    labels were visually ambiguous enough to cause real misclicks (row L
+    read as row I); `scanin` locates the chart's own printed fiducial
+    marks and patch grid directly from the scan instead, confirmed exact
+    against a real scan via its own diagnostic overlay.
+    """
     warnings: list[str] = []
     diagnostics: dict[str, bytes] = {}
-    scale_x = scale_y = None
+
+    scale_x_val = scale_y_val = None
     assumed_isotropic = False
-
-    if x_axis is not None:
-        scale_x, profile_x = geom.calibrate_axis(
-            scan,
-            x_axis.centre_xy,
-            x_axis.length_px,
-            x_axis.width_px,
-            x_axis.angle_deg,
-            x_axis.tick_spacing_mm,
-            x_axis.px_per_mm_hint,
-        )
-        diagnostics["geometry_x.png"] = geom.render_diagnostic(scale_x, profile_x)
-
-        assumed_isotropic = y_axis is None
-        if y_axis is not None:
-            scale_y, profile_y = geom.calibrate_axis(
-                scan,
-                y_axis.centre_xy,
-                y_axis.length_px,
-                y_axis.width_px,
-                y_axis.angle_deg,
-                y_axis.tick_spacing_mm,
-                y_axis.px_per_mm_hint,
-            )
-            diagnostics["geometry_y.png"] = geom.render_diagnostic(scale_y, profile_y)
-        else:
-            warnings.append("no y-axis ruler given; assuming y scale = x scale (isotropic)")
-            scale_y = scale_x
-            diagnostics["geometry_y.png"] = diagnostics["geometry_x.png"]
+    if dpi_x is not None:
+        scale_x_val = px_per_mm_from_dpi(dpi_x)
+        assumed_isotropic = dpi_y is None
+        scale_y_val = px_per_mm_from_dpi(dpi_y) if dpi_y is not None else scale_x_val
+        if assumed_isotropic:
+            warnings.append("no y-resolution given; assuming y scale = x scale (isotropic)")
     else:
         warnings.append(
-            "no ruler region given; geometric (px/mm) calibration was not performed. "
+            "no scan resolution (dpi) given; geometric (px/mm) calibration was not performed. "
             "Perforation gauge and stamp dimensions cannot be measured with this reference "
-            "until it is rebuilt with a ruler."
+            "until it is rebuilt with a resolution."
         )
 
-    samples = it8.sample_it8_grid(scan, it8_corners)
-    diagnostics["it8_grid.png"] = it8.render_diagnostic(scan, it8_corners, samples)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        scan_tmp_path = Path(tmpdir) / "scan_for_scanin.tif"
+        write_tiff(scan_tmp_path, scan.astype(np.uint16))
+        scanin_result = scanin_mod.locate_and_sample_patches(
+            scan_tmp_path,
+            cgats_reference_path,
+            native_max_value=65535.0,
+            cht_path=cht_path,
+            scanin_cmd=scanin_cmd,
+        )
+    samples = scanin_result.samples
+    if scanin_result.diagnostic_png is not None:
+        diagnostics["it8_grid.png"] = scanin_result.diagnostic_png
     diagnostics["it8_std_heatmap.png"] = it8.render_std_heatmap(samples)
 
     patch_ids, rgb, xyz = _patch_rgb_xyz_arrays(samples, cgats_reference_path)
+
+    # Sanity check: scanin occasionally picks the wrong one of several
+    # candidate orientations/correspondences for a chart (confirmed on a
+    # real scan: the sample grid still geometrically tiled every patch
+    # correctly -- so it looked fine in the diagnostic at a glance -- but
+    # each box was matched to the wrong patch ID, e.g. the GS row ending
+    # up above row A instead of below row L, silently scrambling which
+    # sampled RGB got compared to which CGATS XYZ entry during model
+    # fitting). A correct correspondence must show brighter patches
+    # measuring brighter; that single real failure scored -0.16 here
+    # against 0.98 for correct builds. Refuse rather than silently fit (and
+    # let the user save) a model trained against scrambled correspondences
+    # -- CLAUDE.md: never invent a measurement result.
+    luma_xyz_corr = float(np.corrcoef(rgb.mean(axis=1), xyz[:, 1])[0, 1])
+    if luma_xyz_corr < 0.7:
+        raise scanin_mod.ScaninError(
+            "scanin's patch recognition looks wrong (luma-vs-XYZ_Y correlation "
+            f"{luma_xyz_corr:.2f}, expected > 0.7 for a correct match) -- it likely "
+            "matched the chart at the wrong rotation/orientation. Check the "
+            "target's physical placement on the bed (e.g. not upside down) and "
+            "rescan; if it recurs, try nudging the target slightly or rescanning "
+            "at a different angle."
+        )
 
     # Grey-ramp linearisation (SPEC §4.3): fit from GS patches, apply to all.
     gs_mask = [pid.startswith("GS") for pid in patch_ids]
@@ -165,13 +215,19 @@ def build_reference(
         notes=notes,
         scanner_options=dict(scan_metadata.scanner_options),
         scale=ScaleCalibration(
-            px_per_mm_x=scale_x.px_per_mm,
-            px_per_mm_y=scale_y.px_per_mm,
-            uncertainty_x=scale_x.se_px_per_mm,
-            uncertainty_y=scale_y.se_px_per_mm,
+            px_per_mm_x=scale_x_val,
+            px_per_mm_y=scale_y_val,
+            # Not a statistically-fit uncertainty (there's no regression
+            # here to report one from) -- 0.0 reflects that the DPI value
+            # itself is taken as exact, which is only as good as
+            # dpi_source says it is; the scan head's own mechanical
+            # positioning repeatability isn't characterised at all (SPEC
+            # §4.1/§4.2 -- flagged here rather than inventing a number).
+            uncertainty_x=0.0,
+            uncertainty_y=0.0,
             assumed_isotropic=assumed_isotropic,
         )
-        if scale_x is not None
+        if scale_x_val is not None
         else None,
         colour_model=ColourModelInfo(
             kind=best_kind,
@@ -181,11 +237,10 @@ def build_reference(
         ),
         scan_path="reference_scan.tif",
     )
+    if scale_x_val is not None:
+        warnings.append(f"scale source: {dpi_source}")
 
-    scale_warnings = (scale_x.warnings if scale_x is not None else []) + (
-        scale_y.warnings if (scale_y is not None and y_axis is not None) else []
-    )
-    all_warnings = warnings + scale_warnings
+    all_warnings = warnings
     if all_warnings:
         reference.notes = (
             (reference.notes + "\n" if reference.notes else "")
@@ -197,7 +252,11 @@ def build_reference(
     diagnostics["model_comparison.json"] = json.dumps(model_comparison, indent=2).encode("utf-8")
 
     return ReferenceBuildResult(
-        reference=reference, diagnostics=diagnostics, model_arrays=model_arrays, scan=scan
+        reference=reference,
+        diagnostics=diagnostics,
+        model_arrays=model_arrays,
+        scan=scan,
+        model_comparison=model_comparison,
     )
 
 
@@ -211,6 +270,16 @@ def save_reference(result: ReferenceBuildResult, library_root: str | Path) -> Pa
     for filename, data in result.diagnostics.items():
         (ref_dir / "diagnostics" / filename).write_bytes(data)
     return ref_dir
+
+
+def save_reference_metadata(library_root: str | Path, reference: Reference) -> Path:
+    """Re-write just reference.json (rename, archive/unarchive, notes) --
+    the scan and colour model are unaffected, so there's no need to touch
+    them for a metadata-only edit."""
+    ref_dir = Path(library_root) / "references" / reference.ref_id
+    path = ref_dir / "reference.json"
+    path.write_text(reference.to_json(), encoding="utf-8")
+    return path
 
 
 def load_reference(library_root: str | Path, ref_id: str) -> Reference:

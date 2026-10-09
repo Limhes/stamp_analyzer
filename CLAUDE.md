@@ -50,7 +50,9 @@ choices at an expert level. Do not simplify, and do not hand-wave.
 - PySide6 and pyqtgraph (including `pyqtgraph.opengl`) for the GUI.
 - Jinja2 and WeasyPrint for reports.
 - pytest for tests and ruff for linting/formatting.
-- ArgyllCMS (system package, optional) as a cross-check for the colour profile.
+- ArgyllCMS (system package, `argyll` + `argyll-ref`) -- **required**, not optional:
+  `scanin` does all IT8 patch location (SPEC §4.3). `colprof`/`cctiff` remain an
+  optional cross-check on the fitted colour model itself.
 - SANE through `scanimage` (subprocess); `python-sane` is optional.
 
 ## Commands

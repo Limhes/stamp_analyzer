@@ -57,6 +57,22 @@ def main() -> int:
 
     depth_inactive = os.environ.get("FAKE_SCANNER_DEPTH_INACTIVE") == "1"
 
+    # Apply any --option=value assignments first, exactly like the real
+    # scanimage does when -n and/or -A are combined with option flags in
+    # the same invocation -- this fake's state only persists for the
+    # duration of one process (see module docstring), mirroring the real
+    # epson2 backend's lack of cross-invocation persistence.
+    for a in args:
+        if a.startswith("--") and "=" in a:
+            name, value = a.split("=", 1)
+            if name == "--depth" and depth_inactive:
+                print(
+                    f"scanimage: attempted to set inactive option {name.lstrip('-')}",
+                    file=sys.stderr,
+                )
+                return 1
+            state[name] = value
+
     if "-A" in args:
         depth_line = (
             "    --depth 8bit [inactive]"

@@ -40,8 +40,12 @@ _DEVICE_LINE_RE = re.compile(r"^device `([^']+)' is a (.+)$")
 # e.g. "    --resolution 50..1200dpi (in steps of 1) [300]"
 #      "    -l 0..216.069mm [0]"
 #      "    --test [no]"
+#      "    --color-correction None|... [None] [advanced]" -- a trailing
+#      "[advanced]"/"[inactive]"-style tag is a SECOND bracket group after
+#      the value, so `current` must take the FIRST bracket on the line, not
+#      the last (an end-anchored match would grab "advanced" as the value).
 _OPTION_LINE_RE = re.compile(
-    r"^ {4}(?P<name>-{1,2}[\w-]+)(?:\s+(?P<constraint>.*?))?\s*\[(?P<current>[^\]]*)\]\s*$"
+    r"^ {4}(?P<name>-{1,2}[\w-]+)(?:\s+(?P<constraint>.*?))?\s*\[(?P<current>[^\]]*)\]"
 )
 
 
@@ -149,31 +153,53 @@ def dump_options(
     return ScannerOptions(device=device, raw_text=proc.stdout, options=options)
 
 
+#: Options this backend accepts but never echoes a current value for in
+#: `-A` output (confirmed: `--{red,green,blue}-gamma-table`, active or
+#: not, print just the constraint line with no trailing "[...]") -- there
+#: is nothing to read back and compare, so apply_and_verify can't apply
+#: its normal all-or-nothing check to them without permanently refusing to
+#: ever set them. They're still applied; the caller just can't get the
+#: same hard guarantee SPEC §4.1 asks for on everything else.
+UNVERIFIABLE_OPTION_SUFFIXES = ("-gamma-table",)
+
+
 def apply_and_verify(
     options: dict[str, str],
     device: str | None = None,
     scanimage_cmd: str = "scanimage",
 ) -> dict[str, tuple[str, str]]:
     """Apply `options` (long-option-name -> value, without leading dashes) and
-    read them back with a second `-A` call.
+    read them back, in a single `scanimage` invocation.
+
+    Setting options and dumping them must happen in the same process: a
+    direct-USB SANE backend (confirmed on the Epson 1200U's `epson2`
+    backend) does not persist option state across separate `scanimage`
+    invocations, so a set-then-dump done as two calls always reads back
+    the backend's power-on defaults rather than what was just requested.
 
     Returns a dict of mismatches: {option_name: (requested, actual)}. An
-    empty dict means every option was applied and verified. Per SPEC §4.1,
-    the caller must refuse to scan (or warn loudly) on a non-empty result.
+    empty dict means every *verifiable* option was applied and confirmed
+    (see `UNVERIFIABLE_OPTION_SUFFIXES`). Per SPEC §4.1, the caller must
+    refuse to scan (or warn loudly) on a non-empty result.
     """
-    args = [scanimage_cmd, "-n"]  # -n: set options, don't scan
+    args = [scanimage_cmd]
     if device:
         args += ["-d", device]
     for name, value in options.items():
         flag = name if name.startswith("-") else f"--{name}"
         args += [f"{flag}={value}"]
+    args += ["-n", "-A"]  # -n: set options, don't scan; -A: dump resulting state
     proc = _run(args)
     if proc.returncode != 0:
         raise ScannerError(f"applying scanner options failed: {proc.stderr.strip()}")
 
-    verified = dump_options(device=device, scanimage_cmd=scanimage_cmd)
+    verified = ScannerOptions(
+        device=device, raw_text=proc.stdout, options=_parse_options_text(proc.stdout)
+    )
     mismatches: dict[str, tuple[str, str]] = {}
     for name, requested in options.items():
+        if name.endswith(UNVERIFIABLE_OPTION_SUFFIXES):
+            continue
         flag = name if name.startswith("-") else f"--{name}"
         actual_opt = verified.options.get(flag)
         actual = actual_opt.current if actual_opt else "<option not found>"
@@ -225,7 +251,7 @@ def acquire_scan(
     if device:
         args += ["-d", device]
     if resolution_dpi is not None:
-        args += [f"--resolution={resolution_dpi}"]
+        args += [f"--resolution={int(resolution_dpi)}"]
     if mode:
         args += [f"--mode={mode}"]
     if depth_option_active:

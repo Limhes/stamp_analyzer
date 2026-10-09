@@ -95,6 +95,12 @@ class PerforationResult:
     # cancellation ink merging with a dark mount/paper background). None
     # means "use the auto-detected box".
     box_override_px: list[tuple[float, float]] | None = None
+    # (min, max) gauge the FFT peak search is restricted to (SPEC §6: the
+    # GUI's single top-of-panel range slider, replacing per-side spatial
+    # ROI sliders) -- narrows which peak in the spectrum counts as "the"
+    # periodicity instead of risking a spurious one elsewhere in the full
+    # 6-18 default band winning. None means "use the full default band".
+    gauge_range: tuple[float, float] | None = None
     meta: AnalysisMeta = field(default_factory=AnalysisMeta)
 
     def effective(self) -> dict[PerfSide, PerforationSide]:
@@ -119,6 +125,7 @@ class PerforationResult:
                 if d.get("box_override_px") is not None
                 else None
             ),
+            gauge_range=(tuple(d["gauge_range"]) if d.get("gauge_range") is not None else None),
             meta=AnalysisMeta.from_dict(d.get("meta", {})),
         )
 
@@ -156,6 +163,17 @@ class ColourCluster:
     # draw-a-ROI-per-colour workflow); None for a cluster that didn't come
     # from a saved ROI (e.g. the CLI's GMM-based `analyse_colour`).
     mask_path: str | None = None
+    # The project-level colour overview (all stamps' inks plotted together,
+    # SPEC §9/§10) is a cross-stamp *comparison*, not a per-stamp
+    # measurement -- whether a cluster appears there and under what label
+    # is a presentation choice the user makes in that view, so it's stored
+    # on the cluster itself rather than recomputed from scratch each time.
+    # overview_included defaults to True so a freshly-measured ink cluster
+    # shows up without an extra step; overview_label falls back to
+    # "{stamp_id}/{cluster.label}" (the report's own prior default) when
+    # unset.
+    overview_included: bool = True
+    overview_label: str | None = None
 
     @staticmethod
     def from_dict(d: dict[str, Any]) -> ColourCluster:
@@ -175,6 +193,8 @@ class ColourCluster:
             srgb_swatch=tuple(d["srgb_swatch"]) if d.get("srgb_swatch") is not None else None,
             out_of_gamut=d.get("out_of_gamut", False),
             mask_path=d.get("mask_path"),
+            overview_included=d.get("overview_included", True),
+            overview_label=d.get("overview_label"),
         )
 
 
@@ -336,6 +356,12 @@ class Reference:
     scale: ScaleCalibration | None = None
     colour_model: ColourModelInfo | None = None
     scan_path: str | None = None
+    # Soft-hide, not delete (SPEC §4.4's reference manager): an archived
+    # reference stays on disk and anything already built against it keeps
+    # working, it just drops out of the default "pick a reference" lists
+    # (sample import, the wizard's "compare" picker) so a long-lived
+    # library doesn't accumulate every retired reference in every chooser.
+    archived: bool = False
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, ensure_ascii=False)
@@ -353,6 +379,7 @@ class Reference:
             scale=ScaleCalibration.from_dict(scale) if scale else None,
             colour_model=ColourModelInfo.from_dict(colour_model) if colour_model else None,
             scan_path=d.get("scan_path"),
+            archived=d.get("archived", False),
         )
 
     @staticmethod

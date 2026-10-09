@@ -17,9 +17,11 @@ from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import (
     QGraphicsEllipseItem,
+    QGraphicsItem,
     QGraphicsPolygonItem,
     QGraphicsRectItem,
     QGraphicsScene,
+    QGraphicsSimpleTextItem,
     QGraphicsView,
 )
 
@@ -31,6 +33,7 @@ TOOL_ELLIPSE = "ellipse"
 TOOL_POLYGON = "polygon"
 TOOL_BRUSH = "brush"
 TOOL_PERF_BOX = "perf_box"
+TOOL_POINTS = "points"
 
 MODE_INCLUDE = "include"
 MODE_ERASE = "erase"
@@ -49,6 +52,15 @@ _PERF_HANDLE_HIT_PX = 26.0
 _PERF_ROTATE_OFFSET_PX = 28.0
 _PERF_MIN_HALF_SIZE_PX = 5.0
 _PERF_CORNER_SIGNS = {0: (-1, -1), 1: (1, -1), 2: (1, 1), 3: (-1, 1)}
+
+#: Non-interactive "every detected stamp" overview (SPEC §5), shown while
+#: no single stamp is being edited.
+_STATIC_BOX_COLOUR = QColor(80, 200, 255)
+
+#: Click-to-mark labeled points (SPEC §4.4/§8: the reference wizard's IT8
+#: corners and ruler endpoints). Reuses the perf-box handle's fixed
+#: on-screen size (_make_perf_handle) for the marker itself.
+_POINT_COLOUR = QColor(255, 80, 200)
 
 
 def _display_image(rgb: np.ndarray) -> np.ndarray:
@@ -69,6 +81,7 @@ class ImageViewer(QGraphicsView):
     pixel_info = Signal(object)  # dict or None
     roi_changed = Signal(str)  # the active ROI's name, whenever its mask changes
     perf_box_changed = Signal()  # the perforation-box overlay geometry changed
+    points_changed = Signal()  # a labeled point was placed or undone
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -107,6 +120,13 @@ class ImageViewer(QGraphicsView):
         self._perf_drag_start: tuple[float, float, float, float, float] | None = None
         self._perf_drag_start_corners: np.ndarray | None = None
 
+        self._static_box_items: list = []
+
+        self._point_labels: list[str] = []
+        self._points: dict[str, tuple[float, float]] = {}
+        self._point_order: list[str] = []
+        self._point_items: list = []
+
     # -- loading -----------------------------------------------------
 
     def set_image(
@@ -126,6 +146,11 @@ class ImageViewer(QGraphicsView):
         self._active_roi = None
         self._perf_box = None
         self._perf_box_items = []
+        self._static_box_items = []
+        self._point_labels = []
+        self._points = {}
+        self._point_order = []
+        self._point_items = []
 
         self._scene.clear()
         pixmap = QPixmap.fromImage(_to_qimage(_display_image(rgb)))
@@ -133,6 +158,13 @@ class ImageViewer(QGraphicsView):
         self._scene.setSceneRect(QRectF(0, 0, pixmap.width(), pixmap.height()))
         self._mask_item = self._scene.addPixmap(QPixmap())
         self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+
+    def image_size(self) -> tuple[int, int] | None:
+        """(width_px, height_px) of the currently-loaded image, or None."""
+        if self._rgb is None:
+            return None
+        h, w = self._rgb.shape[:2]
+        return w, h
 
     # -- ROI management ----------------------------------------------------
 
@@ -210,6 +242,18 @@ class ImageViewer(QGraphicsView):
         self._perf_box = (float(centre[0]), float(centre[1]), width / 2.0, height / 2.0, theta)
         self._refresh_perf_box()
 
+    def zoom_to_perf_box(self, margin_factor: float = 2.5) -> None:
+        """Fit the view to the current box plus a wide margin around it, so
+        picking a stamp from a list (SPEC §5) actually brings it into view
+        close enough to drag its handles, instead of leaving it a speck on
+        a full sample-sheet scan."""
+        if self._perf_box is None:
+            return
+        cx, cy, hw, hh, _theta = self._perf_box
+        half_w, half_h = hw * margin_factor, hh * margin_factor
+        rect = QRectF(cx - half_w, cy - half_h, 2 * half_w, 2 * half_h)
+        self.fitInView(rect, Qt.AspectRatioMode.KeepAspectRatio)
+
     def get_perf_box(self) -> np.ndarray | None:
         """The 4 corners (px, sequential winding) of the current rectangle,
         or None if none is shown -- feed this straight back into
@@ -231,6 +275,113 @@ class ImageViewer(QGraphicsView):
     def clear_perf_box(self) -> None:
         self._perf_box = None
         self._clear_perf_box_items()
+
+    def fit_whole_image(self) -> None:
+        self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+
+    def set_static_boxes(self, boxes: list[tuple[str, np.ndarray]]) -> None:
+        """Non-interactive rectangles with a small label each -- e.g. every
+        detected stamp on a sample sheet (SPEC §5), so a gap where one
+        wasn't detected is immediately visible without selecting each
+        stamp one at a time. ``boxes`` is (label, 4-corner array)."""
+        self._clear_static_box_items()
+        for label, corners in boxes:
+            pen = QPen(_STATIC_BOX_COLOUR, 2)
+            pen.setCosmetic(True)
+            poly_item = QGraphicsPolygonItem(QPolygonF([QPointF(x, y) for x, y in corners]))
+            poly_item.setPen(pen)
+            poly_item.setBrush(Qt.BrushStyle.NoBrush)
+            poly_item.setZValue(5)
+            self._scene.addItem(poly_item)
+            self._static_box_items.append(poly_item)
+
+            text_item = QGraphicsSimpleTextItem(label)
+            text_item.setBrush(_STATIC_BOX_COLOUR)
+            text_item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+            text_item.setZValue(6)
+            centre = corners.mean(axis=0)
+            text_item.setPos(float(centre[0]), float(centre[1]))
+            self._scene.addItem(text_item)
+            self._static_box_items.append(text_item)
+
+    def clear_static_boxes(self) -> None:
+        self._clear_static_box_items()
+
+    def _clear_static_box_items(self) -> None:
+        for item in self._static_box_items:
+            self._scene.removeItem(item)
+        self._static_box_items = []
+
+    # -- click-to-mark labeled points (SPEC §4.4/§8) ------------------------
+
+    def set_point_labels(self, labels: list[str]) -> None:
+        """Start (or restart) collecting this ordered sequence of labeled
+        points -- e.g. the reference wizard's IT8 corners and ruler
+        endpoints. Clears any points already placed."""
+        self._point_labels = list(labels)
+        self._points = {}
+        self._point_order = []
+        self._redraw_points()
+        self.points_changed.emit()
+
+    def next_point_label(self) -> str | None:
+        for label in self._point_labels:
+            if label not in self._points:
+                return label
+        return None
+
+    def points_complete(self) -> bool:
+        return bool(self._point_labels) and self.next_point_label() is None
+
+    def get_points(self) -> dict[str, tuple[float, float]]:
+        return dict(self._points)
+
+    def set_point(self, label: str, xy: tuple[float, float]) -> None:
+        """Overwrite an already-placed point's coordinates in place (e.g.
+        after auto-refinement snaps a rough click onto a known landmark).
+        No-op if ``label`` hasn't been placed yet."""
+        if label not in self._points:
+            return
+        self._points[label] = xy
+        self._redraw_points()
+        self.points_changed.emit()
+
+    def undo_last_point(self) -> None:
+        if not self._point_order:
+            return
+        label = self._point_order.pop()
+        del self._points[label]
+        self._redraw_points()
+        self.points_changed.emit()
+
+    def clear_points(self) -> None:
+        self._points = {}
+        self._point_order = []
+        self._redraw_points()
+        self.points_changed.emit()
+
+    def _place_point(self, scene_pt: QPointF) -> None:
+        label = self.next_point_label()
+        if label is None:
+            return
+        self._points[label] = (scene_pt.x(), scene_pt.y())
+        self._point_order.append(label)
+        self._redraw_points()
+        self.points_changed.emit()
+
+    def _redraw_points(self) -> None:
+        for item in self._point_items:
+            self._scene.removeItem(item)
+        self._point_items = []
+        for label, (x, y) in self._points.items():
+            self._point_items.append(self._make_perf_handle(x, y, _POINT_COLOUR))
+            text_item = QGraphicsSimpleTextItem(label)
+            text_item.setBrush(_POINT_COLOUR)
+            text_item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+            text_item.setZValue(16)
+            text_item.setPos(x + _PERF_HANDLE_RADIUS_PX + 2, y - _PERF_HANDLE_RADIUS_PX - 2)
+            self._scene.addItem(text_item)
+            self._point_items.append(text_item)
 
     @staticmethod
     def _perf_box_corners(state: tuple[float, float, float, float, float]) -> np.ndarray:
@@ -264,47 +415,62 @@ class ImageViewer(QGraphicsView):
             return
         corners = self._perf_box_corners(self._perf_box)
 
+        # A plain (non-cosmetic) pen's width is in *scene* units, so it
+        # scales with zoom -- on a full sample sheet (often fitted at well
+        # under 1x to begin with), a 2px-wide outline could end up a
+        # fraction of a device pixel and effectively invisible. Cosmetic
+        # keeps it a constant width on screen regardless of zoom.
+        pen = QPen(_PERF_BOX_COLOUR, 3)
+        pen.setCosmetic(True)
         poly_item = QGraphicsPolygonItem(QPolygonF([QPointF(x, y) for x, y in corners]))
-        poly_item.setPen(QPen(_PERF_BOX_COLOUR, 2))
+        poly_item.setPen(pen)
         poly_item.setBrush(Qt.BrushStyle.NoBrush)
         poly_item.setZValue(10)
         self._scene.addItem(poly_item)
         self._perf_box_items.append(poly_item)
 
         for cx, cy in corners:
-            handle = QGraphicsEllipseItem(
-                cx - _PERF_HANDLE_RADIUS_PX,
-                cy - _PERF_HANDLE_RADIUS_PX,
-                2 * _PERF_HANDLE_RADIUS_PX,
-                2 * _PERF_HANDLE_RADIUS_PX,
-            )
-            handle.setBrush(_PERF_BOX_COLOUR)
-            handle.setPen(QPen(QColor(0, 0, 0), 1))
-            handle.setZValue(11)
-            self._scene.addItem(handle)
-            self._perf_box_items.append(handle)
+            self._perf_box_items.append(self._make_perf_handle(cx, cy, _PERF_BOX_COLOUR))
 
         rx, ry = self._perf_rotate_handle_pos(self._perf_box)
-        rotate_handle = QGraphicsEllipseItem(
-            rx - _PERF_HANDLE_RADIUS_PX,
-            ry - _PERF_HANDLE_RADIUS_PX,
+        self._perf_box_items.append(self._make_perf_handle(rx, ry, _PERF_ROTATE_COLOUR))
+
+    def _make_perf_handle(self, cx: float, cy: float, colour: QColor) -> QGraphicsEllipseItem:
+        # Geometry centred on the item's own local origin, then placed via
+        # setPos + ItemIgnoresTransformations -- the standard Qt pattern
+        # for a handle that stays a constant size on screen regardless of
+        # the view's zoom (plain scene-unit geometry would shrink to
+        # near-invisible on a fully zoomed-out sample sheet).
+        handle = QGraphicsEllipseItem(
+            -_PERF_HANDLE_RADIUS_PX,
+            -_PERF_HANDLE_RADIUS_PX,
             2 * _PERF_HANDLE_RADIUS_PX,
             2 * _PERF_HANDLE_RADIUS_PX,
         )
-        rotate_handle.setBrush(_PERF_ROTATE_COLOUR)
-        rotate_handle.setPen(QPen(QColor(0, 0, 0), 1))
-        rotate_handle.setZValue(11)
-        self._scene.addItem(rotate_handle)
-        self._perf_box_items.append(rotate_handle)
+        handle.setBrush(colour)
+        handle.setPen(QPen(QColor(0, 0, 0), 1))
+        handle.setZValue(11)
+        handle.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+        handle.setPos(cx, cy)
+        self._scene.addItem(handle)
+        return handle
+
+    def _view_scale(self) -> float:
+        scale = self.transform().m11()
+        return scale if scale > 1e-6 else 1.0
 
     def _hit_test_perf_handle(self, scene_pt: QPointF) -> int | None:
         if self._perf_box is None:
             return None
         pt = np.array([scene_pt.x(), scene_pt.y()])
+        # Handles are a fixed size on screen (device px), but mouse
+        # position is compared in scene units -- convert the hit radius
+        # through the view's current zoom so it matches what's drawn.
+        threshold = _PERF_HANDLE_HIT_PX / self._view_scale()
         for i, corner in enumerate(self._perf_box_corners(self._perf_box)):
-            if np.linalg.norm(pt - corner) <= _PERF_HANDLE_HIT_PX:
+            if np.linalg.norm(pt - corner) <= threshold:
                 return i
-        if np.linalg.norm(pt - self._perf_rotate_handle_pos(self._perf_box)) <= _PERF_HANDLE_HIT_PX:
+        if np.linalg.norm(pt - self._perf_rotate_handle_pos(self._perf_box)) <= threshold:
             return 4
         return None
 
@@ -440,6 +606,10 @@ class ImageViewer(QGraphicsView):
         self.pixel_info.emit(info)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
+        if self._tool == TOOL_POINTS and event.button() == Qt.MouseButton.LeftButton:
+            if self._rgb is not None:
+                self._place_point(self.mapToScene(event.pos()))
+            return
         if (
             self._tool == TOOL_PERF_BOX
             and self._perf_box is not None

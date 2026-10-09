@@ -79,6 +79,27 @@ say clearly which numbers come from synthetic data. Stop and report, including t
 real cross-validated ΔE00 if the data is there.
 ```
 
+**Status (2026-10-09): geometric calibration and IT8 patch location both replaced**,
+once a real Epson 1200U was available to test against (see SPEC §4.2/§4.3 for the
+full rationale and the concrete evidence from each change):
+
+- `calibration/geometry.py` (ruler tick detection) is **deleted**. Geometric
+  calibration now comes directly from the scanner's own verified resolution
+  setting (`dpi / 25.4 = px/mm`), not a ruler fit.
+- `calibration/it8.py`'s four-corner-click grid model is **deleted**.
+  `calibration/scanin.py` (new) shells out to ArgyllCMS's `scanin` for fully
+  automatic patch location -- no manual corners, no GUI point-marking at all.
+  ArgyllCMS (`argyll` + `argyll-ref`) changed from an optional cross-check
+  dependency to a required one as a direct result.
+- Two real, hardware-specific bugs were found and fixed during this work, both now
+  documented in SPEC §2/§4.1: `apply_and_verify` needing a single `scanimage`
+  invocation (state doesn't persist across separate processes on this backend), and
+  `--gamma-correction=Default` not actually being linear (an identity
+  user-defined gamma table is the real linear/off equivalent -- this alone was the
+  difference between a cross-validated ΔE00 of ~6-8 and ~2).
+- `calibration/reference.py`'s `build_reference()` signature changed accordingly:
+  no more `it8_corners`; `dpi_x`/`dpi_y`/`dpi_source` replace the ruler axis specs.
+
 ## Phase 2: Stamp detection and extraction
 
 ```
@@ -239,6 +260,20 @@ Phase 8: GUI integration of the scanner and references (SPEC §4.1, §4.4):
 - Also the drift check-patch hook from §4.4 (design only, unless trivial).
 Stop and report.
 ```
+
+**Status (2026-10-09): reference wizard simplified to match Phase 1's status
+note above.** With both the ruler and the corner-click grid gone, the actual flow
+is: scan the IT8 target live (device selection, option apply-and-verify per §4.1,
+acquire) or load an existing TIFF → **Build & review** directly, no point-marking
+step of any kind → name and save. `scanin` runs automatically inside
+`build_reference()`. The wizard's resolution field is still pre-filled from the
+scan's verified/embedded dpi as originally planned. Validated end to end against a
+real 1200dpi scan: ΔE00 mean 1.99, matching (slightly beating) the best
+ruler-and-corner-click-era reference (2.36) -- and robust to where the target sits
+on the bed, confirmed across three separate physical placements/rotations during
+testing, none requiring any manual input. Reference manager (list/rename/archive/
+compare) and the sample-scan flow are implemented as originally specced; the drift
+check-patch hook remains a design-only stub.
 
 ## Phase 9: Hardening
 

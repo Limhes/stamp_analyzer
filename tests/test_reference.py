@@ -3,9 +3,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from stampan.core.calibration.it8 import N_COLS, ROWS, IT8Corners
+from stampan.core.calibration import reference as ref_mod
+from stampan.core.calibration import scanin as scanin_mod
+from stampan.core.calibration.it8 import PatchSample
 from stampan.core.calibration.reference import (
-    RulerAxisSpec,
     build_reference,
     list_references,
     load_colour_model,
@@ -13,154 +14,58 @@ from stampan.core.calibration.reference import (
     save_reference,
 )
 from stampan.core.cgats import lab_from_xyz_d50, parse_cgats_file
-from stampan.core.io import ScanMetadata
+from stampan.core.io import ScanMetadata, write_tiff
 
 REF_PATH = Path(__file__).parent.parent / "reference_data" / "R240103.txt"
+FAKE_SCANIN = str(Path(__file__).parent / "fakes" / "fake_scanin.py")
 
-# Same fixed synthetic "camera" matrix used in test_characterisation.py, so
-# a scan built from real IT8 XYZ values round-trips through a 3x3 matrix fit
-# essentially exactly. This validates the reference-building pipeline's
-# plumbing (geometry + IT8 sampling + model selection + persistence), not
-# a real scanner's characteristics -- there is no real reference scan yet.
-_XYZ_TO_RGB = np.array(
-    [
-        [2.5, -1.2, -0.3],
-        [-0.9, 1.9, 0.0],
-        [0.05, -0.2, 1.1],
-    ]
-)
+# `scanin` locates patches from the scan's own printed fiducial marks, which
+# a synthetic test image has none of -- tests use fake_scanin.py (a stand-in
+# `scanin` binary, same pattern as fake_scanimage.py for core.scanner) to
+# exercise the rest of build_reference's pipeline (linearisation, model
+# fitting, persistence) against a known, recoverable RGB<->XYZ relationship
+# instead. The scan image's actual pixel content is irrelevant here -- the
+# fake ignores it -- so any small placeholder TIFF will do.
 
 
-def _build_synthetic_reference_scan(
-    pitch_px: float = 40.0,
-    ruler_px_per_mm: float = 10.0,
-    gamma: float = 1.0,
-) -> tuple[np.ndarray, IT8Corners, RulerAxisSpec, RulerAxisSpec]:
-    table = parse_cgats_file(REF_PATH)
-    by_id = table.by_sample_id()
-
-    def encode(rgb: np.ndarray) -> np.ndarray:
-        # linear camera RGB -> raw (possibly gamma-encoded) scanner RGB, the
-        # inverse of what grey-ramp linearisation must recover (SPEC §4.3).
-        linear = np.clip(rgb / 100.0, 0, 1)
-        return (linear**gamma) * 65535.0
-
-    margin = 80
-    it8_w = int(pitch_px * (N_COLS - 1) + pitch_px * 2)
-    it8_h = int(pitch_px * (len(ROWS) - 1) + pitch_px * 4)  # + room for GS row
-    ruler_len_mm = 60
-    ruler_len_px = int(ruler_len_mm * ruler_px_per_mm)
-
-    canvas_w = max(it8_w, ruler_len_px) + 2 * margin
-    canvas_h = it8_h + margin * 3 + 30  # + horizontal ruler strip height
-    canvas = np.full((canvas_h, canvas_w, 3), 40000.0, dtype=np.float64)
-
-    def patch_centre(row_idx: int, col_idx: int) -> tuple[float, float]:
-        return (margin + col_idx * pitch_px, margin + row_idx * pitch_px)
-
-    half = pitch_px * 0.85 / 2.0
-    for ri, row_letter in enumerate(ROWS):
-        for ci in range(N_COLS):
-            cx, cy = patch_centre(ri, ci)
-            row = by_id[f"{row_letter}{ci + 1}"]
-            xyz = np.array([row["XYZ_X"], row["XYZ_Y"], row["XYZ_Z"]])
-            rgb = xyz @ _XYZ_TO_RGB.T
-            rgb_scaled = encode(rgb)
-            x0, x1 = int(cx - half), int(cx + half)
-            y0, y1 = int(cy - half), int(cy + half)
-            canvas[y0:y1, x0:x1] = rgb_scaled
-
-    # build_it8_grid places the GS row exactly one row-pitch below row L.
-    gs_y_px = margin + (len(ROWS) - 1) * pitch_px + pitch_px
-    for gi in range(24):
-        gx = margin + gi * (pitch_px * (N_COLS - 1) / 23)
-        row = by_id[f"GS{gi}"]
-        xyz = np.array([row["XYZ_X"], row["XYZ_Y"], row["XYZ_Z"]])
-        rgb = xyz @ _XYZ_TO_RGB.T
-        rgb_scaled = encode(rgb)
-        x0, x1 = int(gx - half), int(gx + half)
-        y0, y1 = int(gs_y_px - half), int(gs_y_px + half)
-        canvas[y0:y1, x0:x1] = rgb_scaled
-
-    corners = IT8Corners(
-        a1=patch_centre(0, 0),
-        a22=patch_centre(0, N_COLS - 1),
-        l1=patch_centre(len(ROWS) - 1, 0),
-        l22=patch_centre(len(ROWS) - 1, N_COLS - 1),
-    )
-
-    # Horizontal ruler strip below the IT8 grid, with 1 mm ticks.
-    ruler_y = it8_h + margin * 2
-    ruler_x0 = margin
-    n_ticks = 30
-    strip = np.full((20, ruler_len_px + 20), 55000.0)
-    for i in range(n_ticks):
-        x = 10 + i * ruler_px_per_mm
-        xi0, xi1 = int(x - 1), int(x + 2)
-        strip[:, xi0:xi1] = 4000.0
-    canvas[ruler_y : ruler_y + 20, ruler_x0 : ruler_x0 + strip.shape[1], :] = strip[..., None]
-
-    x_axis = RulerAxisSpec(
-        centre_xy=(ruler_x0 + strip.shape[1] / 2.0, ruler_y + 10),
-        length_px=strip.shape[1],
-        width_px=16,
-        angle_deg=0.0,
-        tick_spacing_mm=1.0,
-        px_per_mm_hint=ruler_px_per_mm,
-    )
-    # Reuse the same strip for the y axis spec too (isotropic test fixture);
-    # a real reference would have a second, vertically-oriented strip.
-    y_axis = RulerAxisSpec(
-        centre_xy=x_axis.centre_xy,
-        length_px=x_axis.length_px,
-        width_px=x_axis.width_px,
-        angle_deg=0.0,
-        tick_spacing_mm=1.0,
-        px_per_mm_hint=ruler_px_per_mm,
-    )
-
-    return canvas.astype(np.uint16), corners, x_axis, y_axis
+def _dummy_scan(tmp_path: Path) -> tuple[np.ndarray, Path]:
+    scan = np.full((8, 8, 3), 30000, dtype=np.uint16)
+    path = tmp_path / "dummy_scan.tif"
+    write_tiff(path, scan)
+    return scan, path
 
 
-def test_build_reference_recovers_scale_and_low_cv_delta_e00():
-    scan, corners, x_axis, y_axis = _build_synthetic_reference_scan()
-    result = build_reference(
-        name="synthetic test reference",
+def _build(tmp_path, monkeypatch, gamma: float = 1.0, **kwargs):
+    monkeypatch.setenv("FAKE_SCANIN_GAMMA", str(gamma))
+    scan, _ = _dummy_scan(tmp_path)
+    return build_reference(
         scan=scan,
         scan_metadata=ScanMetadata(scanner_options={"resolution": 1200, "mode": "Color"}),
-        x_axis=x_axis,
-        it8_corners=corners,
         cgats_reference_path=REF_PATH,
-        y_axis=y_axis,
+        dpi_x=1200.0,
+        dpi_y=1200.0,
+        dpi_source="test fixture",
+        scanin_cmd=FAKE_SCANIN,
+        cht_path=REF_PATH,  # unused by the fake, just needs to exist
+        **kwargs,
     )
+
+
+def test_build_reference_recovers_low_cv_delta_e00(tmp_path, monkeypatch):
+    result = _build(tmp_path, monkeypatch, name="synthetic test reference")
     ref = result.reference
-    assert ref.scale.px_per_mm_x == pytest.approx(10.0, rel=0.02)
+    assert ref.scale.px_per_mm_x == pytest.approx(1200.0 / 25.4)
     assert ref.colour_model.kind in ("matrix3x3", "root_poly2", "root_poly3")
     assert ref.colour_model.cv_delta_e00["mean"] < 1.0
-    assert set(result.diagnostics) >= {
-        "geometry_x.png",
-        "it8_grid.png",
-        "it8_std_heatmap.png",
-        "colour_model_error_heatmap.png",
-    }
+    assert set(result.diagnostics) >= {"it8_std_heatmap.png", "colour_model_error_heatmap.png"}
 
 
-def test_save_and_load_reference_roundtrip(tmp_path):
-    scan, corners, x_axis, y_axis = _build_synthetic_reference_scan()
-    result = build_reference(
-        name="roundtrip test",
-        scan=scan,
-        scan_metadata=ScanMetadata(scanner_options={"resolution": 1200}),
-        x_axis=x_axis,
-        it8_corners=corners,
-        cgats_reference_path=REF_PATH,
-        y_axis=y_axis,
-    )
+def test_save_and_load_reference_roundtrip(tmp_path, monkeypatch):
+    result = _build(tmp_path, monkeypatch, name="roundtrip test")
     ref_dir = save_reference(result, tmp_path)
     assert (ref_dir / "reference.json").exists()
     assert (ref_dir / "reference_scan.tif").exists()
     assert (ref_dir / "model.npz").exists()
-    assert (ref_dir / "diagnostics" / "it8_grid.png").exists()
 
     loaded = load_reference(tmp_path, result.reference.ref_id)
     assert loaded == result.reference
@@ -170,13 +75,13 @@ def test_save_and_load_reference_roundtrip(tmp_path):
     assert refs[0].ref_id == result.reference.ref_id
 
     model = load_colour_model(tmp_path, result.reference.ref_id)
-    rgb_sample = np.array([[20000.0, 15000.0, 10000.0]])
+    rgb_sample = np.array([[2000.0, 1500.0, 1000.0]])
     lab = model.predict_lab(rgb_sample)
     assert lab.shape == (1, 3)
     assert np.all(np.isfinite(lab))
 
 
-def test_load_colour_model_applies_grey_ramp_linearisation_to_new_pixels(tmp_path):
+def test_load_colour_model_applies_grey_ramp_linearisation_to_new_pixels(tmp_path, monkeypatch):
     # Regression test: the grey-ramp linearisation curve fit in build_reference
     # (SPEC §4.3) was discarded after training -- it was applied to the IT8
     # patches used to fit the characterisation model, but never persisted or
@@ -184,30 +89,70 @@ def test_load_colour_model_applies_grey_ramp_linearisation_to_new_pixels(tmp_pat
     # itself an IT8 patch) was therefore fed to the model still gamma-encoded,
     # landing outside the model's trained (linear) domain entirely. Found via
     # 100% of pixels on a real scan coming back "outside the trained gamut".
-    scan, corners, x_axis, y_axis = _build_synthetic_reference_scan(gamma=2.2)
-    result = build_reference(
-        name="gamma test reference",
-        scan=scan,
-        scan_metadata=ScanMetadata(scanner_options={"resolution": 1200}),
-        x_axis=x_axis,
-        it8_corners=corners,
-        cgats_reference_path=REF_PATH,
-        y_axis=y_axis,
-    )
+    result = _build(tmp_path, monkeypatch, gamma=2.2, name="gamma test reference")
     save_reference(result, tmp_path)
     model = load_colour_model(tmp_path, result.reference.ref_id)
 
-    # A1's own raw (still gamma-encoded) pixel from the built scan -- not a
-    # value used to fit the model, just read back from the rendered canvas --
-    # must still map close to its known ground-truth Lab.
-    cx, cy = corners.a1
-    raw_rgb = scan[int(cy), int(cx)].astype(np.float64)[None, :]
-
+    # Re-derive A1's raw (still gamma-encoded) RGB the same way the fake
+    # scanin produced it, and check it still maps close to the known
+    # ground-truth Lab once the persisted linearisation curve is applied.
     table = parse_cgats_file(REF_PATH)
     row = table.by_sample_id()["A1"]
+    xyz_to_rgb = np.array([[2.5, -1.2, -0.3], [-0.9, 1.9, 0.0], [0.05, -0.2, 1.1]])
+    xyz = np.array([row["XYZ_X"], row["XYZ_Y"], row["XYZ_Z"]])
+    rgb_linear = np.clip((xyz @ xyz_to_rgb.T) / 100.0, 0, 1)
+    raw_rgb = ((rgb_linear**2.2) * 65535.0)[None, :]
+
     expected_lab = np.array(lab_from_xyz_d50(row["XYZ_X"], row["XYZ_Y"], row["XYZ_Z"]))
 
     predicted_lab = model.predict_lab(raw_rgb)[0]
     assert np.all(np.isfinite(predicted_lab))
     delta_e = np.linalg.norm(predicted_lab - expected_lab)
     assert delta_e < 2.0, f"predicted {predicted_lab}, expected {expected_lab}"
+
+
+def test_build_reference_refuses_scrambled_scanin_correspondence(tmp_path, monkeypatch):
+    # Regression test: scanin occasionally picks the wrong one of several
+    # candidate orientations for a chart (confirmed on a real scan -- the
+    # grid still geometrically tiled every patch correctly, so it looked
+    # right in the diagnostic at a glance, but each box was matched to the
+    # wrong patch ID, e.g. the GS row ending up above row A instead of
+    # below row L). That scrambles which sampled RGB gets compared to which
+    # CGATS XYZ entry during fitting, producing a plausible-looking but
+    # useless reference (ΔE00 mean ~27 on the real failure) rather than an
+    # obvious crash. build_reference must refuse rather than silently save
+    # a model trained on a scrambled correspondence.
+    table = parse_cgats_file(REF_PATH)
+    patch_ids = list(table.by_sample_id().keys())
+    # Shuffle (fixed seed) so brightness order no longer tracks XYZ_Y order.
+    rng = np.random.default_rng(0)
+    scrambled_rgb = rng.permutation(len(patch_ids))
+    samples = {
+        pid: PatchSample(
+            patch_id=pid,
+            centre_px=(float("nan"), float("nan")),
+            mean_rgb=(float(scrambled_rgb[i]), float(scrambled_rgb[i]), float(scrambled_rgb[i])),
+            std_rgb=(1.0, 1.0, 1.0),
+            n_pixels=0,
+        )
+        for i, pid in enumerate(patch_ids)
+    }
+    monkeypatch.setattr(
+        ref_mod.scanin_mod,
+        "locate_and_sample_patches",
+        lambda *a, **kw: scanin_mod.ScaninResult(samples=samples, diagnostic_png=None),
+    )
+
+    scan, _ = _dummy_scan(tmp_path)
+    with pytest.raises(scanin_mod.ScaninError, match="wrong"):
+        build_reference(
+            name="scrambled",
+            scan=scan,
+            scan_metadata=ScanMetadata(scanner_options={"resolution": 1200}),
+            cgats_reference_path=REF_PATH,
+            dpi_x=1200.0,
+            dpi_y=1200.0,
+            dpi_source="test fixture",
+            scanin_cmd=FAKE_SCANIN,
+            cht_path=REF_PATH,
+        )

@@ -8,14 +8,71 @@ from typer.testing import CliRunner
 
 from stampan.cli import app
 from stampan.core.calibration import reference as ref_mod
+from stampan.core.calibration import scanin as scanin_mod
+from stampan.core.calibration.it8 import PatchSample
+from stampan.core.cgats import parse_cgats_file
 from stampan.core.io import ScanMetadata, read_tiff, write_tiff
 from tests.synth import SideSpec, SynthSpec
 from tests.synth_sheet import SheetSpec, StampPlacement, generate_synthetic_sheet
-from tests.test_reference import _build_synthetic_reference_scan
 
 runner = CliRunner()
 
 FAKE_SCANIMAGE = [sys.executable, str(Path(__file__).parent / "fakes" / "fake_scanimage.py")]
+FAKE_SCANIN = str(Path(__file__).parent / "fakes" / "fake_scanin.py")
+REF_CGATS_PATH = "reference_data/R240103.txt"
+
+# Same fixed synthetic "camera" matrix fake_scanin.py uses, so direct
+# build_reference() calls here (not going through the CLI) and the one CLI
+# invocation test (which monkeypatches scanin_mod directly, since `reference
+# create` has no --scanin-cmd flag -- there's no reason production code
+# needs one) agree on the same known-recoverable RGB<->XYZ relationship.
+_XYZ_TO_RGB = np.array(
+    [
+        [2.5, -1.2, -0.3],
+        [-0.9, 1.9, 0.0],
+        [0.05, -0.2, 1.1],
+    ]
+)
+
+
+def _fake_scanin_result() -> scanin_mod.ScaninResult:
+    table = parse_cgats_file(REF_CGATS_PATH)
+    samples = {}
+    for patch_id, row in table.by_sample_id().items():
+        xyz = np.array([row["XYZ_X"], row["XYZ_Y"], row["XYZ_Z"]])
+        rgb_linear = np.clip((xyz @ _XYZ_TO_RGB.T) / 100.0, 0, 1)
+        rgb = tuple((rgb_linear * 65535.0).tolist())
+        samples[patch_id] = PatchSample(
+            patch_id=patch_id,
+            centre_px=(float("nan"), float("nan")),
+            mean_rgb=rgb,
+            std_rgb=(1.0, 1.0, 1.0),
+            n_pixels=0,
+        )
+    return scanin_mod.ScaninResult(samples=samples, diagnostic_png=b"")
+
+
+def _dummy_scan() -> np.ndarray:
+    return np.full((8, 8, 3), 30000, dtype=np.uint16)
+
+
+def _build_test_reference(name: str) -> ref_mod.ReferenceBuildResult:
+    # dpi chosen so px_per_mm (dpi / 25.4) matches the synthetic sample
+    # sheets' own px_per_mm=10 below -- detect/extract_crop interpret the
+    # sample sheet's pixel sizes using the *reference's* scale, so a
+    # mismatch here silently detects 0 stamps rather than erroring.
+    dpi = 10.0 * 25.4
+    return ref_mod.build_reference(
+        name=name,
+        scan=_dummy_scan(),
+        scan_metadata=ScanMetadata(scanner_options={"resolution": dpi}),
+        cgats_reference_path=REF_CGATS_PATH,
+        dpi_x=dpi,
+        dpi_y=dpi,
+        dpi_source="test fixture",
+        scanin_cmd=FAKE_SCANIN,
+        cht_path=REF_CGATS_PATH,  # unused by the fake, just needs to exist
+    )
 
 
 def test_version():
@@ -30,28 +87,17 @@ def test_reference_list_empty(tmp_path):
     assert "no references found" in result.stdout
 
 
-def test_reference_create_list_show_roundtrip(tmp_path):
-    scan, corners, x_axis, y_axis = _build_synthetic_reference_scan()
+def test_reference_create_list_show_roundtrip(tmp_path, monkeypatch):
+    # `reference create` has no --scanin-cmd flag (no reason production
+    # code needs one), so this one test monkeypatches scanin_mod directly
+    # rather than going through a fake binary on PATH.
+    monkeypatch.setattr(
+        ref_mod.scanin_mod, "locate_and_sample_patches", lambda *a, **kw: _fake_scanin_result()
+    )
     scan_path = tmp_path / "ref_scan.tif"
-    write_tiff(scan_path, scan.astype(np.uint16))
+    write_tiff(scan_path, _dummy_scan())
 
     library_root = tmp_path / "library"
-
-    def fmt(axis):
-        return ",".join(
-            str(v)
-            for v in (
-                axis.centre_xy[0],
-                axis.centre_xy[1],
-                axis.length_px,
-                axis.width_px,
-                axis.angle_deg,
-                axis.tick_spacing_mm,
-                axis.px_per_mm_hint,
-            )
-        )
-
-    corners_str = ",".join(str(v) for v in (*corners.a1, *corners.a22, *corners.l1, *corners.l22))
 
     result = runner.invoke(
         app,
@@ -62,14 +108,10 @@ def test_reference_create_list_show_roundtrip(tmp_path):
             str(scan_path),
             "--name",
             "cli test reference",
-            "--ruler-x",
-            fmt(x_axis),
-            "--ruler-y",
-            fmt(y_axis),
-            "--it8-corners",
-            corners_str,
+            "--dpi",
+            "1200",
             "--cgats",
-            "reference_data/R240103.txt",
+            REF_CGATS_PATH,
             "--library-root",
             str(library_root),
         ],
@@ -92,17 +134,8 @@ def test_reference_create_list_show_roundtrip(tmp_path):
 
 
 def test_detect_command_writes_project_and_stamps(tmp_path):
-    scan, corners, x_axis, y_axis = _build_synthetic_reference_scan()
     library_root = tmp_path / "library"
-    ref_result = ref_mod.build_reference(
-        name="detect-test reference",
-        scan=scan,
-        scan_metadata=ScanMetadata(scanner_options={"resolution": 1200}),
-        x_axis=x_axis,
-        it8_corners=corners,
-        cgats_reference_path="reference_data/R240103.txt",
-        y_axis=y_axis,
-    )
+    ref_result = _build_test_reference("detect-test reference")
     ref_mod.save_reference(ref_result, library_root)
     ref_id = ref_result.reference.ref_id
 
@@ -194,17 +227,8 @@ def test_detect_command_writes_project_and_stamps(tmp_path):
 def test_colour_and_report_commands_produce_outputs(tmp_path):
     from stampan.core import project as project_mod
 
-    scan, corners, x_axis, y_axis = _build_synthetic_reference_scan()
     library_root = tmp_path / "library"
-    ref_result = ref_mod.build_reference(
-        name="report-test reference",
-        scan=scan,
-        scan_metadata=ScanMetadata(scanner_options={"resolution": 1200}),
-        x_axis=x_axis,
-        it8_corners=corners,
-        cgats_reference_path="reference_data/R240103.txt",
-        y_axis=y_axis,
-    )
+    ref_result = _build_test_reference("report-test reference")
     ref_mod.save_reference(ref_result, library_root)
     ref_id = ref_result.reference.ref_id
 
@@ -284,17 +308,8 @@ def test_colour_and_report_commands_produce_outputs(tmp_path):
 def test_run_command_chains_detect_perf_colour_report(tmp_path):
     from stampan.core import project as project_mod
 
-    scan, corners, x_axis, y_axis = _build_synthetic_reference_scan()
     library_root = tmp_path / "library"
-    ref_result = ref_mod.build_reference(
-        name="run-test reference",
-        scan=scan,
-        scan_metadata=ScanMetadata(scanner_options={"resolution": 1200}),
-        x_axis=x_axis,
-        it8_corners=corners,
-        cgats_reference_path="reference_data/R240103.txt",
-        y_axis=y_axis,
-    )
+    ref_result = _build_test_reference("run-test reference")
     ref_mod.save_reference(ref_result, library_root)
     ref_id = ref_result.reference.ref_id
 

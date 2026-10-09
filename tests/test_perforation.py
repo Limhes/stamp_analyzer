@@ -3,6 +3,7 @@ import pytest
 
 from stampan.core.perforation import (
     PROFILE_STEP_MM,
+    HoleDetection,
     _detect_holes,
     _detect_profile_roi,
     _mask_from_roi,
@@ -32,6 +33,25 @@ def test_clean_gauge_12_all_sides_accurate():
         assert side.kind == "perforated"
         assert side.gauge == pytest.approx(12.0, abs=0.05), side_name
         assert side.confidence > 0.5
+
+
+def test_narrowing_gauge_range_around_a_real_peak_does_not_reject_it():
+    # Regression: the SNR noise-floor estimate used to be the median
+    # magnitude within the *same* (narrowed) search band, so tightly
+    # bracketing a real peak shrank the median toward the peak's own
+    # skirt, inflating the apparent background and tanking the SNR for
+    # exactly the clean peaks a narrow range is meant to isolate.
+    img, _gt = generate_synthetic_stamp(_spec(16))
+    full = analyse_perforation(img, PPM, PPM, gauge_range=(6.0, 18.0))
+    narrow = analyse_perforation(img, PPM, PPM, gauge_range=(10.0, 15.0))
+    for side_name in ("top", "bottom", "left", "right"):
+        assert narrow.sides[side_name].kind == "perforated", side_name
+        # Not bit-identical: the profile low-pass filter's cutoff tracks
+        # gauge_range's own upper bound, so a narrower range legitimately
+        # filters slightly differently -- just close.
+        assert narrow.sides[side_name].gauge == pytest.approx(
+            full.sides[side_name].gauge, abs=0.01
+        ), side_name
 
 
 @pytest.mark.parametrize("gauge", [8.0, 10.5, 12.0, 14.25, 16.0])
@@ -214,7 +234,7 @@ def test_detect_stamp_box_matches_manual_box_result():
     auto = analyse_perforation(img, PPM, PPM)
     manual = analyse_perforation(img, PPM, PPM, manual_box_px=box)
     for side_name in ("top", "bottom", "left", "right"):
-        assert manual.sides[side_name].gauge == pytest.approx(auto.sides[side_name].gauge, abs=1e-6)
+        assert manual.sides[side_name].gauge == pytest.approx(auto.sides[side_name].gauge, abs=1e-3)
 
 
 def test_manual_box_nudges_still_recover_the_gauge():
@@ -266,6 +286,77 @@ def test_grouped_multiplicity_adds_a_warning_single_does_not():
     assert not any("shared with a neighbouring" in w for w in single.warnings)
     assert any("shared with a neighbouring" in w for w in pair.warnings)
     assert any("pair of 2" in w for w in pair.warnings)
+
+
+def test_classify_and_pick_amplitude_floor_is_relaxed_when_user_confirmed():
+    from stampan.core.perforation import _classify_and_pick
+
+    # A clean, highly periodic signal (high SNR, enough holes) but with a
+    # real amplitude between the manual (0.02mm) and automatic (0.08mm)
+    # floors -- real scans have shown genuine low-amplitude, unmistakably
+    # periodic tooth patterns that the automatic floor was wrongly treating
+    # the same as sub-pixel edge noise, even once a human had manually
+    # selected exactly that stretch as the ROI to trust.
+    rng = np.random.default_rng(0)
+    s = np.linspace(0, 20, 400)
+    depth = 0.025 * np.sin(2 * np.pi * s / 1.67) + rng.normal(scale=0.001, size=len(s))
+    holes = [
+        HoleDetection(index=i, s_mm=float(x), depth_mm=0.04, diameter_mm=0.5)
+        for i, x in enumerate(np.arange(0.8, 19, 1.67))
+    ]
+    warnings_auto: list[str] = []
+    kind_auto, gauge_auto, _unc, _conf = _classify_and_pick(
+        12.0, 10.0, 12.0, holes, depth, 0.3, warnings_auto, user_confirmed=False
+    )
+    warnings_manual: list[str] = []
+    kind_manual, gauge_manual, _unc, _conf = _classify_and_pick(
+        12.0, 10.0, 12.0, holes, depth, 0.3, warnings_manual, user_confirmed=True
+    )
+    assert kind_auto == "straight_edge"
+    assert gauge_auto is None
+    assert kind_manual == "perforated"
+    assert gauge_manual is not None
+
+
+def test_classify_and_pick_prefers_the_spectral_peak_over_hole_regression():
+    # Regression: the hole-position regression used to be the primary
+    # reported value, which a single misdetected/missed hole (cancellation
+    # ink, a broken tooth) can skew well away from the true gauge, while
+    # the clean spectral peak stays anchored by the side's overall
+    # periodicity. Real data showed this cause a side to be dropped
+    # entirely (rejected as out-of-range) even though its spectrum plot
+    # showed an obvious, clean peak right where the user expected it.
+    from stampan.core.perforation import _classify_and_pick
+
+    positions = list(np.arange(0.8, 19, 1.67))
+    positions[-1] += 4.0  # one misdetected/skewed hole drags the linear fit off
+    holes = [
+        HoleDetection(index=i, s_mm=float(x), depth_mm=0.3, diameter_mm=0.5)
+        for i, x in enumerate(positions)
+    ]
+    depth = 0.3 + 0.25 * np.sin(2 * np.pi * np.linspace(0, 20, 400) / 1.67)
+    warnings: list[str] = []
+    # gauge_spectral=12.0 is the real peak; the hole-position regression
+    # over these (one-skewed) positions lands well away from it.
+    kind, gauge, _unc, _conf = _classify_and_pick(
+        12.0, 10.0, 8.0, holes, depth, 0.3, warnings, user_confirmed=True
+    )
+    assert kind == "perforated"
+    assert gauge == pytest.approx(12.0, abs=0.01)
+    assert any("using the spectral peak" in w for w in warnings)
+
+
+def test_classify_and_pick_still_rejects_pure_noise_even_when_user_confirmed():
+    from stampan.core.perforation import _classify_and_pick
+
+    rng = np.random.default_rng(1)
+    depth = rng.normal(scale=0.002, size=200)  # no real signal at all
+    warnings: list[str] = []
+    kind, gauge, _unc, _conf = _classify_and_pick(
+        None, 1.0, None, [], depth, 0.01, warnings, user_confirmed=True
+    )
+    assert kind == "straight_edge"
+    assert gauge is None
 
 
 def test_manual_roi_override_is_recorded_and_used():

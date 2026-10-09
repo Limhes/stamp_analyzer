@@ -47,12 +47,12 @@ def test_dump_options_parses_known_fields(patched_run):
 
 
 def test_apply_and_verify_matches(patched_run):
+    # apply_and_verify must set and read back options in one invocation --
+    # a direct-USB backend (confirmed on the real Epson 1200U) does not
+    # persist option state across separate scanimage processes, so a
+    # separate dump_options() call afterwards is not expected to see it.
     mismatches = apply_and_verify({"resolution": "1200", "mode": "Color", "depth": "16"})
     assert mismatches == {}
-
-    opts = dump_options()
-    assert opts.options["--resolution"].current == "1200"
-    assert opts.options["--depth"].current == "16"
 
 
 def test_apply_and_verify_detects_mismatch(tmp_path, monkeypatch):

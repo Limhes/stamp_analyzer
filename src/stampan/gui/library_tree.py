@@ -72,6 +72,22 @@ class LibraryTree(QTreeWidget):
 
         self.expandAll()
 
+    def select_sample(self, project_id: str, sample_id: str) -> None:
+        """Programmatically select a sample item (e.g. the Stamp tab's
+        "Edit bounding box on sheet..."), triggering ``selection_changed``
+        the same as a user click would."""
+        projects_root = self.topLevelItem(1)
+        if projects_root is None:
+            return
+        for i in range(projects_root.childCount()):
+            project_item = projects_root.child(i)
+            for j in range(project_item.childCount()):
+                sample_item = project_item.child(j)
+                data = sample_item.data(0, Qt.ItemDataRole.UserRole)
+                if data == (KIND_SAMPLE, project_id, sample_id):
+                    self.setCurrentItem(sample_item)
+                    return
+
     def _on_selection_changed(self) -> None:
         items = self.selectedItems()
         if not items:

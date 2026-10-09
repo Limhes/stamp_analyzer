@@ -32,7 +32,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.ndimage import median_filter
-from scipy.signal import find_peaks
+from scipy.signal import butter, find_peaks, sosfiltfilt
 
 from stampan.core.models import (
     CONDITION_ON_PAPER,
@@ -44,6 +44,12 @@ SIDES = ("top", "bottom", "left", "right")
 
 GAUGE_MIN = 6.0
 GAUGE_MAX = 18.0
+#: The gauge-range slider's starting selection (SPEC §6) -- most
+#: definitive-issue perforations fall in this band, a better default to
+#: land on than the full physically-plausible GAUGE_MIN-GAUGE_MAX extent.
+#: Shared between the GUI and the CLI's bulk re-measure so both land on
+#: the same starting point for a stamp that's never been measured before.
+DEFAULT_GAUGE_RANGE = (10.0, 15.0)
 DEFAULT_CORNER_EXCLUSION_MM = 3.5  # >= one pitch at the lowest plausible gauge
 PROFILE_STEP_MM = 0.01
 
@@ -111,6 +117,7 @@ class PerforationAnalysis:
     confidence: float
     warnings: list[str]
     contour_px: np.ndarray  # (N, 2) outer contour, for diagnostics
+    gauge_range: tuple[float, float] = (GAUGE_MIN, GAUGE_MAX)
 
 
 def _notation(gauge: float) -> str:
@@ -327,6 +334,7 @@ def analyse_side(
     px_per_mm_y: float,
     corner_exclusion_mm: float = DEFAULT_CORNER_EXCLUSION_MM,
     manual_roi_mm: list[tuple[float, float]] | None = None,
+    gauge_range: tuple[float, float] = (GAUGE_MIN, GAUGE_MAX),
 ) -> SideAnalysis:
     along_scale = px_per_mm_x if side in ("top", "bottom") else px_per_mm_y
     outward_scale = px_per_mm_y if side in ("top", "bottom") else px_per_mm_x
@@ -358,34 +366,76 @@ def analyse_side(
     tip_pts = np.array(tip_pts)
     bottom_pts = np.array(bottom_pts)
 
-    tip_fit, tip_inliers = _robust_envelope_fit(tip_pts[:, 0], tip_pts[:, 1])
-    tooth_roughness_mm = float(
-        np.std(tip_pts[tip_inliers, 1] - np.polyval(tip_fit, tip_pts[tip_inliers, 0]))
-        / outward_scale
-    )
-    rejected_frac = 1.0 - tip_inliers.mean()
-    if rejected_frac > 0.1:
+    # The tip line is the box edge itself -- SPEC §6: "assume rectangular
+    # stamps", and the box is how the user asserts "this edge is right"
+    # (drawn by auto-detection, or dragged by hand to visually hug the
+    # tooth tips). It used to be independently re-fit from the contour's
+    # own outermost points per side, which could drift away from the box
+    # at an angle -- "the edges of the box should be identical to the
+    # profile lines" -- especially on a side with cancellation ink or
+    # damage distorting the contour, exactly the stretches a robust fit
+    # was least able to anchor reliably. In this edge's own (along,
+    # outward) coordinates the box edge is simply outward=0 for every
+    # along -- a degree-1 fit with zero slope and zero intercept.
+    tip_fit = np.array([0.0, 0.0])
+    mean_tip_offset_mm = float(np.mean(tip_pts[:, 1])) / outward_scale
+    tooth_roughness_mm = float(np.std(tip_pts[:, 1])) / outward_scale
+    if abs(mean_tip_offset_mm) > 0.15:
+        where = "outside" if mean_tip_offset_mm > 0 else "inside"
         warnings.append(
-            f"tip-line fit rejected {rejected_frac * 100:.0f}% of the tooth-tip envelope as "
-            "outliers (likely cancellation ink or damage distorting the contour there)"
+            f"tooth tips sit {abs(mean_tip_offset_mm):.2f}mm {where} the drawn box edge on "
+            "average; depth/gauge are measured from the box edge, so consider nudging it to "
+            "better hug the tips"
         )
 
     bottom_fit, _bottom_inliers = _robust_envelope_fit(bottom_pts[:, 0], bottom_pts[:, 1])
 
-    # Depth profile: distance from the tip line to the contour, uniformly
-    # resampled in mm along the side.
+    # Depth profile: distance from the tip line (the box edge) to the
+    # contour, uniformly resampled in mm along the side.
     depth_px = np.polyval(tip_fit, along_mm) - outward
     s_min, s_max = along_mm.min(), along_mm.max()
     s_grid = np.arange(s_min, s_max, PROFILE_STEP_MM)
     depth_grid_px = np.interp(s_grid, along_mm, depth_px)
-    depth_grid_mm = depth_grid_px / outward_scale
+    depth_grid_raw_mm = depth_grid_px / outward_scale
+
+    # Low-pass filter: the raw profile is built from individual contour
+    # points, which carry pixel/sub-pixel-scale extraction jitter (a
+    # staircase-y mask boundary, scan noise, cancellation-ink edge
+    # texture) with no physical meaning -- real teeth simply cannot
+    # oscillate faster than the finest gauge the user says is plausible
+    # (``gauge_range``'s upper end), so anything faster is unambiguously
+    # noise, not signal, and can be removed outright rather than merely
+    # damped. This is exactly the "so much noise, even though the picture
+    # is really quite nice... filter out all the high frequency crap"
+    # profile plots were showing (SPEC §6): a real photo at gauge ~12.5
+    # was clearly periodic by eye, but a flat Gaussian smooth too small
+    # to touch sub-0.1mm jitter left enough of it to tank the FFT's SNR
+    # on several real cancelled stamps. A 4th-order zero-phase (filtfilt,
+    # no lag/shift of the real peaks) Butterworth low-pass with its
+    # cutoff set a comfortable margin above the finest plausible tooth
+    # frequency removes that jitter wholesale while leaving every
+    # physically-possible period untouched. Used for the FFT/hole
+    # detection and the displayed profile -- *not* for
+    # _detect_profile_roi below, whose anomaly threshold is relative to
+    # the profile's own local-vs-global roughness and is already tuned
+    # against the raw (unsmoothed) signal; filtering shifts that ratio
+    # and started flagging good stretches as noisy that weren't before.
+    finest_plausible_freq_cyc_per_mm = gauge_range[1] / 20.0
+    cutoff_freq_cyc_per_mm = 1.5 * finest_plausible_freq_cyc_per_mm
+    nyquist_cyc_per_mm = 0.5 / PROFILE_STEP_MM
+    normalized_cutoff = min(cutoff_freq_cyc_per_mm / nyquist_cyc_per_mm, 0.99)
+    if len(depth_grid_raw_mm) > 30:
+        sos = butter(4, normalized_cutoff, btype="low", output="sos")
+        depth_grid_mm = sosfiltfilt(sos, depth_grid_raw_mm)
+    else:
+        depth_grid_mm = depth_grid_raw_mm
 
     perf_depth_mm = float(np.polyval(bottom_fit, 0) - np.polyval(tip_fit, 0)) / outward_scale
 
     # Provisional full-profile estimate, used only to size the ROI-detection
     # windows below -- a rough gauge guess is enough for that, and this
     # runs before any noise exclusion so it has to tolerate noisy input.
-    provisional_gauge, *_ = _estimate_period(s_grid, depth_grid_mm)
+    provisional_gauge, *_ = _estimate_period(s_grid, depth_grid_mm, gauge_range)
     pitch_hint_mm = 20.0 / provisional_gauge if provisional_gauge else 20.0 / 12.0
 
     if manual_roi_mm is not None:
@@ -393,7 +443,7 @@ def analyse_side(
         good_mask = _mask_from_roi(s_grid, roi_mm)
         roi_manual = True
     else:
-        good_mask = _detect_profile_roi(s_grid, depth_grid_mm, pitch_hint_mm)
+        good_mask = _detect_profile_roi(s_grid, depth_grid_raw_mm, pitch_hint_mm)
         roi_mm = _roi_runs_from_mask(s_grid, good_mask)
         roi_manual = False
         if roi_mm and not (len(roi_mm) == 1 and roi_mm[0] == (float(s_grid[0]), float(s_grid[-1]))):
@@ -412,7 +462,7 @@ def analyse_side(
             roi_mm = [(float(s_grid[0]), float(s_grid[-1]))]
             warnings.append("ROI detection found no stable stretch; using the full profile")
 
-    result = _estimate_period(s_grid[good_mask], depth_grid_mm[good_mask])
+    result = _estimate_period(s_grid[good_mask], depth_grid_mm[good_mask], gauge_range)
     gauge_spectral, spectral_snr, freqs, mag, peak_freq = result
 
     holes, gauge_holes, spacing_std, spacing_max_dev = _detect_holes(
@@ -422,28 +472,37 @@ def analyse_side(
     hole_diameters = [h.diameter_mm for h in holes if h.diameter_mm is not None]
     hole_diameter_mm = float(np.mean(hole_diameters)) if hole_diameters else None
 
+    # The amplitude sanity check inside _classify_and_pick must look only at
+    # the ROI actually being judged (auto-detected or the user's slider
+    # selection) -- using the full unmasked profile defeated the entire
+    # point of excluding a noisy stretch: a clean, genuinely-perforated
+    # selection could still get graded on amplitude dominated by an
+    # unrelated noisy part of the side outside that selection.
+    roi_depth_mm = depth_grid_mm[good_mask] if good_mask.any() else depth_grid_mm
+    # A manually-drawn spatial ROI or a gauge-range slider narrowed away
+    # from its full default both mean the same thing here: the user is
+    # vouching for this result, not just the automatic pipeline.
+    user_confirmed = roi_manual or gauge_range != (GAUGE_MIN, GAUGE_MAX)
     kind, gauge, uncertainty, confidence = _classify_and_pick(
         gauge_spectral,
         spectral_snr,
         gauge_holes,
         holes,
-        depth_grid_mm,
+        roi_depth_mm,
         perf_depth_mm,
         warnings,
+        user_confirmed=user_confirmed,
+        gauge_range=gauge_range,
     )
 
     notation = _notation(gauge) if gauge is not None else None
 
-    # Tip line back in pixel space, for diagnostics: at along_mm=0 the tip
-    # line sits at outward=tip_fit(0) px from edge.origin; its direction in
-    # (along, outward) pixel units is (along_scale, tip_fit'(0)) per mm
-    # along -- the slope *at the origin*, degree-agnostic (tip_fit may be
-    # linear or a gently-bowed quadratic, see _robust_envelope_fit), since
-    # this is only a straight dashed line drawn on the diagnostic image.
-    tip_origin_px = edge.origin + edge.normal * np.polyval(tip_fit, 0)
-    tip_slope_at_origin = np.polyval(np.polyder(tip_fit), 0)
-    tip_dir_px = edge.direction * along_scale + edge.normal * tip_slope_at_origin
-    tip_dir_px = tip_dir_px / np.linalg.norm(tip_dir_px)
+    # Tip line back in pixel space, for diagnostics: it's just the box edge
+    # itself (tip_fit is identically zero), so this is exactly edge.origin
+    # / edge.direction -- the dashed line drawn on the diagnostic image
+    # coincides with the box edge by construction.
+    tip_origin_px = edge.origin
+    tip_dir_px = edge.direction
 
     return SideAnalysis(
         side=side,
@@ -558,13 +617,21 @@ def _mask_from_roi(s_grid: np.ndarray, roi_mm: list[tuple[float, float]]) -> np.
 
 
 def _estimate_period(
-    s_grid: np.ndarray, depth_mm: np.ndarray
+    s_grid: np.ndarray,
+    depth_mm: np.ndarray,
+    gauge_range: tuple[float, float] = (GAUGE_MIN, GAUGE_MAX),
 ) -> tuple[float | None, float, np.ndarray, np.ndarray, float | None]:
     """Spectral (FFT) period estimate. Returns (gauge, SNR, freqs, magnitude,
-    peak_freq)."""
+    peak_freq). ``gauge_range`` restricts which band the highest peak is
+    picked from -- the GUI's single top-of-panel range slider (SPEC §6):
+    narrowing it to where the user can see the real tooth-spacing peak in
+    the spectrum plot keeps a spurious peak elsewhere in the full 6-18
+    default band from winning instead."""
     n = len(depth_mm)
     if n < 20:
         return None, 0.0, np.array([]), np.array([]), None
+
+    gauge_lo, gauge_hi = gauge_range
 
     detrended = depth_mm - np.mean(depth_mm)
     window = np.hanning(n)
@@ -573,7 +640,7 @@ def _estimate_period(
     freqs = np.fft.rfftfreq(padded_n, d=PROFILE_STEP_MM)
     mag = np.abs(spectrum)
 
-    band = (freqs >= 1.0 / (20.0 / GAUGE_MIN)) & (freqs <= 1.0 / (20.0 / GAUGE_MAX))
+    band = (freqs >= 1.0 / (20.0 / gauge_lo)) & (freqs <= 1.0 / (20.0 / gauge_hi))
     if not np.any(band):
         return None, 0.0, freqs, mag, None
 
@@ -592,7 +659,18 @@ def _estimate_period(
     bin_width = freqs[1] - freqs[0]
     peak_freq = freqs[peak_idx] + offset * bin_width
 
-    background = np.median(mag[band_idx])
+    # The noise floor must come from a band wide enough to actually be
+    # representative of "background", independent of how narrow the
+    # user's peak-search gauge_range is -- using the *search* band itself
+    # (as this used to) means narrowing it to tightly bracket a real peak
+    # shrinks the median toward the peak's own skirt, inflating the
+    # apparent background and tanking the SNR for exactly the clean,
+    # narrowly-bracketed peaks a narrow range is meant to isolate (a real
+    # 12-ish gauge peak went from accepted at the full 6-18 band to
+    # "no periodic structure" once narrowed to 10-15, even though the peak
+    # itself was untouched). Always use the full default band for this.
+    noise_band = (freqs >= 1.0 / (20.0 / GAUGE_MIN)) & (freqs <= 1.0 / (20.0 / GAUGE_MAX))
+    background = np.median(mag[noise_band]) if np.any(noise_band) else np.median(mag[band_idx])
     snr = float(mag[peak_idx] / background) if background > 0 else 0.0
     gauge = peak_freq * 20.0
     return gauge, snr, freqs, mag, peak_freq
@@ -670,8 +748,14 @@ def _classify_and_pick(
     depth_mm: np.ndarray,
     perf_depth_mm: float,
     warnings: list[str],
+    user_confirmed: bool = False,
+    gauge_range: tuple[float, float] = (GAUGE_MIN, GAUGE_MAX),
 ) -> tuple[str, float | None, float | None, float]:
     amplitude = float(depth_mm.max() - depth_mm.min()) if len(depth_mm) else 0.0
+    gauge_range_lo, gauge_range_hi = gauge_range
+    # Small slack around the selected band: the slider marks roughly where
+    # the real peak is, not a hard boundary to the mm.
+    _RANGE_TOLERANCE = 0.5
 
     # Real perforation holes cut substantially into the paper (tenths of a
     # mm at least); this check must run *before* trusting the spectral SNR,
@@ -680,7 +764,20 @@ def _classify_and_pick(
     # synthetic straight edge: ~0.05 mm amplitude, SNR > 3, landing
     # plausibly in the 6-18 gauge band) that a periodicity-only check will
     # not catch.
-    MIN_PERFORATION_AMPLITUDE_MM = 0.08
+    #
+    # This floor is tuned for the *automatic* case, where nothing else has
+    # vouched for the result. ``user_confirmed`` is set when the user has
+    # narrowed the gauge-range slider away from its full default (SPEC §6)
+    # -- they are themselves asserting "the real peak is in here", so a
+    # found peak is trusted more than the automatic floor would otherwise
+    # allow. Real scans have shown genuine, unmistakably periodic tooth
+    # patterns with amplitude well under 0.08mm (thinner paper, gentler
+    # scan depth response, etc.) that this floor would reject outright
+    # regardless of how clean the periodicity is. Confirmation still has to
+    # pass every other check (hole count, spectral/hole-regression
+    # agreement) -- this only lowers the floor that would otherwise block
+    # it from ever being judged on that evidence at all.
+    MIN_PERFORATION_AMPLITUDE_MM = 0.02 if user_confirmed else 0.08
     if amplitude < MIN_PERFORATION_AMPLITUDE_MM:
         warnings.append(
             f"amplitude {amplitude:.3f}mm too small for real perforation "
@@ -688,26 +785,106 @@ def _classify_and_pick(
         )
         return "straight_edge", None, None, 0.9
 
-    # len(holes) < 3: np.polyfit(..., cov=True) below needs more points than
-    # the fit order (1) to estimate a covariance at all; found by a crash on
-    # a real, badly torn stamp edge with only 2 spurious "holes" detected.
-    not_periodic = spectral_snr < 3.0 or gauge_spectral is None or len(holes) < 3
-    if not_periodic:
+    # Spectral SNR >= 3.0 is strong enough evidence entirely on its own --
+    # a clean FFT peak doesn't need corroborating hole detections, and
+    # requiring them anyway used to block an otherwise-clear spectral
+    # result whenever contamination suppressed individual hole detections
+    # (cancellation ink can wipe out ``_detect_holes``'s spatial peaks
+    # while leaving the side's overall periodicity, which the FFT looks at
+    # in aggregate, intact). Below that automatic bar, fall back to the
+    # user-confirmed bypass: the user has narrowed the gauge range to
+    # where they can see the real peak, and >= 3 real hole detections are
+    # enough to trust it -- "3 holes should be enough to make a best
+    # guess" once a human has vouched for the band.
+    spectrally_periodic = spectral_snr >= 3.0 and gauge_spectral is not None
+    if not spectrally_periodic and not (
+        user_confirmed and gauge_holes is not None and len(holes) >= 3
+    ):
         warnings.append("no periodic structure detected: classified as imperforate")
         return "imperf", None, None, 0.8
 
-    if gauge_holes is None:
-        warnings.append("holes detected but regression failed; using spectral estimate only")
-        return "perforated", gauge_spectral, None, 0.4
+    # The hole-position regression's own uncertainty (standard error from
+    # the linear fit of hole index -> position) -- computed whenever there
+    # are enough holes to fit (np.polyfit's cov=True needs more points than
+    # the fit order to estimate a covariance at all; found by a crash on a
+    # real, badly torn stamp edge with only 2 spurious "holes" detected),
+    # independent of whether its point estimate ends up being the reported
+    # gauge.
+    regression_gauge = None
+    regression_uncertainty = None
+    if len(holes) >= 3:
+        idx = np.arange(len(holes))
+        s_peaks = np.array([h.s_mm for h in holes])
+        (period, _), cov = np.polyfit(idx, s_peaks, 1, cov=True)
+        if period > 0:
+            se_period = float(np.sqrt(cov[0, 0]))
+            regression_gauge = 20.0 / period
+            regression_uncertainty = 20.0 * se_period / period**2
 
-    agree = abs(gauge_spectral - gauge_holes) <= 0.1
     confidence = 1.0
-    if not agree:
-        warnings.append(
-            f"spectral ({gauge_spectral:.2f}) and hole-position ({gauge_holes:.2f}) "
-            "estimates disagree by > 0.1 gauge"
+
+    # The spectral peak -- the direct FFT peak position, exactly what's
+    # drawn on the spectrum plot -- is the primary reported value whenever
+    # we have one, not the hole-position regression. Real cancelled-stamp
+    # data has shown the regression disagree with, and be *less* reliable
+    # than, a clean spectral peak: a single misdetected or missed hole
+    # (cancellation ink, a broken tooth) skews a linear fit over the whole
+    # side, while the FFT peak stays anchored by the side's overall
+    # periodicity. SPEC §6: "just take the peak position [...] and report
+    # that" -- the regression is still used for its uncertainty estimate
+    # when it agrees, and as the fallback value on the rare side where no
+    # spectral peak was found at all.
+    if gauge_spectral is not None:
+        gauge = gauge_spectral
+        uncertainty = None
+        if regression_gauge is not None:
+            agree = abs(gauge_spectral - regression_gauge) <= 0.1
+            if agree:
+                uncertainty = regression_uncertainty
+            else:
+                warnings.append(
+                    f"spectral ({gauge_spectral:.2f}) and hole-position "
+                    f"({regression_gauge:.2f}) estimates disagree by > 0.1 gauge; "
+                    "using the spectral peak"
+                )
+                confidence *= 0.6
+        if spectrally_periodic:
+            if spectral_snr < 5.0:
+                confidence *= 0.7
+        else:
+            warnings.append(
+                "spectral periodicity check did not clear its automatic threshold "
+                "on this manual selection, but the peak sits in the selected gauge "
+                "range and holes were detected there; trusting the peak"
+            )
+            confidence *= 0.6
+    elif regression_gauge is not None:
+        # No spectral peak at all (can only reach here via the
+        # user_confirmed bypass above) -- the regression isn't constrained
+        # to gauge_range the way the spectral search is, so a bad
+        # detection latching onto noise can land well outside the band
+        # the user actually selected. Reject rather than report something
+        # the user's own selection already contradicts.
+        regression_in_range = (
+            gauge_range_lo - _RANGE_TOLERANCE
+            <= regression_gauge
+            <= gauge_range_hi + _RANGE_TOLERANCE
         )
+        if not regression_in_range:
+            warnings.append(
+                f"hole-spacing estimate ({regression_gauge:.2f}) falls outside "
+                f"the selected gauge range ({gauge_range_lo:.2f}-{gauge_range_hi:.2f}); "
+                "not trusting it"
+            )
+            return "imperf", None, None, 0.8
+        gauge = regression_gauge
+        uncertainty = regression_uncertainty
+        warnings.append("no spectral peak found; gauge estimated from hole spacing alone")
         confidence *= 0.5
+    else:
+        warnings.append("no periodic structure detected: classified as imperforate")
+        return "imperf", None, None, 0.8
+
     if len(holes) < 8:
         warnings.append(f"only {len(holes)} holes; gauge less reliable")
         confidence *= 0.6
@@ -719,17 +896,6 @@ def _classify_and_pick(
         # lands here often, so don't report full confidence for it.
         warnings.append(f"only {len(holes)} holes; gauge moderately reliable")
         confidence *= 0.85
-    if spectral_snr < 5.0:
-        confidence *= 0.7
-
-    # Use the hole-position regression as the primary value: it carries a
-    # proper per-side standard error and isn't biased by spectral leakage.
-    idx = np.arange(len(holes))
-    s_peaks = np.array([h.s_mm for h in holes])
-    (period, _), cov = np.polyfit(idx, s_peaks, 1, cov=True)
-    se_period = float(np.sqrt(cov[0, 0]))
-    gauge = 20.0 / period
-    uncertainty = 20.0 * se_period / period**2
 
     return "perforated", gauge, uncertainty, max(0.0, min(1.0, confidence))
 
@@ -744,6 +910,7 @@ def analyse_perforation(
     condition: str | None = None,
     multiplicity: str | None = None,
     multiplicity_count: int | None = None,
+    gauge_range: tuple[float, float] = (GAUGE_MIN, GAUGE_MAX),
 ) -> PerforationAnalysis:
     """Measure perforation gauge on all four sides of an upright stamp crop
     (SPEC §6). ``manual_roi``, keyed by side name, overrides auto ROI
@@ -776,6 +943,13 @@ def analyse_perforation(
       neighbour that this crop simply doesn't show. Flagged as a warning
       rather than guessed at, since which side(s) are shared isn't
       information this function has.
+
+    ``gauge_range`` restricts every side's spectral peak search to that
+    (min, max) gauge band instead of the default 6-18 -- the GUI's single
+    top-of-panel range slider, for narrowing the FFT's peak search to where
+    the user can actually see the real tooth-spacing peak in the spectrum
+    plot, rather than risking a spurious peak elsewhere in the full band
+    winning (SPEC §6).
     """
     mask = segment_stamp(crop)
     contour_px = _outer_contour(mask)
@@ -823,6 +997,7 @@ def analyse_perforation(
             px_per_mm_y,
             corner_exclusion_mm,
             manual_roi_mm=(manual_roi or {}).get(side),
+            gauge_range=gauge_range,
         )
 
     on_paper = condition == CONDITION_ON_PAPER
@@ -859,6 +1034,7 @@ def analyse_perforation(
         confidence=float(np.mean(confidences)) if confidences else 0.0,
         warnings=overall_warnings,
         contour_px=contour_px,
+        gauge_range=gauge_range,
     )
 
 
@@ -1008,6 +1184,9 @@ def render_diagnostic(crop: np.ndarray, analysis: PerforationAnalysis) -> bytes:
             gauges = side.spectrum_freq_cyc_per_mm * 20.0
             band = (gauges >= GAUGE_MIN) & (gauges <= GAUGE_MAX)
             ax_s.plot(gauges[band], side.spectrum_mag[band], lw=0.6)
+            gauge_lo, gauge_hi = analysis.gauge_range
+            if (gauge_lo, gauge_hi) != (GAUGE_MIN, GAUGE_MAX):
+                ax_s.axvspan(gauge_lo, gauge_hi, color="green", alpha=0.1, lw=0)
             if side.spectral_peak_freq:
                 ax_s.axvline(side.spectral_peak_freq * 20.0, color="red", lw=0.5)
         ax_s.set_title(f"{side_name} spectrum (gauge axis)", fontsize=8)

@@ -77,6 +77,20 @@ def test_stamp_json_roundtrip():
     assert restored == stamp
 
 
+def test_colour_cluster_overview_fields_roundtrip():
+    cluster = ColourCluster(label="ink1", overview_included=False, overview_label="custom label")
+    restored = ColourCluster.from_dict(
+        {"label": cluster.label, "overview_included": False, "overview_label": "custom label"}
+    )
+    assert restored == cluster
+
+
+def test_colour_cluster_overview_fields_default_to_included_no_custom_label():
+    restored = ColourCluster.from_dict({"label": "ink1"})
+    assert restored.overview_included is True
+    assert restored.overview_label is None
+
+
 def test_stamp_condition_and_multiplicity_default_to_unrecorded():
     # Never assumed -- these change which perforation approach is correct,
     # so "unknown" must stay distinguishable from any real value.

@@ -22,12 +22,32 @@ detection, plate flaws, OCR of the design, and multi-scanner management.
 
 ## 2. Physical setup and known limitations
 
-**Scanner.** Epson Perfection 1200U, controlled by SANE (`epson`/`epson2` backend;
-verify which one with `scanimage -L`). The working resolution is 1200 dpi (≈ 0.0212 mm/px,
+**Scanner.** Epson Perfection 1200U, controlled by SANE (confirmed: the `epson2`
+backend, via `scanimage -L`). The working resolution is 1200 dpi (≈ 0.0212 mm/px,
 so one perforation hole at gauge 12 is ≈ 79 px). Use 16 bit per channel if the backend
-offers it, and verify with `scanimage -A`. All automatic corrections stay off: auto
-exposure, auto gamma, colour correction, sharpening and descreening. Gamma is fixed
-(linear if possible). The exact option set is recorded (§4.1).
+offers it, and verify with `scanimage -A`. **Confirmed on the real device: this
+backend only ever offers 8-bit depth** (`--depth` reports the single fixed value
+"8bit", marked inactive); `core.scanner.acquire_scan()` detects this up front and
+omits the `--depth` flag (passing it aborts the scan outright) rather than failing,
+with a warning. `write_tiff()` still enforces the pipeline's uint16 convention, so
+an 8-bit capture is losslessly upscaled (×257, so 0→0, 255→65535) before being
+written -- skipping this (e.g. a raw `.astype(uint16)`) leaves values still
+numerically in 0–255, silently outside the domain any reference's colour model was
+trained on; found exactly this way on a real sample.
+
+All automatic corrections stay off: auto exposure, auto gamma, colour correction,
+sharpening and descreening. Gamma is fixed (linear if possible). **Confirmed on the
+real device: this backend's `--gamma-correction Default` is *not* linear/off -- it's
+the backend's own contrast-enhancing curve, a real colorimetric distortion** (its
+cross-validated ΔE00 was ~6-8, vs. ~2 with an identity table on an otherwise
+identical scan). The actual linear/off equivalent is `--gamma-correction=User
+defined` with an identity table (`output[i] = i`) loaded via
+`--{red,green,blue}-gamma-table`. Also confirmed: those three gamma-table options
+are **write-only** on this backend -- `scanimage -A` never echoes a value for them,
+active or not -- so `scanner.apply_and_verify()` treats them as applied-but-
+unverifiable rather than failing the normal "read back and refuse on mismatch"
+check it applies to every other option (§4.1). The exact option set is recorded
+(§4.1) regardless.
 
 **Sample.** A black card with stamps held behind glassine strips (a stock card).
 Consequences:
@@ -44,8 +64,9 @@ Consequences:
   correction" to be added later without restructuring.
 
 **Reference sheet.** A Wolf Faust IT8.7/2 reflective target (batch R240103, 5×7",
-FUJICOLOR Crystal Archive, glossy) plus a metal ruler with black tick marks. The ruler
-type is not yet decided, so the ruler algorithm must be generic (§4.2).
+FUJICOLOR Crystal Archive, glossy). No ruler is used (§4.2 -- removed once a real
+scanner was available to test against: the scanner's own resolution setting, read
+back and verified, is simpler and no less trustworthy for a flatbed scanner).
 The IT8 reference data (CGATS, 288 patches A1–L22 + GS0–GS23, XYZ and Lab D50 2°,
 plus per-patch STDEV and MEAN_DE) is at `reference_data/R240103.txt`.
 
@@ -62,10 +83,10 @@ stampan/
     io.py               # 16-bit TIFF read/write, metadata
     scanner.py          # SANE wrapper: option capture, apply, verify, acquire
     calibration/
-      geometry.py       # ruler → px↔mm (x and y)
-      it8.py            # patch location + RGB extraction
+      scanin.py         # ArgyllCMS `scanin` wrapper: automatic patch location + RGB
+      it8.py            # patch layout constants (ROWS/N_COLS/N_GS), PatchSample, std heatmap
       characterisation.py   # RGB→XYZ model fit, validation, apply
-      reference.py      # Reference object: save/load/verify
+      reference.py      # Reference object: save/load/verify (dpi → px/mm, scanin → patches)
     detection.py        # stamp detection + rotated crops
     perforation.py
     colour.py           # masks, clustering, statistics
@@ -126,31 +147,82 @@ a sync folder that touches files while they are being written.**
   between reference and sample; everything else must match.
 - When a reference is loaded, apply its options before each sample scan. Then read them
   back and **refuse to scan (or warn loudly)** if any stored option differs.
+- **Confirmed on the real device: apply and read-back must happen in a single
+  `scanimage` invocation.** A direct-USB SANE backend (confirmed: `epson2` on the
+  1200U) does not persist option state across separate `scanimage` processes, so a
+  set-then-dump done as two calls always reads back the backend's power-on defaults,
+  not what was just requested. `core.scanner.apply_and_verify()` does `-n -A`
+  (set, don't scan; dump resulting state) in one call for this reason.
 - Record the lamp warm-up time. Default: wait 60 s after the first scan of a session, or
   do a dummy pre-scan. Store the scan timestamp in every TIFF and JSON.
 
-### 4.2 Geometric calibration (ruler)
+### 4.2 Geometric calibration (scanner DPI, not a ruler)
 
-- The user marks the approximate ruler region and its orientation, or the software finds it.
-- Extract an intensity profile along the ruler's tick region and detect the tick
-  centres with sub-pixel precision (centroid or parabolic peak fit on the
-  tick-darkness profile).
-- Assign mm values to the ticks, using the known tick spacing (a parameter: 1 mm or
-  0.5 mm). Fit a linear regression of position on mm. Report the scale (px/mm), the
-  standard error, the residuals (max, RMS) and a non-linearity check (quadratic term).
-- **The x and y scales are calibrated separately.** Either the ruler is placed in
-  both orientations (two ruler regions on the reference sheet, or two reference
-  scans), or the software warns that it is assuming x = y. The residual plot is a
-  diagnostic image.
-- Acceptance target: scale uncertainty < 0.05 % (it limits perforation-gauge accuracy).
+**Status (2026-10-09): changed from a ruler fit to the scanner's own resolution
+setting**, at René's explicit direction once a real scanner was available to test
+against. A ruler regression made sense for an uncalibrated camera distance; a flatbed
+scanner already reports its own geometric sampling rate (dpi) directly, and that
+value is read back and confirmed by `scanner.apply_and_verify()` (§4.1) before the
+scan is taken -- it is a verified hardware setting, not an inference from the image.
+
+- `px_per_mm = dpi / 25.4`, computed separately for x and y (`dpi_y` optional --
+  omitting it assumes an isotropic scanner, true of virtually all flatbeds).
+- `dpi_source` is recorded for traceability: `"verified scanner setting"` for the
+  GUI's live-scan path (where `apply_and_verify` already confirmed the value), vs.
+  `"typed by hand"` for an externally-captured scan, where it is only as trustworthy
+  as whoever supplied it.
+- **Uncertainty is 0.0, by construction, not by measurement**: there is no
+  regression here to report a statistical uncertainty from. This reflects that the
+  dpi value itself is taken as exact (only as good as `dpi_source` says), not a
+  characterised mechanical positioning tolerance of the scan head -- flagged as
+  such rather than inventing a number (CLAUDE.md: never invent measurement results).
+- No reference scan with no dpi given skips geometric calibration entirely (with a
+  warning), rather than falling back to a hard-coded or guessed value.
+
+The old ruler-based module (`core/calibration/geometry.py`) and its ruler-strip
+reference-sheet component have been deleted; see §2's reference-sheet note.
 
 ### 4.3 Colour characterisation (IT8)
 
-**Patch location.** The user clicks the four corner-patch centres (A1, A22, L1, L22)
-on the scan; the software then interpolates the grid and the GS row. As a cross-check
-when it's installed, ArgyllCMS `scanin` with `it8.cht` can be used. Per patch, take
-the central ~60 % of the area and compute a trimmed mean of the RGB values (reject dust
-and scratches with a robust estimator). Record the patch std as a quality indicator.
+**Patch location (2026-10-09: automatic, via ArgyllCMS `scanin`).** An earlier
+version had the user click the four corner-patch centres (A1, A22, L1, L22) and
+optionally the GS row's own corners, then bilinearly interpolated the rest of the
+grid. Replaced at René's explicit direction: that approach needed pixel-precise
+manual clicks whose small errors compounded across the 22×12 grid, and its point
+labels were visually ambiguous enough to cause a real misclick (row L read as row I
+in the UI font, mistaken for a geometry bug for several iterations before being
+traced to the label text). `core/calibration/scanin.py` instead shells out to
+ArgyllCMS's `scanin` with the standard `it8.cht` chart (shipped by the `argyll-ref`
+system package, not vendored -- AGPL-3), which locates the chart's own printed
+fiducial marks and patch grid directly from the scan via edge/line detection and
+geometric feature matching -- no manual input, and no assumption that the target is
+axis-aligned or unrotated.
+
+- **Required system dependency, not merely a cross-check any more:**
+  `sudo apt install argyll argyll-ref` (Debian/Ubuntu). `scanin` locates every
+  patch; there is no fallback patch-location path.
+- **Pre-crop requirement, confirmed necessary:** `scanin`'s recognition is tuned for
+  a scan already reasonably cropped to the target, not a full scanner-bed capture
+  (confirmed: on an uncropped scan the rotation/scale fit diverged completely --
+  x/y scale differing by 30×, match confidence 0.54; cropped to the target plus a
+  margin, the same scan fit cleanly, confidence 1.02). `scanin.py` auto-crops via a
+  saturation-based content bounding box before invoking `scanin`, so this needs no
+  manual step (the ArgyllCMS-only workflow this project started from did this crop
+  by hand, in XSane).
+- **Scale note:** `scanin`'s `.ti3` output reports device RGB as 0–100, normalised
+  to the *scanned TIFF's own bit depth*. Every TIFF this app writes is uint16
+  (including the ×257 upscale for 8-bit-only backends, see §4.1), so 100 always
+  means 65535 here; `scanin.py` converts back to that native 0–65535 scale
+  immediately, so nothing downstream (a fitted colour model, stamp-crop prediction)
+  needs to know `scanin` was involved at all.
+- `scanin`'s own `-dipon` diagnostic image (every patch box drawn and labelled on
+  the scan) is persisted as the reference's `it8_grid.png` diagnostic, satisfying
+  "every analysis step produces a diagnostic image" directly from the authoritative
+  tool's own output rather than a hand-rolled re-rendering.
+
+Per patch, `scanin` takes the central portion of the area and computes a robust mean
+of the RGB values (reject dust and scratches); record the patch std as a quality
+indicator (`it8_std_heatmap.png`).
 
 **Model.** Linear scanner RGB maps to XYZ (D50, 2°). Implement and compare at least:
 
@@ -158,7 +230,9 @@ and scratches with a robust estimator). Record the patch std as a quality indica
 - (b) root-polynomial regression of degree 2 and 3 (Finlayson et al.; available in
   `colour.characterisation`),
 - (c) optionally, an ArgyllCMS ICC input profile (`colprof`) applied via ArgyllCMS
-  (`cctiff`/`xicclu`), as an external cross-check;
+  (`cctiff`/`xicclu`), as an external cross-check -- distinct from `scanin` above,
+  which is now required (patch *location*), not optional (this is a cross-check on
+  the fitted *model*, still a design hook, not implemented);
 - (d) as a reference point, piecewise-linear (Delaunay) interpolation of RGB → Lab
   (`scipy.interpolate.LinearNDInterpolator`). René explored this earlier (see §13). It
   has no smoothing (patch noise passes straight through) and is undefined outside the
@@ -457,7 +531,7 @@ Also export all results as CSV and JSON.
 
 - Test data location (inside the project folder, but gitignored -- never committed):
   `/home/limhes/git/stamps/stamp_analyzer/testdata/`
-  - `reference/`: the IT8 + ruler scan(s), with the `scanimage -A` dump
+  - `reference/`: the IT8 target scan(s), with the `scanimage -A` dump
   - `samples/`: sample sheet scans
   - `ground_truth.yaml`: per stamp, the hand-gauged perforation per side, imperf
     sides, whether it's cancelled, the expected shade name/catalogue colour, and notes
