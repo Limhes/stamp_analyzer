@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -27,6 +28,23 @@ from stampan.core.models import Project, Sample, Stamp
 def _slugify(name: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "_", name.strip().lower()).strip("_")
     return slug or "project"
+
+
+def sheet_label(sample_id: str) -> str:
+    """'sample_003' -> 'Sheet 3' (falls back to the id itself)."""
+    m = re.fullmatch(r"sample_(\d+)", sample_id)
+    return f"Sheet {int(m.group(1))}" if m else sample_id
+
+
+def sheet_title(sample) -> str:
+    """The sheet's own name if the user gave it one, else "Sheet <n>"."""
+    return sample.name or sheet_label(sample.sample_id)
+
+
+def stamp_label(stamp_id: str) -> str:
+    """'sample_003_stamp007' -> 'Stamp 8' (1-based within its sheet)."""
+    m = re.search(r"_stamp(\d+)$", stamp_id)
+    return f"Stamp {int(m.group(1)) + 1}" if m else stamp_id
 
 
 def project_dir(library_root: str | Path, project_id: str) -> Path:
@@ -94,8 +112,7 @@ def add_sample(
 
     scan_metadata.ref_id = ref_id
 
-    n = len(project.sample_ids) + 1
-    sample_id = f"sample_{n:03d}"
+    sample_id = next_sample_id(library_root, project)
     scan_path = f"{sample_id}.tif"
     write_tiff(p_dir / scan_path, scan.astype(np.uint16), scan_metadata)
 
@@ -184,8 +201,90 @@ def load_stamp_crop(library_root: str | Path, project_id: str, stamp_id: str) ->
     return image
 
 
-def next_stamp_id(sample: Sample, index: int) -> str:
+def _trailing_number(identifier: str) -> int:
+    m = re.search(r"(\d+)$", identifier)
+    return int(m.group(1)) if m else -1
+
+
+def next_sample_id(library_root: str | Path, project: Project) -> str:
+    """One past the highest sheet number ever used in this project. Counting
+    the sheets instead would reuse a deleted sheet's id and overwrite another
+    sheet's files."""
+    p_dir = project_dir(library_root, project.project_id)
+    used = [_trailing_number(s) for s in project.sample_ids]
+    used += [_trailing_number(p.stem) for p in p_dir.glob("sample_*.json")]
+    return f"sample_{max(used, default=0) + 1:03d}"
+
+
+def next_stamp_id(sample: Sample, index: int | None = None) -> str:
+    """``index`` for a fresh sheet's n-th stamp; omitted, one past the
+    highest stamp number on the sheet (so a removed stamp's id is never
+    reused)."""
+    if index is None:
+        index = max((_trailing_number(s) for s in sample.stamp_ids), default=-1) + 1
     return f"{sample.sample_id}_stamp{index:03d}"
+
+
+def rename_project(library_root: str | Path, project_id: str, name: str) -> Project:
+    project = load_project(library_root, project_id)
+    project.name = name
+    save_project(library_root, project)
+    return project
+
+
+def delete_project(library_root: str | Path, project_id: str) -> None:
+    """Permanently remove a project with all its sheets, stamps and reports."""
+    shutil.rmtree(project_dir(library_root, project_id))
+
+
+def rename_sample(
+    library_root: str | Path, project_id: str, sample_id: str, name: str | None
+) -> Sample:
+    sample = load_sample(library_root, project_id, sample_id)
+    sample.name = name or None
+    save_sample(library_root, sample)
+    return sample
+
+
+def delete_stamp(library_root: str | Path, project_id: str, stamp_id: str) -> None:
+    """Permanently remove a stamp (crop, results, diagnostics) from its sheet."""
+    sample = load_sample(
+        library_root, project_id, find_sample_for_stamp(library_root, project_id, stamp_id)
+    )
+    sample.stamp_ids.remove(stamp_id)
+    save_sample(library_root, sample)
+    shutil.rmtree(project_dir(library_root, project_id) / "stamps" / stamp_id, ignore_errors=True)
+
+
+def delete_sample(library_root: str | Path, project_id: str, sample_id: str) -> None:
+    """Permanently remove a sheet: its scan, its record and all its stamps."""
+    p_dir = project_dir(library_root, project_id)
+    sample = load_sample(library_root, project_id, sample_id)
+    for stamp_id in sample.stamp_ids:
+        shutil.rmtree(p_dir / "stamps" / stamp_id, ignore_errors=True)
+    project = load_project(library_root, project_id)
+    project.sample_ids = [s for s in project.sample_ids if s != sample_id]
+    save_project(library_root, project)
+    (p_dir / sample.scan_path).unlink(missing_ok=True)
+    (p_dir / f"{sample_id}.json").unlink(missing_ok=True)
+    for extra in (p_dir / "diagnostics").glob(f"{sample_id}_*.png"):  # overview, contact sheet
+        extra.unlink()
+
+
+def stamp_index(library_root: str | Path, project: Project) -> dict[str, str]:
+    """stamp_id -> sample_id for every stamp in ``project``, in sheet order."""
+    index: dict[str, str] = {}
+    for sample_id in project.sample_ids:
+        for stamp_id in load_sample(library_root, project.project_id, sample_id).stamp_ids:
+            index[stamp_id] = sample_id
+    return index
+
+
+def find_sample_for_stamp(library_root: str | Path, project_id: str, stamp_id: str) -> str:
+    sample_id = stamp_index(library_root, load_project(library_root, project_id)).get(stamp_id)
+    if sample_id is None:
+        raise ValueError(f"stamp {stamp_id} not found in project {project_id}")
+    return sample_id
 
 
 def save_stamp_roi_mask(
@@ -201,6 +300,29 @@ def save_stamp_roi_mask(
     filename = f"{_slugify(roi_name)}.png"
     cv2.imwrite(str(stamp_dir / filename), mask)
     return f"stamps/{stamp_id}/colour_rois/{filename}"
+
+
+def rename_stamp_colour(
+    library_root: str | Path, project_id: str, stamp_id: str, old: str, new: str
+) -> Stamp:
+    """Rename one of a stamp's colours, moving its area mask with it."""
+    stamp = load_stamp(library_root, project_id, stamp_id)
+    if any(c.label == new for c in stamp.colour.clusters):
+        raise ValueError(f"this stamp already has a colour named '{new}'")
+    for cluster in stamp.colour.clusters:
+        if cluster.label != old:
+            continue
+        cluster.label = new
+        if cluster.mask_path:
+            p_dir = project_dir(library_root, project_id)
+            old_path = p_dir / cluster.mask_path
+            new_rel = f"stamps/{stamp_id}/colour_rois/{_slugify(new)}.png"
+            if old_path.exists():
+                old_path.rename(p_dir / new_rel)
+            cluster.mask_path = new_rel
+        save_stamp_results(library_root, project_id, stamp)
+        return stamp
+    raise ValueError(f"no colour named '{old}' on {stamp_id}")
 
 
 def load_stamp_roi_mask(library_root: str | Path, project_id: str, path: str) -> np.ndarray | None:

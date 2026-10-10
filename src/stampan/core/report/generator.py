@@ -24,9 +24,10 @@ from weasyprint import HTML
 
 from stampan import __version__
 from stampan.core import colour as colour_mod
+from stampan.core import perforation as perforation_mod
 from stampan.core import project as project_mod
 from stampan.core.calibration import reference as ref_mod
-from stampan.core.models import ColourCluster, PerforationSide, Project, Reference, Stamp
+from stampan.core.models import LOW_CONFIDENCE, ColourCluster, Project, Reference, Stamp
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 
@@ -100,34 +101,6 @@ def _fmt(value: float | None, digits: int = 2, suffix: str = "") -> str:
     return f"{value:.{digits}f}{suffix}"
 
 
-def _perforation_notation(sides: dict[str, PerforationSide]) -> str:
-    """Compound notation, e.g. '11 1/2 x 12' (top/bottom x left/right).
-
-    Mirrors ``core.perforation.perforation_result_notation``, but against
-    the persisted :class:`PerforationSide` model (auto merged with any
-    manual correction, SPEC §6) rather than the in-memory analysis type.
-    """
-
-    def fmt(names: tuple[str, str]) -> str:
-        vals = []
-        for name in names:
-            side = sides.get(name)
-            if side is None:
-                continue
-            if side.kind == "imperf":
-                vals.append("imperf")
-            elif side.kind == "straight_edge":
-                vals.append("straight edge")
-            elif side.notation:
-                vals.append(side.notation)
-        a, b = sides.get(names[0]), sides.get(names[1])
-        if a and b and a.kind == b.kind == "perforated" and a.notation == b.notation:
-            return a.notation or "?"
-        return "/".join(vals) if vals else "?"
-
-    return f"{fmt(('top', 'bottom'))} x {fmt(('left', 'right'))}"
-
-
 @dataclass
 class PerforationRow:
     side: str
@@ -156,6 +129,19 @@ class ColourRow:
     philatelic_match_delta_e00: str
     swatch_hex: str
     out_of_gamut: bool
+
+
+@dataclass
+class OverviewRow:
+    """One colour in the project-wide colour overview (SPEC §9/§10)."""
+
+    label: str
+    sheet: str
+    philatelic_name: str
+    lightness: str
+    chroma: str
+    hue: str
+    swatch_hex: str
 
 
 @dataclass
@@ -205,6 +191,7 @@ class ReportContext:
     stamps: list[StampReportContext]
     notes: list[str]
     colour_overview_image: str | None = None
+    colour_overview_rows: list[OverviewRow] = field(default_factory=list)
 
 
 def _perforation_rows(perforation) -> list[PerforationRow]:
@@ -272,9 +259,9 @@ def _stamp_context(
     flags: list[str] = []
     if stamp.perforation.manual:
         flags.append("manual perforation override")
-    if stamp.perforation.meta.confidence < 0.7:
+    if stamp.perforation.meta.confidence < LOW_CONFIDENCE:
         flags.append("low perforation confidence")
-    if stamp.colour.meta.confidence and stamp.colour.meta.confidence < 0.7:
+    if stamp.colour.meta.confidence and stamp.colour.meta.confidence < LOW_CONFIDENCE:
         flags.append("low colour confidence")
 
     crop_image = None
@@ -295,7 +282,9 @@ def _stamp_context(
         width_mm=_fmt(stamp.geometry.width_mm, 2, " mm"),
         height_mm=_fmt(stamp.geometry.height_mm, 2, " mm"),
         crop_image=crop_image,
-        perforation_notation=_perforation_notation(stamp.perforation.effective()),
+        perforation_notation=perforation_mod.perforation_result_notation(
+            stamp.perforation.effective()
+        ),
         perforation_rows=_perforation_rows(stamp.perforation),
         perforation_diagnostic=_read_diagnostic(
             library_root, project_id, stamp.stamp_id, stamp.perforation.meta.diagnostic_image
@@ -331,6 +320,7 @@ def build_report_context(library_root: str | Path, project: Project) -> ReportCo
     reference_summaries: list[ReferenceSummary] = []
     stamp_contexts: list[StampReportContext] = []
     ink_cluster_entries: list[tuple[str, ColourCluster]] = []
+    overview_rows: list[OverviewRow] = []
     notes: list[str] = []
 
     for sample_id in project.sample_ids:
@@ -374,9 +364,30 @@ def build_report_context(library_root: str | Path, project: Project) -> ReportCo
                 )
             )
             for cluster in stamp.colour.clusters:
-                if cluster.label != "paper" and cluster.overview_included:
-                    label = cluster.overview_label or f"{stamp.stamp_id}/{cluster.label}"
+                # Same entries and labels as the project page's overview.
+                if (
+                    cluster.label != "paper"
+                    and cluster.mean_lab is not None
+                    and cluster.overview_included
+                ):
+                    label = cluster.overview_label or (
+                        f"{project_mod.stamp_label(stamp.stamp_id)} · {cluster.label}"
+                    )
                     ink_cluster_entries.append((label, cluster))
+                    lightness, chroma, hue = cluster.mean_lch or (None, None, None)
+                    overview_rows.append(
+                        OverviewRow(
+                            label=label,
+                            sheet=project_mod.sheet_title(sample),
+                            philatelic_name=cluster.philatelic_name or "—",
+                            lightness=_fmt(lightness, 1),
+                            chroma=_fmt(chroma, 1),
+                            hue=_fmt(hue, 1, "°"),
+                            swatch_hex="#{:02x}{:02x}{:02x}".format(
+                                *(cluster.srgb_swatch or (128, 128, 128))
+                            ),
+                        )
+                    )
 
     colour_overview_image = None
     if ink_cluster_entries:
@@ -393,6 +404,7 @@ def build_report_context(library_root: str | Path, project: Project) -> ReportCo
         stamps=stamp_contexts,
         notes=notes,
         colour_overview_image=colour_overview_image,
+        colour_overview_rows=overview_rows,
     )
 
 

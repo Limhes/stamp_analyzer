@@ -20,6 +20,10 @@ from typing import Any
 # Shared
 # --------------------------------------------------------------------------
 
+#: A result whose confidence is below this is flagged as low confidence --
+#: on the report and in the GUI alike (SPEC §6.1 step 7).
+LOW_CONFIDENCE = 0.7
+
 
 @dataclass
 class AnalysisMeta:
@@ -395,6 +399,7 @@ class Sample:
     ref_id: str
     scan_time: str | None = None
     stamp_ids: list[str] = field(default_factory=list)
+    name: str | None = None  # user-given; None shows "Sheet <n>"
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, ensure_ascii=False)
@@ -408,6 +413,7 @@ class Sample:
             ref_id=d["ref_id"],
             scan_time=d.get("scan_time"),
             stamp_ids=list(d.get("stamp_ids", [])),
+            name=d.get("name"),
         )
 
     @staticmethod

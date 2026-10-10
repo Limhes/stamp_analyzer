@@ -93,9 +93,17 @@ stampan/
     naming.py           # Munsell notation
     philatelic_colours.py   # Lab -> philatelic colour name (§9, replaces ISCC–NBS)
     project.py          # sample/project persistence
+    workflow.py         # end-to-end steps shared by CLI and GUI (capture, ingest,
+                        #   place/measure stamp, batch perforation, report export)
     report/             # Jinja2 templates + WeasyPrint
-  cli.py                # `stampan` command (typer or argparse)
-  gui/                  # PySide6 app (`stampan-gui`)
+  cli.py                # `stampan` command -- thin layer over core.workflow
+  gui/                  # PySide6 app (`stampan-gui`) -- thin layer over core.workflow
+    main_window.py      # menus, toolbars, docks, navigation, status bar
+    pages/              # inspector pages: project, sheet, stamp (+ tabs), reference
+    dialogs/            # Add Sheet dialog, New Reference wizard
+    viewer.py, library_tree.py
+    theme.py, icons.py, widgets.py   # look and feel: stylesheet, SVG icons, shared widgets
+    tasks.py, workers.py             # background tasks, one busy indicator
 tests/
 scripts/                # diagnostic runners used during development
 reference_data/R240103.txt
@@ -542,17 +550,28 @@ Also export all results as CSV and JSON.
 
 ## 12. GUI (PySide6)
 
-- **Main window.** The left side has a library tree (References / Projects → Samples
-  → Stamps). The centre has an image viewer (QGraphicsView): smooth zoom and pan,
-  a pixel readout (px, mm, RGB, Lab), and overlay layers. The right side has a
-  context panel with tabs: Detection, Perforation, Colour, Notes.
-- **Viewer tools:** rotated rectangle, ellipse, polygon, point markers, brush/lasso
-  (add/remove), and inclusion/exclusion ROIs -- the inclusion ROI is how the user
-  selects a clean, cancellation-free area for Colour to analyse (§7, §8.1). Every
-  tool has undo/redo.
-- **Workflow mode:** a step bar (Reference → Scan → Detect → per stamp: Perf →
-  Colour → Report), with per-stamp status icons (todo / auto / reviewed / manual).
-- Long computations run in worker threads with progress and cancel.
+- **Main window.** Menu bar (File / Edit / View / Tools / Project / Help, with
+  keyboard shortcuts), a main toolbar (New Project, New Reference, Add Sheet, Generate
+  Report), and three areas:
+  - *Library* dock (left): Projects → Sheets → Stamps, then References (archived
+    ones hidden). Each stamp carries a status dot (nothing / partly / fully measured).
+    Context menu per item.
+  - *Image* (centre): the QGraphicsView viewer with its own tool bar -- pan,
+    rectangle, ellipse, polygon, brush; add/erase; brush size; undo/redo/clear; zoom
+    out / % / in / fit / 1:1. Area tools are enabled only while a colour area is being
+    edited. An empty state is shown when nothing is loaded.
+  - *Inspector* dock (right): the page for the selected item -- Project (statistics,
+    colour overview, report), Sheet (detected stamps, adjust rectangle, add a missed
+    stamp), Stamp (Details / Perforation / Colour tabs, previous/next), Reference
+    (accuracy, scale, scanner settings, diagnostics; rename/archive/compare).
+- **Dialogs:** Add Sheet (reference + scanner or TIFF, validated before OK); New
+  Reference wizard (acquire → describe → review with per-model ΔE00 table and the
+  patch-location diagnostic → save).
+- **Status bar:** a single busy indicator for all background work, and the pixel
+  readout (px, mm, L*a*b* through the colour model, else RGB).
+- Long computations run in worker threads (one per page, newest request replaces a
+  queued one). Errors show the message with the traceback behind "Show Details".
+- Window layout and library folder persist between sessions (QSettings).
 - Display colour management: display sRGB is computed from Lab (assume an sRGB
   monitor). The display never feeds back into measurements.
 

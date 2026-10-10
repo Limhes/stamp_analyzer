@@ -106,11 +106,35 @@
     </tbody>
   </table>
 
-  {% if report.colour_overview_image %}
-  <h2>Colour overview -- all inks</h2>
-  <img src="{{ report.colour_overview_image }}" style="width:100%; max-width:180mm;">
-  {% endif %}
 </section>
+
+{% if report.colour_overview_rows %}
+<section class="stamp-page">
+  <h2>Colour overview -- all stamps ({{ report.colour_overview_rows|length }} colours)</h2>
+  <p class="muted">Every measured ink colour of the project, plotted together in CIELAB a*b*
+  and C*h (D50). Colours left out on the project page are not included.</p>
+  <img src="{{ report.colour_overview_image }}" style="width:100%; max-width:180mm;">
+  <table>
+    <thead>
+      <tr><th></th><th>Colour</th><th>Sheet</th><th>Philatelic name</th>
+      <th class="num">L*</th><th class="num">C*</th><th class="num">h</th></tr>
+    </thead>
+    <tbody>
+      {% for o in report.colour_overview_rows %}
+      <tr>
+        <td><span class="swatch" style="background:{{ o.swatch_hex }};"></span></td>
+        <td>{{ o.label }}</td>
+        <td>{{ o.sheet }}</td>
+        <td>{{ o.philatelic_name }}</td>
+        <td class="num">{{ o.lightness }}</td>
+        <td class="num">{{ o.chroma }}</td>
+        <td class="num">{{ o.hue }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
 
 {% for s in report.stamps %}
 <section class="stamp-page">

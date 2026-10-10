@@ -1,0 +1,13 @@
+Options/preferences:
+- set library location
+- view/change scanner settings
+
+Projects:
+- ability to remove, rename, etc. sheets
+
+Sheets:
+- Adding stamps to sheet: pan with right-mousedown-drag
+- Remove stamps from sheet (right click: remove)
+
+Stamp: right panel
+- Colour: ability to rename colour (edit inside table)

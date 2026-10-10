@@ -10,14 +10,13 @@ import typer
 
 from stampan import __version__
 from stampan.core import colour as colour_mod
-from stampan.core import detection as detection_mod
-from stampan.core import perforation as perforation_mod
 from stampan.core import philatelic_colours as philatelic_colours_mod
 from stampan.core import project as project_mod
 from stampan.core import scanner as scanner_mod
+from stampan.core import workflow
 from stampan.core.calibration import reference as ref_mod
-from stampan.core.io import ScanMetadata, read_tiff
-from stampan.core.models import GeometryResult, Stamp
+from stampan.core.io import read_tiff, write_tiff
+from stampan.core.workflow import DEFAULT_CGATS_PATH, DEFAULT_LIBRARY_ROOT
 
 app = typer.Typer(
     name="stampan",
@@ -27,8 +26,6 @@ app = typer.Typer(
 reference_app = typer.Typer(help="Manage calibration references (SPEC §4.4).")
 app.add_typer(reference_app, name="reference")
 
-DEFAULT_LIBRARY_ROOT = Path.home() / "StampAnalyzer"
-DEFAULT_CGATS_PATH = Path("reference_data") / "R240103.txt"
 DEFAULT_PHILATELIC_TABLE_PATH = philatelic_colours_mod.DEFAULT_TABLE_PATH
 DEFAULT_INTERIOR_MARGIN_MM = 0.6  # typical perforation depth (~0.3-0.5mm) + 0.3mm safety
 
@@ -75,67 +72,18 @@ def scan(
     """Apply a reference's scanner options, verify them, and acquire a scan."""
     data = json.loads(options_from.read_text(encoding="utf-8"))
     scanner_options = data.get("scanner_options", data)  # accept reference.json or raw options
-
-    mismatches = scanner_mod.apply_and_verify(
-        scanner_options, device=device, scanimage_cmd=scanimage_cmd
-    )
-    if mismatches:
-        typer.echo("Refusing to scan: scanner options did not verify:", err=True)
-        for name, (requested, actual) in mismatches.items():
-            typer.echo(f"  {name}: requested {requested!r}, actual {actual!r}", err=True)
-        raise typer.Exit(code=1)
-
-    depth = int(scanner_options.get("depth", 16))
-    result = scanner_mod.acquire_scan(
-        output,
-        device=device,
-        resolution_dpi=int(scanner_options.get("resolution"))
-        if "resolution" in scanner_options
-        else None,
-        mode=scanner_options.get("mode", "Color"),
-        depth=depth,
-        scanimage_cmd=scanimage_cmd,
-    )
-    for w in result.warnings:
-        typer.echo(f"warning: {w}", err=True)
-
-    # Re-read and re-write with embedded metadata (the scanimage call itself
-    # doesn't know about stampan's ScanMetadata convention).
-    from datetime import UTC, datetime
-
-    from stampan.core.io import write_tiff
-
-    image, _ = read_tiff(output)
-    extra: dict = {}
-    if image.dtype == np.uint8:
-        # This backend/device (e.g. the Epson 1200U via epson2: SPEC §2,
-        # Phase 1) may only offer 8-bit depth (see acquire_scan's own
-        # warning above). write_tiff enforces the pipeline's uint16
-        # convention; a caller that skips this step and just
-        # `.astype(np.uint16)`s an 8-bit array gets values still numerically
-        # in 0-255, silently outside the domain any reference's
-        # characterisation model was trained on (found exactly this way, on
-        # a real sample sheet: every single pixel came back as "outside the
-        # trained gamut"). Rescale losslessly (x257, so 0->0, 255->65535)
-        # rather than silently truncating precision we don't have.
-        typer.echo(
-            "warning: scanner wrote 8-bit; upscaling to 16-bit (x257) for pipeline consistency",
-            err=True,
+    try:
+        captured = workflow.capture_scan(
+            scanner_options, device=device, ref_id=ref_id, scanimage_cmd=scanimage_cmd
         )
-        image = (image.astype(np.uint16) * 257).astype(np.uint16)
-        extra["upscaled_from_8bit"] = True
-    write_tiff(
-        output,
-        image,
-        ScanMetadata(
-            scan_time=datetime.now(UTC).isoformat(),
-            scanner_options=scanner_options,
-            ref_id=ref_id,
-            extra=extra,
-        ),
-    )
-    note = ", upscaled to 16-bit" if extra.get("upscaled_from_8bit") else ""
-    typer.echo(f"wrote {output} ({result.bit_depth}-bit{note})")
+    except scanner_mod.ScannerError as exc:
+        typer.echo(f"Refusing to scan: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    for w in captured.warnings:
+        typer.echo(f"warning: {w}", err=True)
+    write_tiff(output, captured.image, captured.metadata)
+    note = ", upscaled to 16-bit" if captured.metadata.extra.get("upscaled_from_8bit") else ""
+    typer.echo(f"wrote {output} ({captured.source_bit_depth}-bit{note})")
 
 
 def _parse_floats(s: str) -> list[float]:
@@ -212,69 +160,24 @@ def detect(
     margin_mm: float = typer.Option(3.0, help="Black margin around tooth tips, in mm."),
 ) -> None:
     """Detect stamps on a sample sheet and write crops + stamp.json (SPEC §5)."""
-    ref = ref_mod.load_reference(library_root, reference)
-    if ref.scale is None:
-        typer.echo(f"reference {reference} has no scale calibration.", err=True)
-        raise typer.Exit(code=1)
-
     scan_image, scan_metadata = read_tiff(sample_path)
-    scan_metadata.ref_id = reference
-
     proj = project_mod.get_or_create_project(library_root, project)
-    sample = project_mod.add_sample(library_root, proj, scan_image, scan_metadata, reference)
-
-    result = detection_mod.detect_stamps(scan_image, ref.scale.px_per_mm_x, ref.scale.px_per_mm_y)
-    overview_png = detection_mod.render_overview(scan_image, result)
-
-    # Computed once per sheet (on a strided subsample -- the 1st percentile
-    # of a background-dominated scan is stable under heavy subsampling) and
-    # reused for every stamp: extract_crop's own fallback would otherwise
-    # re-sort the entire multi-hundred-MB sheet once per stamp.
-    background_level = float(np.percentile(scan_image[::8, ::8], 1))
-
-    crops = []
-    for i, detected in enumerate(result.stamps):
-        crop, transform = detection_mod.extract_crop(
-            scan_image,
-            detected,
-            ref.scale.px_per_mm_x,
-            ref.scale.px_per_mm_y,
-            margin_mm,
-            background_level=background_level,
+    try:
+        result = workflow.ingest_sample(
+            library_root, proj, reference, scan_image, scan_metadata, margin_mm=margin_mm
         )
-        crops.append(crop)
-        width_mm = detected.size_px[0] / ref.scale.px_per_mm_x
-        height_mm = detected.size_px[1] / ref.scale.px_per_mm_y
-        stamp = Stamp(
-            stamp_id=project_mod.next_stamp_id(sample, i),
-            geometry=GeometryResult(
-                width_mm=width_mm,
-                height_mm=height_mm,
-                rotation_deg=transform.angle_deg,
-                sample_centre_px=transform.sample_centre_px,
-                crop_size_px=transform.crop_size_px,
-            ),
-        )
-        project_mod.save_stamp(library_root, sample, stamp, crop)
+    except workflow.WorkflowError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
 
-    contact_sheet_png = detection_mod.render_contact_sheet(crops)
-    project_dir = project_mod.project_dir(library_root, proj.project_id)
-    (project_dir / "diagnostics").mkdir(parents=True, exist_ok=True)
-    (project_dir / "diagnostics" / f"{sample.sample_id}_overview.png").write_bytes(overview_png)
-    (project_dir / "diagnostics" / f"{sample.sample_id}_contact_sheet.png").write_bytes(
-        contact_sheet_png
-    )
-
-    project_mod.save_sample(library_root, sample)
-
-    typer.echo(f"detected {len(result.stamps)} stamp(s) in {sample_path}")
-    flagged = sum(1 for s in result.stamps if s.flagged_for_manual_review)
-    if flagged:
-        typer.echo(f"  {flagged} flagged for manual review")
+    typer.echo(f"detected {result.n_stamps} stamp(s) in {sample_path}")
+    if result.n_flagged:
+        typer.echo(f"  {result.n_flagged} flagged for manual review")
     for w in result.warnings:
         typer.echo(f"warning: {w}", err=True)
+    project_dir = project_mod.project_dir(library_root, proj.project_id)
     typer.echo(
-        f"wrote sample {sample.sample_id} and {len(result.stamps)} stamp(s) to {project_dir}"
+        f"wrote sample {result.sample.sample_id} and {result.n_stamps} stamp(s) to {project_dir}"
     )
 
 
@@ -291,84 +194,31 @@ def perf(
     stamp: str | None = typer.Option(None, "--stamp", help="Only this stamp id."),
     library_root: Path = typer.Option(DEFAULT_LIBRARY_ROOT),
 ) -> None:
-    """Measure perforation gauge on all (or one) stamp(s) in a project (SPEC §6)."""
+    """Measure perforation gauge on all (or one) stamp(s) in a project (SPEC §6).
+
+    Each stamp keeps its own saved box and gauge range (e.g. from the GUI).
+    """
     proj = _resolve_project(library_root, project)
-
-    scale_cache: dict[str, tuple[float, float]] = {}
-    stamp_to_sample: dict[str, str] = {}
-    for sample_id in proj.sample_ids:
-        sample = project_mod.load_sample(library_root, proj.project_id, sample_id)
-        for stamp_id in sample.stamp_ids:
-            stamp_to_sample[stamp_id] = sample_id
-        if sample.ref_id not in scale_cache:
-            ref = ref_mod.load_reference(library_root, sample.ref_id)
-            if ref.scale is None:
-                typer.echo(f"reference {sample.ref_id} has no scale; skipping its stamps", err=True)
-                continue
-            scale_cache[sample.ref_id] = (ref.scale.px_per_mm_x, ref.scale.px_per_mm_y)
-
-    stamp_ids = [stamp] if stamp else list(stamp_to_sample.keys())
-    if not stamp_ids:
+    if not project_mod.stamp_index(library_root, proj):
         typer.echo("no stamps found in this project.", err=True)
         raise typer.Exit(code=1)
 
+    items = workflow.measure_project_perforation(
+        library_root, proj, stamp_ids=[stamp] if stamp else None
+    )
     n_ok = 0
-    for stamp_id in stamp_ids:
-        sample_id = stamp_to_sample.get(stamp_id)
-        if sample_id is None:
-            typer.echo(f"warning: stamp {stamp_id} not found in project", err=True)
+    for item in items:
+        if item.measurement is None:
+            typer.echo(f"warning: skipping {item.stamp_id}: {item.skipped}", err=True)
             continue
-        sample = project_mod.load_sample(library_root, proj.project_id, sample_id)
-        scale = scale_cache.get(sample.ref_id)
-        if scale is None:
-            typer.echo(f"warning: no scale for stamp {stamp_id}'s reference; skipping", err=True)
-            continue
-        px_per_mm_x, px_per_mm_y = scale
-
-        crop = project_mod.load_stamp_crop(library_root, proj.project_id, stamp_id)
-        stamp_obj = project_mod.load_stamp(library_root, proj.project_id, stamp_id)
-        # Respect a previously-saved box/gauge-range (e.g. from the GUI --
-        # a bulk re-measure shouldn't throw away a hand-corrected box or a
-        # deliberately narrowed gauge range), falling back to the same
-        # defaults the GUI itself starts a never-touched stamp at.
-        gauge_range = stamp_obj.perforation.gauge_range or perforation_mod.DEFAULT_GAUGE_RANGE
-        analysis = perforation_mod.analyse_perforation(
-            crop,
-            px_per_mm_x,
-            px_per_mm_y,
-            manual_roi=stamp_obj.perforation.roi_override_mm or None,
-            manual_box_px=stamp_obj.perforation.box_override_px,
-            condition=stamp_obj.condition,
-            multiplicity=stamp_obj.multiplicity,
-            multiplicity_count=stamp_obj.multiplicity_count,
-            gauge_range=gauge_range,
-        )
-        diagnostic_png = perforation_mod.render_diagnostic(crop, analysis)
-        side_pngs = {
-            f"perforation_{name}.png": perforation_mod.render_side_profile(side)
-            for name, side in analysis.sides.items()
-        }
-        notation = perforation_mod.perforation_result_notation(analysis.sides)
-
-        stamp_obj.perforation.auto = {
-            name: side.to_persisted() for name, side in analysis.sides.items()
-        }
-        stamp_obj.perforation.gauge_range = gauge_range
-        stamp_obj.perforation.meta.confidence = analysis.confidence
-        stamp_obj.perforation.meta.warnings = analysis.warnings
-        stamp_obj.perforation.meta.diagnostic_image = "diagnostics/perforation.png"
-        project_mod.save_stamp_results(
-            library_root,
-            proj.project_id,
-            stamp_obj,
-            diagnostics={"perforation.png": diagnostic_png, **side_pngs},
-        )
         n_ok += 1
-        typer.echo(f"{stamp_id}: {notation} (confidence {analysis.confidence:.2f})")
+        analysis = item.measurement.analysis
+        typer.echo(
+            f"{item.stamp_id}: {item.measurement.notation} (confidence {analysis.confidence:.2f})"
+        )
         for w in analysis.warnings:
             typer.echo(f"  warning: {w}", err=True)
-
-    typer.echo(f"measured perforation on {n_ok}/{len(stamp_ids)} stamp(s)")
+    typer.echo(f"measured perforation on {n_ok}/{len(items)} stamp(s)")
 
 
 @app.command()
@@ -525,40 +375,18 @@ def report(
     library_root: Path = typer.Option(DEFAULT_LIBRARY_ROOT),
 ) -> None:
     """Generate the PDF report plus CSV/JSON export for a project (SPEC §10)."""
-    from stampan.core.report import generator as report_mod
-
     proj = _resolve_project(library_root, project)
-    context = report_mod.build_report_context(library_root, proj)
-    if not context.stamps:
-        typer.echo("no stamps with a usable reference in this project.", err=True)
-        raise typer.Exit(code=1)
-
-    html = report_mod.render_html(context)
-    pdf_bytes = report_mod.render_pdf(html)
-
-    project_root = project_mod.project_dir(library_root, proj.project_id)
-    pdf_path = output or (project_root / "report.pdf")
-    pdf_path.parent.mkdir(parents=True, exist_ok=True)
-    pdf_path.write_bytes(pdf_bytes)
-
-    csv_path = pdf_path.with_suffix(".csv")
-    csv_path.write_text(report_mod.export_csv(context), encoding="utf-8")
-    json_path = pdf_path.with_suffix(".json")
-    json_path.write_text(report_mod.export_json(context), encoding="utf-8")
-
-    overview_note = ""
-    if context.colour_overview_image:
-        import base64
-
-        overview_path = pdf_path.parent / "colour_overview.png"
-        overview_path.write_bytes(base64.b64decode(context.colour_overview_image.split(",", 1)[1]))
-        overview_note = f", {overview_path.name}"
-
-    for note in context.notes:
+    try:
+        files = workflow.export_report(library_root, proj, pdf_path=output)
+    except workflow.WorkflowError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    for note in files.notes:
         typer.echo(f"warning: {note}", err=True)
+    overview_note = f", {files.colour_overview.name}" if files.colour_overview else ""
     typer.echo(
-        f"wrote {pdf_path}, {csv_path.name}, {json_path.name}{overview_note} "
-        f"({len(context.stamps)} stamp(s))"
+        f"wrote {files.pdf}, {files.csv.name}, {files.json.name}{overview_note} "
+        f"({files.n_stamps} stamp(s))"
     )
 
 

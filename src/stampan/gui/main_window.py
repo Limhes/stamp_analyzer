@@ -1,36 +1,40 @@
-"""The main window (SPEC §12): library tree + sheet panel on the left,
-image viewer (with its ROI toolbar underneath) in the centre, and the
-stamp-level context panel (Detection/Perforation/Colour/Stamp tabs) on the
-right."""
+"""The main window (SPEC §12).
+
+Library on the left, the image in the centre with its own tool bar, and an
+inspector on the right that shows the page for whatever is selected in the
+library: a project, a sheet, a stamp or a calibration reference. All
+measurement work goes through the pages; this window only does navigation,
+menus, the viewer's tools and the status bar.
+"""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QByteArray, QSettings, Qt, QUrl
+from PySide6.QtGui import QAction, QActionGroup, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
-    QComboBox,
     QDockWidget,
     QFileDialog,
-    QHBoxLayout,
     QInputDialog,
     QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
-    QPushButton,
+    QSizePolicy,
+    QSpinBox,
     QStackedWidget,
-    QStatusBar,
-    QTabWidget,
     QToolBar,
     QVBoxLayout,
     QWidget,
 )
 
-from stampan.cli import DEFAULT_LIBRARY_ROOT
+from stampan import __version__
 from stampan.core import project as project_mod
-from stampan.core.calibration import reference as ref_mod
-from stampan.gui._util import find_sample_for_stamp
+from stampan.core import workflow
+from stampan.gui import icons, library_actions, preferences, theme
+from stampan.gui.dialogs.reference_wizard import ReferenceWizard
 from stampan.gui.library_tree import (
     KIND_PROJECT,
     KIND_REFERENCE,
@@ -38,434 +42,740 @@ from stampan.gui.library_tree import (
     KIND_STAMP,
     LibraryTree,
 )
-from stampan.gui.panels import (
-    ColourOverviewPanel,
-    ColourPanel,
-    PerforationPanel,
-    ReferenceManagerPanel,
-    ReferenceWizardPanel,
-    SheetPanel,
-    SheetStampsPanel,
-    StampPanel,
-)
+from stampan.gui.pages.base import AppContext, Page
+from stampan.gui.pages.project_page import ProjectPage
+from stampan.gui.pages.reference_page import ReferencePage
+from stampan.gui.pages.sheet_page import SheetPage
+from stampan.gui.pages.stamp_page import MODE_COLOUR_AREA, StampPage
+from stampan.gui.tasks import hub
 from stampan.gui.viewer import (
     MODE_ERASE,
     MODE_INCLUDE,
     TOOL_BRUSH,
     TOOL_ELLIPSE,
     TOOL_PAN,
-    TOOL_PERF_BOX,
     TOOL_POLYGON,
     TOOL_RECT,
     ImageViewer,
 )
-from stampan.gui.workers import Worker
+from stampan.gui.widgets import EmptyState, button
 
-#: For debugging convenience only: when running from a source checkout (not
-#: an installed package), default straight into the same test library the
-#: test suite uses instead of the normal empty ~/StampAnalyzer, so there's
-#: something to look at without a manual "Open library..." + project click
-#: every time. Falls back to DEFAULT_LIBRARY_ROOT when this doesn't exist
-#: (an installed app, or a checkout without testdata/ populated).
+#: When running from a source checkout with test data present, start in the
+#: test library unless the user has chosen a library before.
 _DEV_LIBRARY_ROOT = Path(__file__).resolve().parents[3] / "testdata" / "_library"
+
+_AREA_TOOLS = (TOOL_RECT, TOOL_ELLIPSE, TOOL_POLYGON, TOOL_BRUSH)
+
+
+class WelcomePage(Page):
+    def __init__(self, ctx: AppContext, window: MainWindow) -> None:
+        super().__init__(ctx)
+        self.header.set_text("Stamp Analyzer", "Calibrated measurement of postage stamps")
+        empty = EmptyState(
+            "stamp",
+            "Nothing selected",
+            "Select a project, sheet, stamp or reference in the library. "
+            "To start, calibrate a reference from an IT8 scan, then create a project "
+            "and add sample sheets to it.",
+        )
+        empty.add_action(button("New Reference…", "target", slot=window.new_reference))
+        empty.add_action(button("New Project…", "folder-plus", "primary", slot=window.new_project))
+        self.body_layout.addWidget(empty)
+        self.body_layout.addStretch(1)
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Stamp Analyzer")
-        self.resize(1400, 900)
-
-        self.library_root: Path = (
-            _DEV_LIBRARY_ROOT if _DEV_LIBRARY_ROOT.is_dir() else DEFAULT_LIBRARY_ROOT
-        )
-        self._current_project_id: str | None = None
-        self._current_stamp_id: str | None = None
+        self.settings = QSettings()
+        saved_root = preferences.library_root()
+        if saved_root is not None:
+            self.library_root = saved_root
+        elif _DEV_LIBRARY_ROOT.is_dir():
+            self.library_root = _DEV_LIBRARY_ROOT
+        else:
+            self.library_root = workflow.DEFAULT_LIBRARY_ROOT
+        self.library_root.mkdir(parents=True, exist_ok=True)
 
         self.viewer = ImageViewer()
-        self.viewer.pixel_info.connect(self._on_pixel_info)
-        self.setCentralWidget(self._build_viewer_area())
+        self.ctx = AppContext(lambda: self.library_root, self.viewer, self.navigate)
+        self._current: Page | None = None
 
-        # -- left: library tree + sheet-level panel --------------------------
-        self.tree = LibraryTree()
-        self.tree.selection_changed.connect(self._on_tree_selection)
-        self.sheet_panel = SheetPanel(lambda: self.library_root)
-        self.sheet_panel.changed.connect(self._reload_tree)
+        self._build_centre()
+        self._build_library_dock()
+        self._build_inspector_dock()
+        self._build_actions()
+        self._build_menus()
+        self._build_toolbars()
+        self._build_status_bar()
 
-        left_container = QWidget()
-        left_layout = QVBoxLayout(left_container)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.addWidget(self.tree, stretch=3)
-        left_layout.addWidget(self.sheet_panel, stretch=1)
-        self._tree_dock = QDockWidget("Library", self)
-        self._tree_dock.setWidget(left_container)
-        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self._tree_dock)
-
-        # -- right: stamp-level context tabs, or the sheet's stamp list --------
-        self.stamp_panel = StampPanel(lambda: self.library_root, self._begin_edit_box_on_sheet)
-        self.perforation_panel = PerforationPanel(lambda: self.library_root, self.viewer)
-        self.colour_panel = ColourPanel(lambda: self.library_root, self.viewer)
-        self.sheet_stamps_panel = SheetStampsPanel(lambda: self.library_root, self.viewer)
-        self.colour_overview_panel = ColourOverviewPanel(lambda: self.library_root)
-        self.reference_manager_panel = ReferenceManagerPanel(lambda: self.library_root)
-        self.reference_wizard_panel = ReferenceWizardPanel(lambda: self.library_root, self.viewer)
-        for panel in (self.perforation_panel, self.colour_panel, self.stamp_panel):
-            panel.changed.connect(self._reload_tree)
-        self.sheet_stamps_panel.changed.connect(self._reload_tree)
-        self.reference_manager_panel.changed.connect(self._reload_tree)
-        self.reference_wizard_panel.changed.connect(self._reload_tree)
-
-        self._context_tabs = QTabWidget()
-        self._context_tabs.addTab(self.stamp_panel, "Stamp")
-        self._context_tabs.addTab(self.perforation_panel, "Perforation")
-        self._context_tabs.addTab(self.colour_panel, "Colour")
-        self._context_tabs.currentChanged.connect(self._on_context_tab_changed)
-
-        # Which stamp these three tabs are about is otherwise only visible
-        # in the library tree's own (possibly scrolled-out-of-view)
-        # selection -- state it here too.
-        self._stamp_context_container = QWidget()
-        stamp_context_container = self._stamp_context_container
-        stamp_context_layout = QVBoxLayout(stamp_context_container)
-        stamp_context_layout.setContentsMargins(0, 0, 0, 0)
-        stamp_context_layout.setSpacing(2)
-        self.current_stamp_label = QLabel("")
-        self.current_stamp_label.setStyleSheet("font-weight: bold; padding: 2px 4px;")
-        stamp_context_layout.addWidget(self.current_stamp_label)
-        stamp_context_layout.addWidget(self._context_tabs)
-
-        self._right_stack = QStackedWidget()
-        self._right_stack.addWidget(stamp_context_container)  # index 0: a selected stamp
-        self._right_stack.addWidget(self.sheet_stamps_panel)  # index 1: a selected sample
-        self._right_stack.addWidget(self.colour_overview_panel)  # index 2: a selected project
-        self._right_stack.addWidget(self.reference_manager_panel)  # index 3: a selected reference
-        self._right_stack.addWidget(self.reference_wizard_panel)  # index 4: "New reference..."
-        self._panel_dock = QDockWidget("Context", self)
-        self._panel_dock.setWidget(self._right_stack)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._panel_dock)
-
-        self._build_toolbar()
-
-        self.status_bar = QStatusBar()
-        self.setStatusBar(self.status_bar)
-        self.pixel_readout = QLabel("")
-        self.status_bar.addPermanentWidget(self.pixel_readout)
-        self.report_progress = QProgressBar()
-        self.report_progress.setRange(0, 0)  # indeterminate: we don't have a per-stamp count yet
-        self.report_progress.setMaximumWidth(140)
-        self.report_progress.setVisible(False)
-        self.status_bar.addPermanentWidget(self.report_progress)
-
-        # Both side docks defaulted to a roughly equal 1/3 share each,
-        # leaving the viewer (the actual working area -- the image) smaller
-        # than either -- give it the lion's share instead. A hard cap, not
-        # just resizeDocks's initial-split hint: resizeDocks only suggests a
-        # starting size, and Qt's own layout pass can still grow a dock
-        # back out to fit its content's minimum size hint (observed: the
-        # panel dock ending up *wider* than the whole window). A fixed
-        # maximum guarantees the viewer keeps at least an equal share
-        # regardless of what the panels inside want to be.
-        _SIDE_DOCK_MAX_WIDTH = 380
-        self._tree_dock.setMaximumWidth(_SIDE_DOCK_MAX_WIDTH)
-        self._panel_dock.setMaximumWidth(_SIDE_DOCK_MAX_WIDTH)
+        self.resize(1480, 920)
+        geometry = self.settings.value("window/geometry")
+        if isinstance(geometry, QByteArray):
+            self.restoreGeometry(geometry)
+        state = self.settings.value("window/state")
+        if isinstance(state, QByteArray):
+            self.restoreState(state)
 
         self._reload_tree()
-        QTimer.singleShot(0, self._size_docks)
+        self._show_page(self.welcome_page)
+        self._update_title()
 
-    def _size_docks(self) -> None:
-        side_width = min(self._tree_dock.maximumWidth(), max(self.width() // 4, 260))
-        self.resizeDocks(
-            [self._tree_dock, self._panel_dock],
-            [side_width, side_width],
-            Qt.Orientation.Horizontal,
+    # -- layout --------------------------------------------------------------
+
+    def _build_centre(self) -> None:
+        self.viewer_toolbar = QToolBar("Image Tools")
+        self.viewer_toolbar.setObjectName("ImageTools")
+        self.viewer_toolbar.setMovable(False)
+        self.viewer_empty = EmptyState(
+            "sheet", "No image", "Select a sheet, stamp or reference to view it here.", dark=True
         )
-        # The cap was only to stop the initial layout pass from growing a
-        # dock back out to its content's minimum size hint -- once the
-        # split above has actually taken, let the user drag it wider again
-        # if they want to.
-        QTimer.singleShot(0, self._release_dock_width_cap)
-
-    def _release_dock_width_cap(self) -> None:
-        self._tree_dock.setMaximumWidth(16777215)
-        self._panel_dock.setMaximumWidth(16777215)
-
-    # -- viewer + its own ROI toolbar, directly underneath -----------------
-
-    def _build_viewer_area(self) -> QWidget:
-        container = QWidget()
-        layout = QVBoxLayout(container)
+        self.centre_stack = QStackedWidget()
+        self.centre_stack.addWidget(self.viewer_empty)
+        self.centre_stack.addWidget(self.viewer)
+        centre = QWidget()
+        layout = QVBoxLayout(centre)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        layout.addWidget(self.viewer, stretch=1)
+        layout.addWidget(self.viewer_toolbar)
+        layout.addWidget(self.centre_stack, stretch=1)
+        self.setCentralWidget(centre)
+        self.viewer.pixel_info.connect(self._on_pixel_info)
+        self.viewer.zoom_changed.connect(self._on_zoom_changed)
 
-        roi_bar = QWidget()
-        roi_layout = QHBoxLayout(roi_bar)
-        roi_layout.setContentsMargins(4, 2, 4, 2)
-
-        roi_layout.addWidget(QLabel("ROI:"))
-        self.tool_combo = QComboBox()
-        self.tool_combo.addItems(["Pan", "Rectangle", "Ellipse", "Polygon", "Brush"])
-        self.tool_combo.currentTextChanged.connect(self._on_tool_changed)
-        roi_layout.addWidget(self.tool_combo)
-
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["Include", "Erase"])
-        self.mode_combo.currentTextChanged.connect(
-            lambda text: self.viewer.set_mode(MODE_INCLUDE if text == "Include" else MODE_ERASE)
+    def _build_library_dock(self) -> None:
+        self.tree = LibraryTree()
+        self.tree.selection_changed.connect(self._on_tree_selection)
+        self.tree.customContextMenuRequested.connect(self._tree_context_menu)
+        self.library_dock = QDockWidget("Library", self)
+        self.library_dock.setObjectName("LibraryDock")
+        self.library_dock.setWidget(self.tree)
+        self.library_dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetMovable
+            | QDockWidget.DockWidgetFeature.DockWidgetClosable
         )
-        roi_layout.addWidget(self.mode_combo)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.library_dock)
 
-        undo_button = QPushButton("Undo")
-        undo_button.clicked.connect(self.viewer.undo)
-        redo_button = QPushButton("Redo")
-        redo_button.clicked.connect(self.viewer.redo)
-        clear_button = QPushButton("Clear")
-        clear_button.clicked.connect(self.viewer.clear_mask)
-        roi_layout.addWidget(undo_button)
-        roi_layout.addWidget(redo_button)
-        roi_layout.addWidget(clear_button)
-        roi_layout.addStretch(1)
+    def _build_inspector_dock(self) -> None:
+        self.welcome_page = WelcomePage(self.ctx, self)
+        self.project_page = ProjectPage(self.ctx)
+        self.sheet_page = SheetPage(self.ctx)
+        self.stamp_page = StampPage(self.ctx, self.tree.sibling_stamp)
+        self.reference_page = ReferencePage(self.ctx)
+        self.pages = QStackedWidget()
+        for page in (
+            self.welcome_page,
+            self.project_page,
+            self.sheet_page,
+            self.stamp_page,
+            self.reference_page,
+        ):
+            self.pages.addWidget(page)
+            page.changed.connect(self._reload_tree)
+        self.stamp_page.mode_changed.connect(self._on_stamp_mode)
+        self.stamp_page.edit_rectangle_requested.connect(self.sheet_page.select_and_edit)
+        self.reference_page.new_reference_requested.connect(self.new_reference)
 
-        layout.addWidget(roi_bar)
-        return container
+        self.inspector_dock = QDockWidget("Inspector", self)
+        self.inspector_dock.setObjectName("InspectorDock")
+        self.inspector_dock.setWidget(self.pages)
+        self.inspector_dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetMovable
+            | QDockWidget.DockWidgetFeature.DockWidgetClosable
+        )
+        self.inspector_dock.setMinimumWidth(400)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.inspector_dock)
+        self.resizeDocks([self.library_dock], [270], Qt.Orientation.Horizontal)
+        self.resizeDocks([self.inspector_dock], [460], Qt.Orientation.Horizontal)
 
-    def _on_tool_changed(self, text: str) -> None:
-        tool = {
-            "Pan": TOOL_PAN,
-            "Rectangle": TOOL_RECT,
-            "Ellipse": TOOL_ELLIPSE,
-            "Polygon": TOOL_POLYGON,
-            "Brush": TOOL_BRUSH,
-        }[text]
-        self.viewer.set_tool(tool)
+    def _action(self, text, icon_name=None, slot=None, shortcut=None, tip=None, checkable=False):
+        action = QAction(text, self)
+        if icon_name:
+            action.setIcon(icons.icon(icon_name))
+        if slot is not None:
+            action.triggered.connect(slot)
+        if shortcut is not None:
+            action.setShortcut(QKeySequence(shortcut))
+        if tip:
+            action.setStatusTip(tip)
+            action.setToolTip(f"{tip} ({action.shortcut().toString()})" if shortcut else tip)
+        action.setCheckable(checkable)
+        return action
 
-    def _on_context_tab_changed(self, index: int) -> None:
-        widget = self._context_tabs.widget(index)
-        is_perforation = widget is self.perforation_panel
-        if is_perforation:
-            self.perforation_panel.activate()
-            self.viewer.set_tool(TOOL_PERF_BOX)
-        else:
-            self.perforation_panel.deactivate()
-            self._on_tool_changed(self.tool_combo.currentText())
-        self.tool_combo.setEnabled(not is_perforation)
-        self.mode_combo.setEnabled(not is_perforation)
+    def _build_actions(self) -> None:
+        a = self._action
+        self.act_new_project = a(
+            "New Project…",
+            "folder-plus",
+            self.new_project,
+            "Ctrl+N",
+            "Create a project for a group of stamps",
+        )
+        self.act_new_reference = a(
+            "New Reference…",
+            "target",
+            self.new_reference,
+            "Ctrl+Shift+N",
+            "Calibrate a reference from an IT8 target scan",
+        )
+        self.act_add_sheet = a(
+            "Add Sheet…",
+            "import",
+            self._add_sheet,
+            "Ctrl+I",
+            "Scan or import a sample sheet into the current project",
+        )
+        self.act_open_library = a(
+            "Open Library…", "library", self.open_library, "Ctrl+O", "Choose the library folder"
+        )
+        self.act_show_folder = a("Show Library Folder", "folder", self._show_library_folder)
+        self.act_quit = a("Quit", "quit", self.close, QKeySequence.StandardKey.Quit)
 
-    # -- top toolbar: project/library-wide actions --------------------------
+        self.act_report = a(
+            "Generate Report",
+            "report",
+            self._generate_report,
+            "Ctrl+R",
+            "Write the project's PDF report with CSV/JSON export",
+        )
+        self.act_open_report = a("Open Last Report", "open-external", self._open_report)
+        self.act_remeasure = a(
+            "Re-measure Perforation…",
+            "run",
+            self._remeasure,
+            tip="Measure the perforation of every stamp in the project again",
+        )
 
-    def _build_toolbar(self) -> None:
-        toolbar = QToolBar("Main")
-        self.addToolBar(toolbar)
+        self.act_prev = a(
+            "Previous Stamp", "chevron-left", lambda: self.stamp_page.step(-1), "Alt+Left"
+        )
+        self.act_next = a(
+            "Next Stamp", "chevron-right", lambda: self.stamp_page.step(+1), "Alt+Right"
+        )
+        self.act_reload = a("Reload Library", "refresh", self._reload_tree, "F5")
 
-        open_action = toolbar.addAction("Open library...")
-        open_action.triggered.connect(self._choose_library_root)
+        self.act_zoom_in = a(
+            "Zoom In",
+            "zoom-in",
+            lambda: self.viewer.zoom_by(1.25),
+            QKeySequence.StandardKey.ZoomIn,
+            "Zoom in",
+        )
+        self.act_zoom_out = a(
+            "Zoom Out",
+            "zoom-out",
+            lambda: self.viewer.zoom_by(0.8),
+            QKeySequence.StandardKey.ZoomOut,
+            "Zoom out",
+        )
+        self.act_fit = a(
+            "Fit to Window", "fit", self.viewer.fit_whole_image, "Ctrl+0", "Fit the whole image"
+        )
+        self.act_actual = a(
+            "Actual Pixels",
+            "actual-size",
+            self.viewer.zoom_actual_size,
+            "Ctrl+1",
+            "One image pixel per screen pixel",
+        )
 
-        new_project_action = toolbar.addAction("New project...")
-        new_project_action.triggered.connect(self._new_project)
+        self.tool_group = QActionGroup(self)
+        self.tool_actions: dict[str, QAction] = {}
+        for tool, text, icon_name, key in (
+            (TOOL_PAN, "Pan", "pan", "H"),
+            (TOOL_RECT, "Rectangle", "rect", "R"),
+            (TOOL_ELLIPSE, "Ellipse", "ellipse", "E"),
+            (TOOL_POLYGON, "Polygon", "polygon", "P"),
+            (TOOL_BRUSH, "Brush", "brush", "B"),
+        ):
+            action = a(text, icon_name, None, key, f"{text} tool", checkable=True)
+            action.triggered.connect(lambda _c=False, t=tool: self.viewer.set_tool(t))
+            self.tool_group.addAction(action)
+            self.tool_actions[tool] = action
 
-        new_reference_action = toolbar.addAction("New reference...")
-        new_reference_action.triggered.connect(self._new_reference)
+        self.mode_group = QActionGroup(self)
+        self.act_include = a(
+            "Add to Area",
+            "include",
+            lambda: self.viewer.set_mode(MODE_INCLUDE),
+            "+",
+            "Shapes add to the measurement area",
+            checkable=True,
+        )
+        self.act_erase = a(
+            "Erase from Area",
+            "erase",
+            lambda: self.viewer.set_mode(MODE_ERASE),
+            "-",
+            "Shapes remove from the measurement area",
+            checkable=True,
+        )
+        self.mode_group.addAction(self.act_include)
+        self.mode_group.addAction(self.act_erase)
+        self.act_include.setChecked(True)
 
-        toolbar.addSeparator()
-        report_action = toolbar.addAction("Generate report")
-        report_action.triggered.connect(self._generate_report)
+        self.act_undo = a(
+            "Undo",
+            "undo",
+            self.viewer.undo,
+            QKeySequence.StandardKey.Undo,
+            "Undo the last area edit",
+        )
+        self.act_redo = a("Redo", "redo", self.viewer.redo, QKeySequence.StandardKey.Redo, "Redo")
+        self.act_clear = a(
+            "Clear Area", "clear", self.viewer.clear_mask, None, "Clear the whole measurement area"
+        )
+        self.area_actions = [
+            *(self.tool_actions[t] for t in _AREA_TOOLS),
+            self.act_include,
+            self.act_erase,
+            self.act_undo,
+            self.act_redo,
+            self.act_clear,
+        ]
 
-    # -- library -------------------------------------------------------
+        self.act_rename_project = a("Rename Project…", "edit", self._rename_project)
+        self.act_remove_project = a("Remove Project…", "clear", self._remove_project)
+        # F2 / Delete act on whatever is selected in the library.
+        self.act_rename_item = a("Rename", None, self._rename_selected, "F2")
+        self.act_remove_item = a(
+            "Remove", None, self._remove_selected, QKeySequence.StandardKey.Delete
+        )
+        for act in (self.act_rename_item, self.act_remove_item):
+            act.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
+            self.tree.addAction(act)
+        self.act_preferences = a(
+            "Preferences…",
+            "edit",
+            self.open_preferences,
+            QKeySequence.StandardKey.Preferences,
+            "Library folder and scanner settings",
+        )
+        self.act_about = a("About Stamp Analyzer", "about", self._about)
 
-    def _choose_library_root(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Library root", str(self.library_root))
-        if path:
-            self.library_root = Path(path)
-            self._reload_tree()
+    def _build_menus(self) -> None:
+        bar = self.menuBar()
+        file_menu = bar.addMenu("&File")
+        for act in (
+            self.act_new_project,
+            self.act_new_reference,
+            None,
+            self.act_add_sheet,
+            None,
+            self.act_open_library,
+            self.act_show_folder,
+            None,
+            self.act_quit,
+        ):
+            file_menu.addSeparator() if act is None else file_menu.addAction(act)
 
-    def _new_project(self) -> None:
-        name, ok = QInputDialog.getText(self, "New project", "Project name:")
-        if ok and name:
-            project_mod.get_or_create_project(self.library_root, name)
-            self._reload_tree()
+        edit_menu = bar.addMenu("&Edit")
+        for act in (self.act_undo, self.act_redo, self.act_clear):
+            edit_menu.addAction(act)
+        edit_menu.addSeparator()
+        edit_menu.addAction(self.act_preferences)
 
-    def _new_reference(self) -> None:
-        self._right_stack.setCurrentWidget(self.reference_wizard_panel)
+        view_menu = bar.addMenu("&View")
+        for act in (
+            self.act_zoom_in,
+            self.act_zoom_out,
+            self.act_fit,
+            self.act_actual,
+            None,
+            self.act_prev,
+            self.act_next,
+            None,
+            self.act_reload,
+        ):
+            view_menu.addSeparator() if act is None else view_menu.addAction(act)
+        view_menu.addSeparator()
+        view_menu.addAction(self.library_dock.toggleViewAction())
+        view_menu.addAction(self.inspector_dock.toggleViewAction())
+
+        tools_menu = bar.addMenu("&Tools")
+        for act in self.tool_actions.values():
+            tools_menu.addAction(act)
+        tools_menu.addSeparator()
+        tools_menu.addAction(self.act_include)
+        tools_menu.addAction(self.act_erase)
+
+        project_menu = bar.addMenu("&Project")
+        for act in (
+            self.act_add_sheet,
+            self.act_remeasure,
+            None,
+            self.act_report,
+            self.act_open_report,
+        ):
+            project_menu.addSeparator() if act is None else project_menu.addAction(act)
+        project_menu.addSeparator()
+        project_menu.addAction(self.act_rename_project)
+        project_menu.addAction(self.act_remove_project)
+
+        help_menu = bar.addMenu("&Help")
+        help_menu.addAction(self.act_about)
+
+    def _build_toolbars(self) -> None:
+        main = QToolBar("Main")
+        main.setObjectName("MainToolbar")
+        main.setMovable(False)
+        main.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        for act in (
+            self.act_new_project,
+            self.act_new_reference,
+            None,
+            self.act_add_sheet,
+            self.act_report,
+        ):
+            main.addSeparator() if act is None else main.addAction(act)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, main)
+
+        tb = self.viewer_toolbar
+        for act in self.tool_actions.values():
+            tb.addAction(act)
+        tb.addSeparator()
+        tb.addAction(self.act_include)
+        tb.addAction(self.act_erase)
+        self.brush_spin = QSpinBox()
+        self.brush_spin.setRange(1, 200)
+        self.brush_spin.setValue(12)
+        self.brush_spin.setSuffix(" px")
+        self.brush_spin.setToolTip("Brush radius (mouse wheel to change)")
+        self.brush_spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        self.brush_spin.setFixedWidth(64)
+        self.brush_spin.valueChanged.connect(self.viewer.set_brush_radius)
+        self.viewer.set_brush_radius(self.brush_spin.value())
+        self.brush_spin_action = tb.addWidget(self.brush_spin)
+        tb.addSeparator()
+        for act in (self.act_undo, self.act_redo, self.act_clear):
+            tb.addAction(act)
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        tb.addWidget(spacer)
+        tb.addAction(self.act_zoom_out)
+        self.zoom_label = QLabel("—")
+        self.zoom_label.setMinimumWidth(52)
+        self.zoom_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        tb.addWidget(self.zoom_label)
+        tb.addAction(self.act_zoom_in)
+        tb.addAction(self.act_fit)
+        tb.addAction(self.act_actual)
+
+    def _build_status_bar(self) -> None:
+        bar = self.statusBar()
+        self.busy = QProgressBar()
+        self.busy.setRange(0, 0)
+        self.busy.setMaximumWidth(120)
+        self.busy.setMaximumHeight(14)
+        self.busy.setVisible(False)
+        self.busy_label = QLabel("")
+        self.pixel_readout = QLabel("")
+        theme.set_role(self.pixel_readout, "mono")
+        bar.addWidget(self.busy)
+        bar.addWidget(self.busy_label)
+        bar.addPermanentWidget(self.pixel_readout)
+        hub().activity.connect(self._on_activity)
+
+    # -- navigation -------------------------------------------------------------
+
+    def navigate(self, kind: str, project_id: str, item_id: str) -> None:
+        if self.tree.selected_key() == (kind, project_id, item_id):
+            self._on_tree_selection(kind, project_id, item_id)
+        elif not self.tree.select_key(kind, project_id, item_id):
+            self._show_page(self.welcome_page)
+
+    def _on_tree_selection(self, kind: str, project_id: str, item_id: str) -> None:
+        try:
+            if kind == KIND_PROJECT:
+                self._show_page(self.project_page)
+                self.project_page.set_project(project_id)
+            elif kind == KIND_SAMPLE:
+                self._show_page(self.sheet_page)
+                self.sheet_page.set_sample(project_id, item_id)
+            elif kind == KIND_STAMP:
+                self._show_page(self.stamp_page)
+                self.stamp_page.set_stamp(project_id, item_id)
+            elif kind == KIND_REFERENCE:
+                self._show_page(self.reference_page)
+                self.reference_page.set_reference(item_id)
+            else:
+                self._show_page(self.welcome_page)
+        except (OSError, ValueError, KeyError) as exc:
+            self._show_page(self.welcome_page)
+            QMessageBox.warning(self, "Could not open item", f"{type(exc).__name__}: {exc}")
+        self._sync_viewer_ui()
+
+    def _show_page(self, page: Page) -> None:
+        if self._current is not None and self._current is not page:
+            self._current.deactivate()
+        if page in (self.welcome_page, self.project_page):
+            self.viewer.clear_image()
+        self._current = page
+        self.pages.setCurrentWidget(page)
+        self._sync_viewer_ui()
+
+    def _current_project_id(self) -> str | None:
+        key = self.tree.selected_key()
+        return key[1] or None if key else None
+
+    def _sync_viewer_ui(self) -> None:
+        has_image = self.viewer.has_image()
+        self.centre_stack.setCurrentWidget(self.viewer if has_image else self.viewer_empty)
+        area = self._current is self.stamp_page and self._stamp_mode == MODE_COLOUR_AREA
+        for act in self.area_actions:
+            act.setEnabled(area)
+        self.brush_spin_action.setEnabled(area)
+        self.tool_actions[TOOL_PAN].setEnabled(has_image)
+        for act in (self.act_zoom_in, self.act_zoom_out, self.act_fit, self.act_actual):
+            act.setEnabled(has_image)
+        tool = self.viewer.tool()
+        if tool in self.tool_actions:
+            self.tool_actions[tool].setChecked(True)
+        else:  # the perforation/sheet rectangle: no tool button represents it
+            checked = self.tool_group.checkedAction()
+            if checked is not None:
+                self.tool_group.setExclusive(False)
+                checked.setChecked(False)
+                self.tool_group.setExclusive(True)
+        on_stamp = self._current is self.stamp_page
+        self.act_prev.setEnabled(on_stamp)
+        self.act_next.setEnabled(on_stamp)
+        has_project = self._current_project_id() is not None
+        for act in (
+            self.act_add_sheet,
+            self.act_report,
+            self.act_open_report,
+            self.act_remeasure,
+            self.act_rename_project,
+            self.act_remove_project,
+        ):
+            act.setEnabled(has_project)
+
+    _stamp_mode = ""
+
+    def _on_stamp_mode(self, mode: str) -> None:
+        self._stamp_mode = mode
+        if mode == MODE_COLOUR_AREA:
+            if self.viewer.tool() == TOOL_PAN:
+                self.viewer.set_tool(TOOL_RECT)
+            self.act_include.setChecked(True)
+            self.viewer.set_mode(MODE_INCLUDE)
+        elif self.viewer.tool() in _AREA_TOOLS:
+            self.viewer.set_tool(TOOL_PAN)
+        self._sync_viewer_ui()
 
     def _reload_tree(self) -> None:
         self.tree.reload(self.library_root)
-        self._select_first_project_if_none_selected()
+        self._sync_viewer_ui()
 
-    def _select_first_project_if_none_selected(self) -> None:
-        if self._current_project_id is not None or self.tree.topLevelItemCount() < 2:
+    # -- library-level actions -----------------------------------------------
+
+    def open_library(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Open Library", str(self.library_root))
+        if path:
+            self.set_library(Path(path))
+
+    def set_library(self, path: Path) -> None:
+        if self._current is not None:
+            self._current.deactivate()
+        path.mkdir(parents=True, exist_ok=True)
+        self.library_root = path
+        preferences.set_library_root(path)
+        self.tree.clearSelection()
+        self._reload_tree()
+        self._show_page(self.welcome_page)
+        self._update_title()
+
+    def open_preferences(self) -> None:
+        dialog = preferences.PreferencesDialog(self.library_root, self)
+        if dialog.exec() and dialog.library_path() != self.library_root:
+            self.set_library(dialog.library_path())
+
+    def new_project(self) -> None:
+        name, ok = QInputDialog.getText(self, "New Project", "Project name:")
+        if not ok or not name.strip():
             return
-        projects_root = self.tree.topLevelItem(1)
-        if projects_root.childCount() == 0:
+        project = project_mod.get_or_create_project(self.library_root, name.strip())
+        self._reload_tree()
+        self.navigate(KIND_PROJECT, project.project_id, "")
+
+    def new_reference(self) -> None:
+        wizard = ReferenceWizard(self.library_root, self)
+        wizard.saved.connect(self._on_reference_saved)
+        wizard.exec()
+
+    def _on_reference_saved(self, ref_id: str) -> None:
+        self._reload_tree()
+        self.navigate(KIND_REFERENCE, "", ref_id)
+
+    def _show_library_folder(self) -> None:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.library_root)))
+
+    # -- project actions: forwarded to the project page ------------------------
+
+    def _with_project_page(self):
+        project_id = self._current_project_id()
+        if project_id is None:
+            return None
+        if self._current is not self.project_page:
+            self.navigate(KIND_PROJECT, project_id, "")
+        return self.project_page
+
+    def _add_sheet(self) -> None:
+        if (page := self._with_project_page()) is not None:
+            page.add_sheet()
+
+    def _generate_report(self) -> None:
+        if (page := self._with_project_page()) is not None:
+            page.generate_report()
+
+    def _open_report(self) -> None:
+        if (page := self._with_project_page()) is not None:
+            page.open_report()
+
+    def _remeasure(self) -> None:
+        if (page := self._with_project_page()) is not None:
+            page.remeasure_perforation()
+
+    # -- context menu ----------------------------------------------------------
+
+    def _tree_context_menu(self, pos) -> None:
+        key = self.tree.item_key_at(pos)
+        menu = QMenu(self)
+        if key is None:
+            menu.addAction(self.act_new_project)
+            menu.addAction(self.act_new_reference)
+        else:
+            kind, project_id, item_id = key
+            if kind in (KIND_PROJECT, KIND_SAMPLE, KIND_STAMP):
+                self.navigate(kind, project_id, item_id)
+            if kind == KIND_PROJECT:
+                menu.addAction(self.act_add_sheet)
+                menu.addAction(self.act_remeasure)
+                menu.addSeparator()
+                menu.addAction(self.act_report)
+                menu.addAction(self.act_open_report)
+                menu.addSeparator()
+                menu.addAction(
+                    icons.icon("edit"), "Rename Project…", self.project_page.rename_project
+                )
+                menu.addAction(
+                    icons.icon("clear"), "Remove Project…", self.project_page.remove_project
+                )
+            elif kind == KIND_SAMPLE:
+                menu.addAction(self.act_add_sheet)
+                menu.addSeparator()
+                menu.addAction(icons.icon("edit"), "Rename Sheet…", self.sheet_page.rename_sheet)
+                menu.addAction(icons.icon("clear"), "Remove Sheet…", self.sheet_page.remove_sheet)
+            elif kind == KIND_STAMP:
+                menu.addAction(self.act_prev)
+                menu.addAction(self.act_next)
+                menu.addSeparator()
+                menu.addAction(
+                    icons.icon("clear"),
+                    "Remove Stamp…",
+                    lambda: self._remove_stamp(project_id, item_id),
+                )
+            elif kind == KIND_REFERENCE:
+                self.navigate(kind, project_id, item_id)
+                menu.addAction(self.act_new_reference)
+            else:
+                menu.addAction(self.act_new_project)
+                menu.addAction(self.act_new_reference)
+        menu.addSeparator()
+        menu.addAction(self.act_reload)
+        menu.exec(self.tree.viewport().mapToGlobal(pos))
+
+    def _rename_project(self) -> None:
+        if (page := self._with_project_page()) is not None:
+            page.rename_project()
+
+    def _remove_project(self) -> None:
+        if (page := self._with_project_page()) is not None:
+            page.remove_project()
+
+    def _rename_selected(self) -> None:
+        key = self.tree.selected_key()
+        if key is None:
             return
-        self.tree.setCurrentItem(projects_root.child(0))
-
-    # -- selection -------------------------------------------------------
-
-    def _on_tree_selection(self, kind: str, project_id: str, item_id: str) -> None:
-        if kind != KIND_SAMPLE:
-            self.sheet_stamps_panel.deactivate()
+        kind = key[0]
         if kind == KIND_PROJECT:
-            self._current_project_id = project_id
-            self.sheet_panel.set_project(project_id)
-            self._right_stack.setCurrentWidget(self.colour_overview_panel)
-            self.colour_overview_panel.set_project(project_id)
+            self.project_page.rename_project()
         elif kind == KIND_SAMPLE:
-            self._current_project_id = project_id
-            self.sheet_panel.set_project(project_id)
-            self._load_sample_image(project_id, item_id)
-            self._right_stack.setCurrentWidget(self.sheet_stamps_panel)
-            self.sheet_stamps_panel.set_sample(project_id, item_id)
+            self.sheet_page.rename_sheet()
         elif kind == KIND_REFERENCE:
-            self._right_stack.setCurrentWidget(self.reference_manager_panel)
-            self.reference_manager_panel.refresh(select_ref_id=item_id)
+            self.reference_page.rename()
+
+    def _remove_selected(self) -> None:
+        key = self.tree.selected_key()
+        if key is None:
+            return
+        kind, project_id, item_id = key
+        if kind == KIND_PROJECT:
+            self.project_page.remove_project()
+        elif kind == KIND_SAMPLE:
+            self.sheet_page.remove_sheet()
         elif kind == KIND_STAMP:
-            self._current_project_id = project_id
-            self._current_stamp_id = item_id
-            self.sheet_panel.set_project(project_id)
-            self._right_stack.setCurrentWidget(self._stamp_context_container)
-            self.current_stamp_label.setText(f"Stamp: {item_id}")
-            self.perforation_panel.set_stamp(project_id, item_id)
-            self.colour_panel.set_stamp(project_id, item_id)
-            self.stamp_panel.set_stamp(project_id, item_id)
-            self._load_stamp_image(project_id, item_id)
+            self._remove_stamp(project_id, item_id)
 
-    def _begin_edit_box_on_sheet(self, project_id: str | None, stamp_id: str | None) -> None:
-        """The Stamp tab's "Edit bounding box on sheet...": switch to that
-        stamp's sample in the tree (which shows the sheet and its stamp
-        list) and start editing this one's box there."""
-        if project_id is None or stamp_id is None:
-            return
-        sample_id = find_sample_for_stamp(self.library_root, project_id, stamp_id)
-        if sample_id is None:
-            return
-        self.tree.select_sample(project_id, sample_id)
-        self.sheet_stamps_panel.select_and_edit(stamp_id)
+    def _remove_stamp(self, project_id: str, stamp_id: str) -> None:
+        sample_id = project_mod.find_sample_for_stamp(self.library_root, project_id, stamp_id)
+        if self._current is not None:
+            self._current.deactivate()  # save pending edits while the stamp still exists
+        if library_actions.remove_stamp(self, self.library_root, project_id, stamp_id):
+            self._current = None  # the removed stamp's page must not save again
+            self._reload_tree()
+            self.navigate(KIND_SAMPLE, project_id, sample_id)
+        else:
+            self.navigate(KIND_STAMP, project_id, stamp_id)
 
-    def _load_stamp_image(self, project_id: str, stamp_id: str) -> None:
-        crop = project_mod.load_stamp_crop(self.library_root, project_id, stamp_id)
-        px_per_mm_x = px_per_mm_y = None
-        predict_lab_fn = None
-        try:
-            sample_id = find_sample_for_stamp(self.library_root, project_id, stamp_id)
-            sample = project_mod.load_sample(self.library_root, project_id, sample_id)
-            ref = ref_mod.load_reference(self.library_root, sample.ref_id)
-            if ref.scale is not None:
-                px_per_mm_x, px_per_mm_y = ref.scale.px_per_mm_x, ref.scale.px_per_mm_y
-            if ref.colour_model is not None:
-                predict_lab_fn = ref_mod.load_colour_model(
-                    self.library_root, sample.ref_id
-                ).predict_lab
-        except Exception:
-            pass  # pixel readout just won't have mm/Lab; the image itself still loads
-        self.viewer.set_image(crop, px_per_mm_x, px_per_mm_y, predict_lab_fn)
+    # -- status ------------------------------------------------------------------
 
-    def _load_sample_image(self, project_id: str, sample_id: str) -> None:
-        # Selecting a sample shows the whole sheet, for sheet-level work
-        # (SPEC §12) -- not the detection overview diagnostic, the real scan.
-        sample = project_mod.load_sample(self.library_root, project_id, sample_id)
-        scan_image, _meta = project_mod.load_sample_scan(self.library_root, project_id, sample)
-        px_per_mm_x = px_per_mm_y = None
-        try:
-            ref = ref_mod.load_reference(self.library_root, sample.ref_id)
-            if ref.scale is not None:
-                px_per_mm_x, px_per_mm_y = ref.scale.px_per_mm_x, ref.scale.px_per_mm_y
-        except Exception:
-            pass
-        self.viewer.set_image(scan_image, px_per_mm_x, px_per_mm_y)
+    def _on_activity(self, busy: bool, message: str) -> None:
+        self.busy.setVisible(busy)
+        self.busy_label.setText(message if busy else "")
+
+    def _on_zoom_changed(self, scale: float) -> None:
+        self.zoom_label.setText(f"{scale * 100:.0f} %")
 
     def _on_pixel_info(self, info) -> None:
         if info is None:
             self.pixel_readout.setText("")
             return
-        text = f"px ({info['x']}, {info['y']})"
+        parts = [f"x {info['x']}  y {info['y']}"]
         if info["mm"]:
-            text += f"  mm ({info['mm'][0]:.2f}, {info['mm'][1]:.2f})"
-        text += f"  RGB {info['rgb']}"
+            parts.append(f"{info['mm'][0]:.2f} × {info['mm'][1]:.2f} mm")
         if info["lab"]:
-            lab = info["lab"]
-            text += f"  Lab ({lab[0]:.1f}, {lab[1]:.1f}, {lab[2]:.1f})"
-        self.pixel_readout.setText(text)
+            L, a, b = info["lab"]  # noqa: N806 -- CIELAB notation
+            parts.append(f"L* {L:.1f}  a* {a:.1f}  b* {b:.1f}")
+        else:
+            parts.append(f"RGB {info['rgb']}")
+        self.pixel_readout.setText("   │   ".join(parts))
 
-    # -- report -------------------------------------------------------
+    def _update_title(self) -> None:
+        self.setWindowTitle(f"Stamp Analyzer — {self.library_root}")
 
-    def _generate_report(self) -> None:
-        if self._current_project_id is None:
-            QMessageBox.information(self, "Report", "Select a project first.")
-            return
-        project_id = self._current_project_id
+    def _about(self) -> None:
+        box = QMessageBox(self)
+        box.setWindowTitle("About Stamp Analyzer")
+        box.setIconPixmap(icons.app_icon().pixmap(64, 64))
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText(f"<b>Stamp Analyzer</b> {__version__}")
+        box.setInformativeText(
+            "Perforation gauge, cancellation and calibrated colour (CIELAB D50, ΔE00) "
+            "of postage stamps from characterised flatbed scans.<br><br>"
+            f"Library: {self.library_root}"
+        )
+        box.exec()
 
-        def do_report(progress=None):
-            from stampan.core.report import generator as report_mod
-
-            if progress:
-                progress("building report...")
-            project = project_mod.load_project(self.library_root, project_id)
-            context = report_mod.build_report_context(self.library_root, project)
-            if not context.stamps:
-                raise RuntimeError("no stamps with a usable reference in this project")
-            if progress:
-                progress("rendering PDF...")
-            html = report_mod.render_html(context)
-            pdf_bytes = report_mod.render_pdf(html)
-            project_dir = project_mod.project_dir(self.library_root, project_id)
-            pdf_path = project_dir / "report.pdf"
-            pdf_path.write_bytes(pdf_bytes)
-            (project_dir / "report.csv").write_text(
-                report_mod.export_csv(context), encoding="utf-8"
-            )
-            (project_dir / "report.json").write_text(
-                report_mod.export_json(context), encoding="utf-8"
-            )
-            if context.colour_overview_image:
-                import base64
-
-                (project_dir / "colour_overview.png").write_bytes(
-                    base64.b64decode(context.colour_overview_image.split(",", 1)[1])
-                )
-            return pdf_path
-
-        self.report_progress.setVisible(True)
-        self.status_bar.showMessage("Generating report...")
-        worker = Worker(do_report)
-        worker.signals.progress.connect(self.status_bar.showMessage)
-        worker.signals.finished.connect(self._on_report_done)
-        worker.signals.failed.connect(self._on_report_failed)
-        self._report_worker = worker  # keep a reference so it isn't garbage-collected
-        worker.start()
-
-    def _on_report_done(self, path) -> None:
-        self.report_progress.setVisible(False)
-        self.status_bar.clearMessage()
-        QMessageBox.information(self, "Report", f"Wrote {path}")
-
-    def _on_report_failed(self, traceback_text: str) -> None:
-        self.report_progress.setVisible(False)
-        self.status_bar.clearMessage()
-        QMessageBox.critical(self, "Report failed", traceback_text)
-
-    # -- shutdown -------------------------------------------------------
+    # -- shutdown --------------------------------------------------------------
 
     def closeEvent(self, event) -> None:  # noqa: N802 -- Qt override
-        """A background ``Worker`` (``QThread``) still running when its last
-        Python reference is dropped gets destroyed mid-run, which aborts the
-        whole process (same hazard ``_BusyPanel._run`` guards against for
-        overlapping runs, SPEC §12) -- closing the window while one is still
-        in flight would hit exactly that. Give each panel's worker a moment
-        to finish first."""
-        panels = (
-            self.sheet_panel,
-            self.perforation_panel,
-            self.colour_panel,
-            self.stamp_panel,
-            self.sheet_stamps_panel,
-            self.colour_overview_panel,
-            self.reference_manager_panel,
-            self.reference_wizard_panel,
-        )
-        for panel in panels:
-            worker = getattr(panel, "_worker", None)
-            if worker is not None and worker.isRunning():
-                worker.wait(10000)
-        if getattr(self, "_report_worker", None) is not None and self._report_worker.isRunning():
-            self._report_worker.wait(10000)
+        if self._current is not None:
+            self._current.deactivate()  # saves pending stamp details
+        # A QThread destroyed while running aborts the process: let any
+        # running measurement finish first.
+        hub().wait_all()
+        self.settings.setValue("window/geometry", self.saveGeometry())
+        self.settings.setValue("window/state", self.saveState())
         super().closeEvent(event)

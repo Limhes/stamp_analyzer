@@ -19,9 +19,15 @@ def main() -> None:
         )
         return
 
+    from stampan.gui import icons, theme
     from stampan.gui.main_window import MainWindow
 
     app = QApplication(sys.argv)
+    app.setOrganizationName("StampAnalyzer")
+    app.setApplicationName("Stamp Analyzer")
+    app.setApplicationDisplayName("Stamp Analyzer")
+    theme.apply(app)
+    app.setWindowIcon(icons.app_icon())
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

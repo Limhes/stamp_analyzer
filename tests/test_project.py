@@ -78,3 +78,48 @@ def test_save_and_load_stamp_roundtrip(tmp_path):
         / "overview.png"
     )
     assert diag_path.exists()
+
+
+def test_delete_and_rename_keep_ids_unique(tmp_path):
+    from stampan.core.models import ColourCluster, Stamp
+
+    p = proj.create_project(tmp_path, "P")
+    scan = np.zeros((10, 10, 3), dtype=np.uint16)
+    s1 = proj.add_sample(tmp_path, p, scan, ScanMetadata(), ref_id="r")
+    s2 = proj.add_sample(tmp_path, p, scan, ScanMetadata(), ref_id="r")
+    crop = np.zeros((4, 4, 3), dtype=np.uint16)
+    for i in range(3):
+        proj.save_stamp(tmp_path, s2, Stamp(stamp_id=proj.next_stamp_id(s2, i)), crop)
+    proj.save_sample(tmp_path, s2)
+
+    proj.delete_stamp(tmp_path, p.project_id, s2.stamp_ids[1])
+    s2 = proj.load_sample(tmp_path, p.project_id, s2.sample_id)
+    assert len(s2.stamp_ids) == 2
+    assert proj.next_stamp_id(s2) == f"{s2.sample_id}_stamp003"
+
+    proj.delete_sample(tmp_path, p.project_id, s1.sample_id)
+    p = proj.load_project(tmp_path, p.project_id)
+    assert p.sample_ids == [s2.sample_id]
+    assert proj.next_sample_id(tmp_path, p) == "sample_003"
+
+    assert proj.rename_sample(tmp_path, p.project_id, s2.sample_id, "Finland 1875").name == (
+        "Finland 1875"
+    )
+    assert proj.rename_project(tmp_path, p.project_id, "Q").name == "Q"
+
+    stamp_id = s2.stamp_ids[0]
+    stamp = proj.load_stamp(tmp_path, p.project_id, stamp_id)
+    mask_rel = proj.save_stamp_roi_mask(
+        tmp_path, p.project_id, stamp_id, "ink", np.full((4, 4), 255, np.uint8)
+    )
+    stamp.colour.clusters = [ColourCluster(label="ink", mask_path=mask_rel)]
+    proj.save_stamp_results(tmp_path, p.project_id, stamp)
+    renamed = proj.rename_stamp_colour(tmp_path, p.project_id, stamp_id, "ink", "frame")
+    assert renamed.colour.clusters[0].label == "frame"
+    assert (
+        proj.load_stamp_roi_mask(tmp_path, p.project_id, renamed.colour.clusters[0].mask_path)
+        is not None
+    )
+
+    proj.delete_project(tmp_path, p.project_id)
+    assert proj.list_projects(tmp_path) == []

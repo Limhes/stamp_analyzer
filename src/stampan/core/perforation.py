@@ -1038,26 +1038,33 @@ def analyse_perforation(
     )
 
 
-def perforation_result_notation(sides: dict[str, SideAnalysis]) -> str:
-    """Compound notation, e.g. '11 1/2 x 12' (top/bottom x left/right)."""
+def perforation_result_notation(sides: dict) -> str:
+    """Compound notation, e.g. '11 1/2 x 12' (top/bottom x left/right).
 
-    def fmt(side_names: tuple[str, str]) -> str:
-        a, b = sides[side_names[0]], sides[side_names[1]]
+    Works on any mapping of side name to an object with ``kind`` and
+    ``notation`` -- a fresh :class:`SideAnalysis` or a persisted
+    ``PerforationSide`` (auto merged with manual corrections) -- and
+    tolerates missing sides.
+    """
+
+    def fmt(names: tuple[str, str]) -> str:
         vals = []
-        for s in (a, b):
-            if s.kind == "imperf":
+        for name in names:
+            side = sides.get(name)
+            if side is None:
+                continue
+            if side.kind == "imperf":
                 vals.append("imperf")
-            elif s.kind == "straight_edge":
+            elif side.kind == "straight_edge":
                 vals.append("straight edge")
-            elif s.notation:
-                vals.append(s.notation)
-        if a.kind == b.kind == "perforated" and a.notation == b.notation:
+            elif side.notation:
+                vals.append(side.notation)
+        a, b = sides.get(names[0]), sides.get(names[1])
+        if a and b and a.kind == b.kind == "perforated" and a.notation == b.notation:
             return a.notation or "?"
         return "/".join(vals) if vals else "?"
 
-    horiz = fmt(("top", "bottom"))
-    vert = fmt(("left", "right"))
-    return f"{horiz} x {vert}"
+    return f"{fmt(('top', 'bottom'))} x {fmt(('left', 'right'))}"
 
 
 # --------------------------------------------------------------------------

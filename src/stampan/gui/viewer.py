@@ -1,5 +1,5 @@
-"""The image viewer: zoom/pan, a px/mm/RGB/Lab pixel readout, and the
-inclusion/exclusion ROI tools (SPEC §12).
+"""The image viewer: zoom/pan, a px/mm/RGB/Lab pixel readout, the editable
+stamp/perforation rectangle, and the measurement-area (ROI) tools (SPEC §12).
 
 Supports several independently-named ROIs at once (one per colour the user
 wants measured, SPEC §8's ROI-first colour workflow) -- one is "active" at a
@@ -14,7 +14,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QPolygonF
+from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import (
     QGraphicsEllipseItem,
     QGraphicsItem,
@@ -27,13 +27,14 @@ from PySide6.QtWidgets import (
 
 from stampan.core import colour as colour_mod
 
+_PERF_MOVE = 5  # drag handle id: the whole rectangle
+
 TOOL_PAN = "pan"
 TOOL_RECT = "rect"
 TOOL_ELLIPSE = "ellipse"
 TOOL_POLYGON = "polygon"
 TOOL_BRUSH = "brush"
 TOOL_PERF_BOX = "perf_box"
-TOOL_POINTS = "points"
 
 MODE_INCLUDE = "include"
 MODE_ERASE = "erase"
@@ -57,10 +58,9 @@ _PERF_CORNER_SIGNS = {0: (-1, -1), 1: (1, -1), 2: (1, 1), 3: (-1, 1)}
 #: no single stamp is being edited.
 _STATIC_BOX_COLOUR = QColor(80, 200, 255)
 
-#: Click-to-mark labeled points (SPEC §4.4/§8: the reference wizard's IT8
-#: corners and ruler endpoints). Reuses the perf-box handle's fixed
-#: on-screen size (_make_perf_handle) for the marker itself.
-_POINT_COLOUR = QColor(255, 80, 200)
+_MIN_ZOOM = 0.02
+_MAX_ZOOM = 40.0
+_BACKGROUND = QColor(31, 33, 37)
 
 
 def _display_image(rgb: np.ndarray) -> np.ndarray:
@@ -81,7 +81,7 @@ class ImageViewer(QGraphicsView):
     pixel_info = Signal(object)  # dict or None
     roi_changed = Signal(str)  # the active ROI's name, whenever its mask changes
     perf_box_changed = Signal()  # the perforation-box overlay geometry changed
-    points_changed = Signal()  # a labeled point was placed or undone
+    zoom_changed = Signal(float)  # current scale factor (1.0 = one image px per screen px)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -89,7 +89,9 @@ class ImageViewer(QGraphicsView):
         self.setScene(self._scene)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
-        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
+        self.setBackgroundBrush(QBrush(_BACKGROUND))
+        self.setFrameShape(QGraphicsView.Shape.NoFrame)
 
         self._pixmap_item = None
         self._mask_item = None
@@ -121,11 +123,8 @@ class ImageViewer(QGraphicsView):
         self._perf_drag_start_corners: np.ndarray | None = None
 
         self._static_box_items: list = []
-
-        self._point_labels: list[str] = []
-        self._points: dict[str, tuple[float, float]] = {}
-        self._point_order: list[str] = []
-        self._point_items: list = []
+        self._pan_origin = None  # viewport pos while drag-panning
+        self._perf_drag_anchor: np.ndarray | None = None
 
     # -- loading -----------------------------------------------------
 
@@ -147,17 +146,26 @@ class ImageViewer(QGraphicsView):
         self._perf_box = None
         self._perf_box_items = []
         self._static_box_items = []
-        self._point_labels = []
-        self._points = {}
-        self._point_order = []
-        self._point_items = []
 
         self._scene.clear()
         pixmap = QPixmap.fromImage(_to_qimage(_display_image(rgb)))
         self._pixmap_item = self._scene.addPixmap(pixmap)
         self._scene.setSceneRect(QRectF(0, 0, pixmap.width(), pixmap.height()))
         self._mask_item = self._scene.addPixmap(QPixmap())
-        self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        self.fit_whole_image()
+
+    def clear_image(self) -> None:
+        self._rgb = None
+        self._rois.clear()
+        self._active_roi = None
+        self._perf_box = None
+        self._perf_box_items = []
+        self._static_box_items = []
+        self._scene.clear()
+        self._pixmap_item = self._mask_item = None
+
+    def has_image(self) -> bool:
+        return self._rgb is not None
 
     def image_size(self) -> tuple[int, int] | None:
         """(width_px, height_px) of the currently-loaded image, or None."""
@@ -191,6 +199,13 @@ class ImageViewer(QGraphicsView):
             self._rois[name] = initial_mask.copy()
         self._refresh_mask_overlay()
 
+    def rename_roi(self, old: str, new: str) -> None:
+        for store in (self._rois, self._undo_stacks, self._redo_stacks):
+            if old in store:
+                store[new] = store.pop(old)
+        if self._active_roi == old:
+            self._active_roi = new
+
     def remove_roi(self, name: str) -> None:
         self._rois.pop(name, None)
         self._undo_stacks.pop(name, None)
@@ -198,15 +213,6 @@ class ImageViewer(QGraphicsView):
         if self._active_roi == name:
             self._active_roi = None
         self._refresh_mask_overlay()
-
-    def rename_roi(self, old_name: str, new_name: str) -> None:
-        if old_name not in self._rois or old_name == new_name:
-            return
-        self._rois[new_name] = self._rois.pop(old_name)
-        self._undo_stacks[new_name] = self._undo_stacks.pop(old_name, [])
-        self._redo_stacks[new_name] = self._redo_stacks.pop(old_name, [])
-        if self._active_roi == old_name:
-            self._active_roi = new_name
 
     def clear_mask(self) -> None:
         if self._active_roi is None:
@@ -253,6 +259,7 @@ class ImageViewer(QGraphicsView):
         half_w, half_h = hw * margin_factor, hh * margin_factor
         rect = QRectF(cx - half_w, cy - half_h, 2 * half_w, 2 * half_h)
         self.fitInView(rect, Qt.AspectRatioMode.KeepAspectRatio)
+        self.zoom_changed.emit(self.zoom_level())
 
     def get_perf_box(self) -> np.ndarray | None:
         """The 4 corners (px, sequential winding) of the current rectangle,
@@ -277,7 +284,24 @@ class ImageViewer(QGraphicsView):
         self._clear_perf_box_items()
 
     def fit_whole_image(self) -> None:
+        if self._pixmap_item is None:
+            return
         self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        self.zoom_changed.emit(self.zoom_level())
+
+    def zoom_level(self) -> float:
+        return self.transform().m11()
+
+    def zoom_by(self, factor: float) -> None:
+        if self._pixmap_item is None:
+            return
+        target = max(_MIN_ZOOM, min(_MAX_ZOOM, self.zoom_level() * factor))
+        factor = target / self.zoom_level()
+        self.scale(factor, factor)
+        self.zoom_changed.emit(self.zoom_level())
+
+    def zoom_actual_size(self) -> None:
+        self.zoom_by(1.0 / self.zoom_level())
 
     def set_static_boxes(self, boxes: list[tuple[str, np.ndarray]]) -> None:
         """Non-interactive rectangles with a small label each -- e.g. every
@@ -311,77 +335,6 @@ class ImageViewer(QGraphicsView):
         for item in self._static_box_items:
             self._scene.removeItem(item)
         self._static_box_items = []
-
-    # -- click-to-mark labeled points (SPEC §4.4/§8) ------------------------
-
-    def set_point_labels(self, labels: list[str]) -> None:
-        """Start (or restart) collecting this ordered sequence of labeled
-        points -- e.g. the reference wizard's IT8 corners and ruler
-        endpoints. Clears any points already placed."""
-        self._point_labels = list(labels)
-        self._points = {}
-        self._point_order = []
-        self._redraw_points()
-        self.points_changed.emit()
-
-    def next_point_label(self) -> str | None:
-        for label in self._point_labels:
-            if label not in self._points:
-                return label
-        return None
-
-    def points_complete(self) -> bool:
-        return bool(self._point_labels) and self.next_point_label() is None
-
-    def get_points(self) -> dict[str, tuple[float, float]]:
-        return dict(self._points)
-
-    def set_point(self, label: str, xy: tuple[float, float]) -> None:
-        """Overwrite an already-placed point's coordinates in place (e.g.
-        after auto-refinement snaps a rough click onto a known landmark).
-        No-op if ``label`` hasn't been placed yet."""
-        if label not in self._points:
-            return
-        self._points[label] = xy
-        self._redraw_points()
-        self.points_changed.emit()
-
-    def undo_last_point(self) -> None:
-        if not self._point_order:
-            return
-        label = self._point_order.pop()
-        del self._points[label]
-        self._redraw_points()
-        self.points_changed.emit()
-
-    def clear_points(self) -> None:
-        self._points = {}
-        self._point_order = []
-        self._redraw_points()
-        self.points_changed.emit()
-
-    def _place_point(self, scene_pt: QPointF) -> None:
-        label = self.next_point_label()
-        if label is None:
-            return
-        self._points[label] = (scene_pt.x(), scene_pt.y())
-        self._point_order.append(label)
-        self._redraw_points()
-        self.points_changed.emit()
-
-    def _redraw_points(self) -> None:
-        for item in self._point_items:
-            self._scene.removeItem(item)
-        self._point_items = []
-        for label, (x, y) in self._points.items():
-            self._point_items.append(self._make_perf_handle(x, y, _POINT_COLOUR))
-            text_item = QGraphicsSimpleTextItem(label)
-            text_item.setBrush(_POINT_COLOUR)
-            text_item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
-            text_item.setZValue(16)
-            text_item.setPos(x + _PERF_HANDLE_RADIUS_PX + 2, y - _PERF_HANDLE_RADIUS_PX - 2)
-            self._scene.addItem(text_item)
-            self._point_items.append(text_item)
 
     @staticmethod
     def _perf_box_corners(state: tuple[float, float, float, float, float]) -> np.ndarray:
@@ -472,12 +425,18 @@ class ImageViewer(QGraphicsView):
                 return i
         if np.linalg.norm(pt - self._perf_rotate_handle_pos(self._perf_box)) <= threshold:
             return 4
-        return None
+        inside = cv2.pointPolygonTest(
+            self._perf_box_corners(self._perf_box).astype(np.float32), (pt[0], pt[1]), False
+        )
+        return _PERF_MOVE if inside >= 0 else None
 
     def _drag_perf_handle(self, scene_pt: QPointF) -> None:
         mouse = np.array([scene_pt.x(), scene_pt.y()])
         cx0, cy0, hw0, hh0, theta0 = self._perf_drag_start
-        if self._perf_drag_handle == 4:  # rotate, about the fixed centre
+        if self._perf_drag_handle == _PERF_MOVE:
+            dx, dy = mouse - self._perf_drag_anchor
+            self._perf_box = (cx0 + dx, cy0 + dy, hw0, hh0, theta0)
+        elif self._perf_drag_handle == 4:  # rotate, about the fixed centre
             v = mouse - np.array([cx0, cy0])
             theta = float(np.arctan2(v[1], v[0])) + np.pi / 2
             self._perf_box = (cx0, cy0, hw0, hh0, theta)
@@ -506,6 +465,27 @@ class ImageViewer(QGraphicsView):
             if tool == TOOL_PAN
             else QGraphicsView.DragMode.NoDrag
         )
+        self.set_cursor_for_tool()
+
+    def set_cursor_for_tool(self) -> None:
+        if self._tool == TOOL_PAN:
+            self.viewport().setCursor(Qt.CursorShape.OpenHandCursor)
+        elif self._tool == TOOL_PERF_BOX:
+            self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+        else:
+            self.viewport().setCursor(Qt.CursorShape.CrossCursor)
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802 -- right button pans instead
+        event.accept()
+
+    def tool(self) -> str:
+        return self._tool
+
+    def mode(self) -> str:
+        return self._mode
+
+    def active_roi(self) -> str | None:
+        return self._active_roi
 
     def set_mode(self, mode: str) -> None:
         self._mode = mode
@@ -569,12 +549,28 @@ class ImageViewer(QGraphicsView):
     # -- zoom --------------------------------------------------------
 
     def wheelEvent(self, event) -> None:  # noqa: N802 -- Qt override
-        factor = 1.25 if event.angleDelta().y() > 0 else 0.8
-        self.scale(factor, factor)
+        anchor = self.transformationAnchor()
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.zoom_by(1.25 if event.angleDelta().y() > 0 else 0.8)
+        self.setTransformationAnchor(anchor)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        if event.key() == Qt.Key.Key_Escape and self._polygon_pts:
+            self._polygon_pts = []
+            self._remove_preview()
+            return
+        super().keyPressEvent(event)
 
     # -- pixel readout + drawing ------------------------------------------
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._pan_origin is not None:
+            pos = event.position().toPoint()
+            delta = pos - self._pan_origin
+            self._pan_origin = pos
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+            return
         super().mouseMoveEvent(event)
         if self._rgb is None:
             return
@@ -606,9 +602,10 @@ class ImageViewer(QGraphicsView):
         self.pixel_info.emit(info)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
-        if self._tool == TOOL_POINTS and event.button() == Qt.MouseButton.LeftButton:
-            if self._rgb is not None:
-                self._place_point(self.mapToScene(event.pos()))
+        if event.button() in (Qt.MouseButton.RightButton, Qt.MouseButton.MiddleButton):
+            # Right/middle drag pans whatever tool is active.
+            self._pan_origin = event.position().toPoint()
+            self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
             return
         if (
             self._tool == TOOL_PERF_BOX
@@ -621,9 +618,14 @@ class ImageViewer(QGraphicsView):
                 self._perf_drag_handle = handle
                 self._perf_drag_start = self._perf_box
                 self._perf_drag_start_corners = self._perf_box_corners(self._perf_box)
+                self._perf_drag_anchor = np.array([scene_pt.x(), scene_pt.y()])
+                if handle == _PERF_MOVE:
+                    self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
                 self._drawing = True
                 return
-            super().mousePressEvent(event)
+            # Outside the rectangle, a left drag pans as well.
+            self._pan_origin = event.position().toPoint()
+            self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
             return
         if (
             self._rgb is None
@@ -645,11 +647,16 @@ class ImageViewer(QGraphicsView):
             self._stamp_brush(scene_pt)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if self._pan_origin is not None:
+            self._pan_origin = None
+            self.set_cursor_for_tool()
+            return
         if self._drawing and self._tool == TOOL_PERF_BOX and self._perf_drag_handle is not None:
             self._perf_drag_handle = None
             self._perf_drag_start = None
             self._perf_drag_start_corners = None
             self._drawing = False
+            self.set_cursor_for_tool()
             return
         if self._drawing and self._tool in (TOOL_RECT, TOOL_ELLIPSE):
             self._commit_shape(self.mapToScene(event.pos()))

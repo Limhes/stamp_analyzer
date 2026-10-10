@@ -275,6 +275,12 @@ testing, none requiring any manual input. Reference manager (list/rename/archive
 compare) and the sample-scan flow are implemented as originally specced; the drift
 check-patch hook remains a design-only stub.
 
+**Refactor (2026-10-09), no new features.** Steps duplicated between CLI and GUI
+moved into `core/workflow.py`. The 2300-line `gui/panels.py` was replaced by pages,
+dialogs and shared widgets. The GUI got a menu bar, toolbars, docks, a theme, SVG
+icons, a single status-bar busy indicator, readable error dialogs and persistent
+settings (SPEC §12). Every test passes; there is a new offscreen GUI smoke test.
+
 ## Phase 9: Hardening
 
 ```
