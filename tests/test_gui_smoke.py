@@ -12,12 +12,18 @@ QtWidgets = pytest.importorskip("PySide6.QtWidgets")
 
 
 @pytest.fixture(scope="module")
-def app():
+def app(tmp_path_factory):
     from PySide6.QtCore import QCoreApplication, QSettings
 
     QCoreApplication.setOrganizationName("StampAnalyzerTests")
     QCoreApplication.setApplicationName("smoke")
+    # Keep the test's settings out of the user's ~/.config.
     QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+    QSettings.setPath(
+        QSettings.Format.IniFormat,
+        QSettings.Scope.UserScope,
+        str(tmp_path_factory.mktemp("settings")),
+    )
     application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     from stampan.gui import theme
 
