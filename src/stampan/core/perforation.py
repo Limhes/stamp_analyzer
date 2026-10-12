@@ -120,6 +120,11 @@ class PerforationAnalysis:
     gauge_range: tuple[float, float] = (GAUGE_MIN, GAUGE_MAX)
 
 
+def notation_for_gauge(gauge: float) -> str:
+    """Gauge to philatelic notation, to the nearest quarter: 11.48 -> '11 1/2'."""
+    return _notation(gauge)
+
+
 def _notation(gauge: float) -> str:
     quarter = round(gauge * 4) / 4
     whole = int(quarter)

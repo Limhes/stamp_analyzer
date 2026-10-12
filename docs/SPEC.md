@@ -510,30 +510,26 @@ Note on the report that the Munsell notation assumes illuminant C viewing.
 
 ## 10. Report
 
-Generated with Jinja2 + WeasyPrint, A4.
+A4 PDF, comparison first (rewritten 2026-10-12 at René's request -- the earlier
+one-page-per-stamp layout with full diagnostics was too detailed):
 
-**Overview page(s):** project name, date, reference used (ID, date, colour-model CV
-ΔE00, scale uncertainty), and the known limitations (glassine, gloss). Then a table
-of all stamps: thumbnail, ID/catalogue number, gauge notation, ink name, ink LCh,
-paper LCh, and flags (low confidence, manual override).
+1. **Summary**: counts; calibration references with resolution, scale, colour model and
+   cross-validated ΔE00; ink colour per catalogue number (mean LCh, max ΔE00 from the
+   group mean, perforations seen); perforation × catalogue-number counts; a short
+   methods note.
+2. **Sheets**: each sheet in calibrated colour with the current stamp rectangles and
+   stamp numbers.
+3. **Comparison charts** (left out when there is nothing to compare): ink colour (a*b*
+   and L*-C*) by catalogue number, by perforation, by cancellation year (continuous
+   scale; estimated dates and undated stamps marked), by cancellation type; shade (h,
+   C*) over time; horizontal vs vertical gauge map. Points carry stamp numbers. Only
+   ink colours ticked in the project overview are used.
+4. **Index**: one line per stamp.
+5. **Stamp cards**, four per page: a large calibrated-colour picture, perforation
+   (notation, per-side gauges, "by hand"), cancellation, colours, size, flags, notes.
 
-**One page per stamp (as much information as fits cleanly):**
-
-- Header: stamp ID, user fields (catalogue number(s), country/issue, notes), and the
-  scan date and time.
-- Large calibrated image of the stamp, with its dimensions in mm (tip-to-tip and
-  hole-bottom-to-hole-bottom).
-- Perforation: the annotated diagnostic image, a per-side table (gauge ± u, notation,
-  hole count, regularity, hole diameter, auto/manual, confidence), and the compound
-  notation.
-- Colour: swatches for paper and ink(s); a table of L*, C*, h, a*, b* (mean ± std),
-  the ΔE00 spread, ink-paper ΔE00, Munsell notation and philatelic colour name (§9,
-  with its match ΔE00); a small a*b* scatter
-  plot and a C*–L* plot with the cluster ellipses; the mixed-pixel fraction; and the τ
-  used.
-- Footer: software version, reference ID, and a hash of the analysis parameters.
-
-Also export all results as CSV and JSON.
+Per-side perforation diagnostics stay in the project folder and the GUI. CSV and JSON
+exports carry the per-stamp data; `colour_overview.png` is the first colour chart.
 
 ## 11. Test data, ground truth, validation
 
@@ -564,6 +560,16 @@ Also export all results as CSV and JSON.
     colour overview, report), Sheet (detected stamps, adjust rectangle, add a missed
     stamp), Stamp (Details / Perforation / Colour tabs, previous/next), Reference
     (accuracy, scale, scanner settings, diagnostics; rename/archive/compare).
+- **Project comparison** (centre area while a project is selected): one row per measured
+  colour with Lab/LCh, perforation, catalogue no. and cancellation; search, filter (inks/paper,
+  perforation "X on all sides" / "X on any side" / exact notation, cancellation type, year
+  range), sort on any column, CSV export. Linked a*b* and L*–C* plots show the visible, ticked
+  rows, coloured by measured colour or grouped by perforation, cancellation, sheet or catalogue
+  no.; hover names a point, clicking selects its row.
+- **Perforation override** (§6.2): per side, kind and gauge set by hand with an optional reason;
+  stored in `manual` next to the measured result, shown as "by hand", flagged on the report.
+- **Cancellation** (Details tab): type from a user-defined list (Preferences), date as YYYY,
+  YYYY-MM or YYYY-MM-DD, and whether it is estimated rather than read from a legible postmark.
 - **Dialogs:** Add Sheet (reference + scanner or TIFF, validated before OK); New
   Reference wizard (acquire → describe → review with per-model ΔE00 table and the
   patch-location diagnostic → save).

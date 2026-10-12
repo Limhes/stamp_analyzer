@@ -12,6 +12,7 @@ traceable and auditable.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -272,6 +273,48 @@ MULTIPLICITY_BLOCK = "block"
 
 
 @dataclass
+class Cancellation:
+    """How and when the stamp was cancelled, as recorded by the user."""
+
+    type: str | None = None  # from the user's list in Preferences
+    #: ISO date, as precise as known: "1889", "1889-03" or "1889-03-14".
+    date: str | None = None
+    #: True when the date was not read from a legible postmark (inferred from
+    #: the issue period, a partial strike, the sheet's other stamps, ...).
+    date_estimated: bool = False
+
+    @staticmethod
+    def from_dict(d: dict[str, Any]) -> Cancellation:
+        return Cancellation(
+            type=d.get("type"),
+            date=d.get("date"),
+            date_estimated=bool(d.get("date_estimated", False)),
+        )
+
+
+_PARTIAL_DATE = re.compile(r"^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?$")
+
+
+def parse_partial_date(text: str) -> str | None:
+    """Normalise "1889", "1889-3", "1889-03-14" (also with "." or "/"
+    separators) to ISO form; raise ValueError if it is not a valid date."""
+    text = text.strip().replace(".", "-").replace("/", "-")
+    if not text:
+        return None
+    parts = text.split("-")
+    if not 1 <= len(parts) <= 3 or not all(p.isdigit() for p in parts) or len(parts[0]) != 4:
+        raise ValueError("use YYYY, YYYY-MM or YYYY-MM-DD")
+    year, *rest = (int(p) for p in parts)
+    if rest and not 1 <= rest[0] <= 12:
+        raise ValueError("month must be 1-12")
+    if len(rest) == 2:
+        import datetime as _dt
+
+        _dt.date(year, rest[0], rest[1])  # raises ValueError for e.g. 31 February
+    return "-".join([f"{year:04d}", *(f"{v:02d}" for v in rest)])
+
+
+@dataclass
 class Stamp:
     stamp_id: str
     crop_path: str | None = None
@@ -288,6 +331,7 @@ class Stamp:
     geometry: GeometryResult = field(default_factory=GeometryResult)
     perforation: PerforationResult = field(default_factory=PerforationResult)
     colour: ColourResult = field(default_factory=ColourResult)
+    cancellation: Cancellation = field(default_factory=Cancellation)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, ensure_ascii=False)
@@ -306,6 +350,7 @@ class Stamp:
             geometry=GeometryResult.from_dict(d.get("geometry", {})),
             perforation=PerforationResult.from_dict(d.get("perforation", {})),
             colour=ColourResult.from_dict(d.get("colour", {})),
+            cancellation=Cancellation.from_dict(d.get("cancellation", {})),
         )
 
     @staticmethod

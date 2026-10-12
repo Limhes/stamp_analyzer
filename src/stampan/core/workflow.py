@@ -16,7 +16,6 @@ functions accept an optional ``progress(message)`` callback.
 
 from __future__ import annotations
 
-import base64
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -32,7 +31,15 @@ from stampan.core import project as project_mod
 from stampan.core import scanner as scanner_mod
 from stampan.core.calibration import reference as ref_mod
 from stampan.core.io import ScanMetadata, read_tiff
-from stampan.core.models import ColourCluster, GeometryResult, Project, Reference, Sample, Stamp
+from stampan.core.models import (
+    ColourCluster,
+    GeometryResult,
+    PerforationSide,
+    Project,
+    Reference,
+    Sample,
+    Stamp,
+)
 
 Progress = Callable[[str], None] | None
 
@@ -456,6 +463,44 @@ class BatchItem:
     skipped: str | None = None  # reason, when measurement is None
 
 
+def set_perforation_override(
+    library_root: str | Path,
+    project_id: str,
+    stamp_id: str,
+    sides: dict[str, tuple[str, float | None]],
+    reason: str = "",
+) -> Stamp:
+    """Replace the manual perforation values of a stamp (SPEC §6.2).
+
+    ``sides`` maps a side to ``(kind, gauge)`` -- kind "perforated" (gauge
+    required), "imperf" or "straight_edge". Sides left out have no override
+    and show the measured value. The measured result itself is untouched, so
+    "measured" and "set by hand" stay distinguishable (and the report flags
+    the override).
+    """
+    stamp = project_mod.load_stamp(library_root, project_id, stamp_id)
+    manual, reasons = {}, {}
+    for side, (kind, gauge) in sides.items():
+        if side not in perforation_mod.SIDES:
+            raise WorkflowError(f"unknown side '{side}'")
+        if kind == "perforated":
+            if gauge is None or not perforation_mod.GAUGE_MIN <= gauge <= 30:
+                raise WorkflowError(f"{side}: a perforated side needs a plausible gauge")
+            manual[side] = PerforationSide(
+                kind=kind, gauge=float(gauge), notation=perforation_mod.notation_for_gauge(gauge)
+            )
+        elif kind in ("imperf", "straight_edge"):
+            manual[side] = PerforationSide(kind=kind)
+        else:
+            raise WorkflowError(f"{side}: unknown kind '{kind}'")
+        if reason.strip():
+            reasons[side] = reason.strip()
+    stamp.perforation.manual = manual
+    stamp.perforation.manual_reason = reasons
+    project_mod.save_stamp_results(library_root, project_id, stamp)
+    return stamp
+
+
 def measure_project_perforation(
     library_root: str | Path,
     project: Project,
@@ -558,9 +603,9 @@ def export_report(
     json_path.write_text(report_mod.export_json(context), encoding="utf-8")
 
     overview_path = None
-    if context.colour_overview_image:
+    if context.colour_overview_png:
         overview_path = pdf_path.parent / "colour_overview.png"
-        overview_path.write_bytes(base64.b64decode(context.colour_overview_image.split(",", 1)[1]))
+        overview_path.write_bytes(context.colour_overview_png)
 
     return ReportFiles(
         pdf=pdf_path,

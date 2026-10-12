@@ -150,6 +150,7 @@ class MainWindow(QMainWindow):
         self.library_dock = QDockWidget("Library", self)
         self.library_dock.setObjectName("LibraryDock")
         self.library_dock.setWidget(self.tree)
+        self.library_dock.setMinimumWidth(220)
         self.library_dock.setFeatures(
             QDockWidget.DockWidgetFeature.DockWidgetMovable
             | QDockWidget.DockWidgetFeature.DockWidgetClosable
@@ -162,6 +163,7 @@ class MainWindow(QMainWindow):
         self.sheet_page = SheetPage(self.ctx)
         self.stamp_page = StampPage(self.ctx, self.tree.sibling_stamp)
         self.reference_page = ReferencePage(self.ctx)
+        self.centre_stack.addWidget(self.project_page.overview)
         self.pages = QStackedWidget()
         for page in (
             self.welcome_page,
@@ -520,7 +522,12 @@ class MainWindow(QMainWindow):
 
     def _sync_viewer_ui(self) -> None:
         has_image = self.viewer.has_image()
-        self.centre_stack.setCurrentWidget(self.viewer if has_image else self.viewer_empty)
+        on_project = self._current is self.project_page
+        if on_project:
+            self.centre_stack.setCurrentWidget(self.project_page.overview)
+        else:
+            self.centre_stack.setCurrentWidget(self.viewer if has_image else self.viewer_empty)
+        self.viewer_toolbar.setVisible(not on_project)
         area = self._current is self.stamp_page and self._stamp_mode == MODE_COLOUR_AREA
         for act in self.area_actions:
             act.setEnabled(area)

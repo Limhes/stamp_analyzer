@@ -1,9 +1,19 @@
 """PDF/CSV/JSON report generation (SPEC §10).
 
-Builds a plain-data context from a project's references/samples/stamps,
-renders it through a Jinja2 HTML template, and converts that to an A4 PDF
-with WeasyPrint. Also exports the same per-stamp data as CSV and JSON, for
-spreadsheet/scripted use outside the PDF.
+The report puts the comparison first:
+
+1. a summary (counts, the calibration references and their accuracy),
+2. every sheet in calibrated colour with its stamps numbered,
+3. comparison charts -- ink colour by catalogue number, perforation,
+   cancellation date and type, a horizontal-vs-vertical gauge map, shade
+   over time -- and a colour summary per catalogue number,
+4. a one-line-per-stamp index,
+5. stamp cards, four to a page: a large calibrated-colour picture with the
+   essentials (perforation, cancellation, colours, size, flags).
+
+Per-side perforation diagnostics stay in the project folder and the GUI;
+they are not repeated here. CSV and JSON carry the per-stamp data for use
+outside the PDF.
 """
 
 from __future__ import annotations
@@ -12,6 +22,7 @@ import base64
 import csv
 import io
 import json
+from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,165 +31,172 @@ from typing import Any
 import colour as colour_science
 import cv2
 import jinja2
+import numpy as np
 from weasyprint import HTML
 
 from stampan import __version__
 from stampan.core import colour as colour_mod
+from stampan.core import overview as overview_mod
 from stampan.core import perforation as perforation_mod
 from stampan.core import project as project_mod
 from stampan.core.calibration import reference as ref_mod
-from stampan.core.models import LOW_CONFIDENCE, ColourCluster, Project, Reference, Stamp
+from stampan.core.models import LOW_CONFIDENCE, Cancellation, Project, Reference, Stamp
+from stampan.core.report import charts
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 
-
-#: Diagnostic images are produced at full crop resolution (1200dpi stamp
-#: crops are often 1500+ px/side) for on-screen inspection; embedded as-is
-#: at full res and losslessly, 15 stamps' worth of full-res PNGs plus crop
-#: photos made the PDF balloon past 60 MB (found generating a real report).
-#: The report only ever displays these at a few cm, and they're
-#: photographic (a scanned stamp, not line art), so both a lower working
-#: resolution and JPEG's lossy compression are the right trade here.
-REPORT_IMAGE_MAX_DIM_PX = 700
-REPORT_JPEG_QUALITY = 82
+#: Stamp pictures fill a quarter page (~85 mm); 900 px is ~270 dpi there.
+STAMP_IMAGE_MAX_PX = 900
+#: Sheets fill the page width (~180 mm).
+SHEET_IMAGE_MAX_PX = 1800
+JPEG_QUALITY = 85
+NO_CATALOGUE = "no catalogue no."
 
 
-def _resize_for_report(image_bgr_or_gray) -> Any:
-    h, w = image_bgr_or_gray.shape[:2]
-    scale = min(1.0, REPORT_IMAGE_MAX_DIM_PX / max(h, w))
-    if scale >= 1.0:
-        return image_bgr_or_gray
-    return cv2.resize(image_bgr_or_gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-
-
-def _jpeg_data_uri(jpeg_bytes: bytes) -> str:
-    return "data:image/jpeg;base64," + base64.b64encode(jpeg_bytes).decode("ascii")
-
-
-def _png_data_uri(png_bytes: bytes) -> str:
-    # Used only for the matplotlib-rendered colour overview chart (small
-    # text labels, line art) -- JPEG's lossy compression visibly smudges
-    # that, unlike the photographic crop/diagnostic images above.
-    return "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
-
-
-def _encode_jpeg(image_rgb) -> bytes:
-    resized = _resize_for_report(image_rgb)
-    ok, buf = cv2.imencode(
-        ".jpg",
-        cv2.cvtColor(resized, cv2.COLOR_RGB2BGR),
-        [cv2.IMWRITE_JPEG_QUALITY, REPORT_JPEG_QUALITY],
-    )
-    if not ok:
-        raise RuntimeError("failed to encode report image")
-    return buf.tobytes()
-
-
-def _read_diagnostic(
-    library_root: str | Path, project_id: str, stamp_id: str, filename: str | None
-) -> str | None:
-    if not filename:
-        return None
-    # ``filename`` is always the stamp-relative path as stored (e.g.
-    # "diagnostics/perforation.png"), matching ``AnalysisMeta.diagnostic_image``'s
-    # own convention.
-    path = project_mod.project_dir(library_root, project_id) / "stamps" / stamp_id / filename
-    if not path.exists():
-        return None
-    image = cv2.imread(str(path), cv2.IMREAD_COLOR)  # drop any alpha; flattens onto black
-    if image is None:
-        return _jpeg_data_uri(path.read_bytes())  # unreadable as an image; embed verbatim
-    resized = _resize_for_report(image)
-    ok, buf = cv2.imencode(".jpg", resized, [cv2.IMWRITE_JPEG_QUALITY, REPORT_JPEG_QUALITY])
-    if not ok:
-        return _jpeg_data_uri(path.read_bytes())
-    return _jpeg_data_uri(buf.tobytes())
+# -- small helpers ---------------------------------------------------------------
 
 
 def _fmt(value: float | None, digits: int = 2, suffix: str = "") -> str:
     if value is None:
-        return "—"  # em dash: "not available", not "zero"
+        return "—"  # "not available", not "zero"
     return f"{value:.{digits}f}{suffix}"
 
 
-@dataclass
-class PerforationRow:
-    side: str
-    kind: str
-    gauge: str
-    notation: str
-    hole_count: str
-    hole_diameter_mm: str
-    regularity_mm: str
-    source: str  # "auto" | "manual"
-    manual_reason: str | None = None
+def _data_uri(data: bytes, mime: str) -> str:
+    return f"data:{mime};base64," + base64.b64encode(data).decode("ascii")
 
 
-@dataclass
-class ColourRow:
-    label: str
-    lightness: str
-    chroma: str
-    hue: str
-    a_star: str
-    b_star: str
-    delta_e00_spread: str
-    core_delta_e: str | None
-    munsell: str
-    philatelic_name: str
-    philatelic_match_delta_e00: str
-    swatch_hex: str
-    out_of_gamut: bool
+def _jpeg_uri(rgb: np.ndarray, max_px: int) -> str:
+    h, w = rgb.shape[:2]
+    scale = min(1.0, max_px / max(h, w))
+    if scale < 1.0:
+        rgb = cv2.resize(rgb, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(
+        ".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
+    )
+    if not ok:
+        raise RuntimeError("failed to encode report image")
+    return _data_uri(buf.tobytes(), "image/jpeg")
 
 
-@dataclass
-class OverviewRow:
-    """One colour in the project-wide colour overview (SPEC §9/§10)."""
-
-    label: str
-    sheet: str
-    philatelic_name: str
-    lightness: str
-    chroma: str
-    hue: str
-    swatch_hex: str
+def _calibrated_display(rgb: np.ndarray, model, max_px: int) -> np.ndarray:
+    """Scanner RGB -> Lab (the reference's colour model) -> display sRGB,
+    downsampled first so a whole sheet stays cheap."""
+    h, w = rgb.shape[:2]
+    scale = min(1.0, max_px / max(h, w))
+    if scale < 1.0:
+        rgb = cv2.resize(rgb, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    return colour_mod.lab_image_to_display_rgb(colour_mod.rgb_to_lab_d50(rgb, model.predict_lab))
 
 
-@dataclass
-class StampReportContext:
-    stamp_id: str
-    sample_id: str
-    catalogue_numbers: list[str]
-    country_issue: str | None
-    notes: str
-    width_mm: str
-    height_mm: str
-    crop_image: str | None
-    perforation_notation: str
-    perforation_rows: list[PerforationRow]
-    perforation_diagnostic: str | None
-    perforation_confidence: float
-    perforation_warnings: list[str]
-    colour_rows: list[ColourRow]
-    colour_cluster_image: str | None
-    colour_scatter_image: str | None
-    n_inks: int
-    tau: float
-    mixed_pixel_fraction: str
-    ink_paper_delta_e00: dict[str, str]
-    colour_confidence: float
-    colour_warnings: list[str]
-    flags: list[str] = field(default_factory=list)
+def _hex(swatch) -> str:
+    return "#{:02x}{:02x}{:02x}".format(*(swatch or (128, 128, 128)))
+
+
+def cancellation_text(c: Cancellation) -> str:
+    """'Numeral, 1889-03-14' / 'Pen cancel, c. 1889 (estimated)'."""
+    date = ""
+    if c.date:
+        date = f"c. {c.date} (estimated)" if c.date_estimated else c.date
+    return ", ".join(p for p in (c.type or "", date) if p)
+
+
+def _notation(text: str) -> str:
+    return text.replace(" 1/4", "¼").replace(" 1/2", "½").replace(" 3/4", "¾").replace(" x ", " × ")
+
+
+# -- context dataclasses ------------------------------------------------------
 
 
 @dataclass
 class ReferenceSummary:
-    ref_id: str
     name: str
     created: str
     colour_model_kind: str
     cv_delta_e00_mean: str
-    scale_uncertainty: str
+    cv_delta_e00_p95: str
+    resolution: str
+    px_per_mm: str
+
+
+@dataclass
+class SheetContext:
+    title: str
+    scanned: str
+    n_stamps: int
+    image: str | None
+
+
+@dataclass
+class ChartContext:
+    title: str
+    caption: str
+    image: str
+
+
+@dataclass
+class ColourLine:
+    label: str
+    philatelic_name: str
+    lch: str
+    swatch_hex: str
+
+
+@dataclass
+class StampCard:
+    number: str  # "7"
+    label: str  # "Stamp 7"
+    stamp_id: str
+    sheet: str
+    catalogue: str
+    country_issue: str
+    perforation: str
+    perforation_detail: str  # per-side gauges
+    perforation_by_hand: bool
+    perforation_confidence: float | None
+    cancellation: str
+    colours: list[ColourLine]
+    size: str
+    notes: str
+    flags: list[str]
+    image: str | None
+
+
+@dataclass
+class GroupSummary:
+    """Colour statistics of one catalogue number's ink measurements."""
+
+    name: str
+    n_stamps: int
+    perforations: str
+    mean_lch: str
+    spread_de00: str  # max ΔE00 of a member from the group mean
+    swatch_hex: str
+
+
+@dataclass
+class PerforationTable:
+    """How many stamps show each perforation, per catalogue number."""
+
+    columns: list[str]  # catalogue numbers
+    rows: list[tuple[str, list[int], int]]  # (notation, count per column, total)
+
+
+def _perforation_table(cards: list[StampCard]) -> PerforationTable | None:
+    measured = [c for c in cards if c.perforation]
+    if not measured:
+        return None
+    columns = sorted({c.catalogue or NO_CATALOGUE for c in measured},
+                     key=lambda n: (n == NO_CATALOGUE, n))  # fmt: skip
+    counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for c in measured:
+        counts[c.perforation][c.catalogue or NO_CATALOGUE] += 1
+    rows = [
+        (notation, [per_cat[col] for col in columns], sum(per_cat.values()))
+        for notation, per_cat in counts.items()
+    ]
+    rows.sort(key=lambda row: -row[2])
+    return PerforationTable(columns=columns if columns != [NO_CATALOGUE] else [], rows=rows)
 
 
 @dataclass
@@ -187,212 +205,262 @@ class ReportContext:
     project_id: str
     generated_at: str
     software_version: str
+    n_sheets: int
+    n_stamps: int
+    n_perforation: int
+    n_colour: int
+    n_dated: int
     references: list[ReferenceSummary]
-    stamps: list[StampReportContext]
-    notes: list[str]
-    colour_overview_image: str | None = None
-    colour_overview_rows: list[OverviewRow] = field(default_factory=list)
+    sheets: list[SheetContext]
+    charts: list[ChartContext]
+    groups: list[GroupSummary]
+    perforations: PerforationTable | None
+    stamps: list[StampCard]
+    notes: list[str] = field(default_factory=list)
+    #: The first colour chart as a standalone PNG (written next to the PDF).
+    colour_overview_png: bytes | None = None
 
 
-def _perforation_rows(perforation) -> list[PerforationRow]:
-    rows = []
-    effective = perforation.effective()
-    for side_name in ("top", "right", "bottom", "left"):
-        side = effective.get(side_name)
+# -- building ------------------------------------------------------------------
+
+
+def _sheet_image(library_root, project_id: str, sample, model, scale) -> str:
+    """The sheet in calibrated colour with each stamp's current rectangle
+    and number -- the same numbers as the stamp cards."""
+    scan, _ = project_mod.load_sample_scan(library_root, project_id, sample)
+    out = np.ascontiguousarray(_calibrated_display(scan, model, SHEET_IMAGE_MAX_PX))
+    f = out.shape[1] / scan.shape[1]
+    thickness = max(2, round(out.shape[1] / 600))
+    font_scale = out.shape[1] / 1400
+    for stamp_id in sample.stamp_ids:
+        g = project_mod.load_stamp(library_root, project_id, stamp_id).geometry
+        if g.sample_centre_px is None or not g.width_mm or not g.height_mm:
+            continue
+        size = (g.width_mm * scale[0] * f, g.height_mm * scale[1] * f)
+        centre = (g.sample_centre_px[0] * f, g.sample_centre_px[1] * f)
+        box = cv2.boxPoints((centre, size, g.rotation_deg or 0.0)).astype(np.int32)
+        cv2.drawContours(out, [box], 0, (0, 114, 178), thickness, cv2.LINE_AA)
+        text = project_mod.stamp_label(stamp_id).replace("Stamp ", "")
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+        x, y = int(centre[0] - tw / 2), int(centre[1] + th / 2)
+        cv2.rectangle(out, (x - 4, y - th - 4), (x + tw + 4, y + 5), (255, 255, 255), -1)
+        cv2.putText(
+            out, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 70, 130), thickness,
+            cv2.LINE_AA,
+        )  # fmt: skip
+    return _jpeg_uri(out, SHEET_IMAGE_MAX_PX)
+
+
+def _stamp_card(library_root, project_id, sheet: str, stamp: Stamp, model) -> StampCard:
+    sides = stamp.perforation.effective()
+    manual = stamp.perforation.manual
+    flags = []
+    conf = stamp.perforation.meta.confidence if stamp.perforation.auto else None
+    if conf is not None and conf < LOW_CONFIDENCE and not manual:
+        flags.append("low perforation confidence")
+    if stamp.condition == "on_paper":
+        flags.append("on paper")
+    detail = []
+    for name in perforation_mod.SIDES:
+        side = sides.get(name)
         if side is None:
             continue
-        is_manual = side_name in perforation.manual
-        rows.append(
-            PerforationRow(
-                side=side_name,
-                kind=side.kind,
-                gauge=_fmt(side.gauge, 2) if side.gauge is not None else "—",
-                notation=side.notation or ("imperf" if side.kind == "imperf" else "—"),
-                hole_count=str(side.hole_count) if side.hole_count is not None else "—",
-                hole_diameter_mm=_fmt(side.hole_diameter_mm, 2, " mm"),
-                regularity_mm=_fmt(side.spacing_std_mm, 3, " mm"),
-                source="manual" if is_manual else "auto",
-                manual_reason=perforation.manual_reason.get(side_name) if is_manual else None,
-            )
+        if side.kind == "perforated" and side.gauge:
+            value = f"{side.gauge:.2f}"
+        else:
+            value = {"imperf": "imperf", "straight_edge": "straight edge"}.get(side.kind, "?")
+        detail.append(f"{name[0].upper()} {value}{'*' if name in manual else ''}")
+    colours = [
+        ColourLine(
+            label=c.label,
+            philatelic_name=c.philatelic_name or "",
+            lch=" / ".join(f"{v:.1f}" for v in c.mean_lch),
+            swatch_hex=_hex(c.srgb_swatch),
         )
-    return rows
-
-
-def _colour_rows(clusters: list[ColourCluster]) -> list[ColourRow]:
-    rows = []
-    for c in clusters:
-        lightness, chroma, hue = c.mean_lch or (None, None, None)
-        _, a_star, b_star = c.mean_lab or (None, None, None)
-        core_delta_e = None
-        if c.core_mean_lab is not None and c.mean_lab is not None:
-            core_delta_e = float(
-                colour_science.difference.delta_E_CIE2000(list(c.core_mean_lab), list(c.mean_lab))
-            )
-        swatch = c.srgb_swatch or (128, 128, 128)
-        rows.append(
-            ColourRow(
-                label=c.label,
-                lightness=_fmt(lightness, 1),
-                chroma=_fmt(chroma, 1),
-                hue=_fmt(hue, 1, "°"),
-                a_star=_fmt(a_star, 1),
-                b_star=_fmt(b_star, 1),
-                delta_e00_spread=_fmt(c.delta_e00_spread, 2),
-                core_delta_e=_fmt(core_delta_e, 2) if core_delta_e is not None else None,
-                munsell=c.munsell or "—",
-                philatelic_name=c.philatelic_name or "—",
-                philatelic_match_delta_e00=_fmt(c.philatelic_match_delta_e00, 1),
-                swatch_hex="#{:02x}{:02x}{:02x}".format(*swatch),
-                out_of_gamut=c.out_of_gamut,
-            )
-        )
-    return rows
-
-
-def _stamp_context(
-    library_root: str | Path,
-    project_id: str,
-    sample_id: str,
-    stamp: Stamp,
-    model: ref_mod.ColourModel,
-) -> StampReportContext:
-    flags: list[str] = []
-    if stamp.perforation.manual:
-        flags.append("manual perforation override")
-    if stamp.perforation.meta.confidence < LOW_CONFIDENCE:
-        flags.append("low perforation confidence")
-    if stamp.colour.meta.confidence and stamp.colour.meta.confidence < LOW_CONFIDENCE:
-        flags.append("low colour confidence")
-
-    crop_image = None
+        for c in stamp.colour.clusters
+        if c.mean_lch is not None
+    ]
+    image = None
     try:
         crop = project_mod.load_stamp_crop(library_root, project_id, stamp.stamp_id)
-        lab = colour_mod.rgb_to_lab_d50(crop, model.predict_lab)
-        display_rgb = colour_mod.lab_image_to_display_rgb(lab)
-        crop_image = _jpeg_data_uri(_encode_jpeg(display_rgb))
+        image = _jpeg_uri(_calibrated_display(crop, model, STAMP_IMAGE_MAX_PX), STAMP_IMAGE_MAX_PX)
     except FileNotFoundError:
-        pass
-
-    return StampReportContext(
+        flags.append("crop missing")
+    g = stamp.geometry
+    label = project_mod.stamp_label(stamp.stamp_id)
+    return StampCard(
+        number=label.replace("Stamp ", ""),
+        label=label,
         stamp_id=stamp.stamp_id,
-        sample_id=sample_id,
-        catalogue_numbers=stamp.catalogue_numbers,
-        country_issue=stamp.country_issue,
-        notes=stamp.notes,
-        width_mm=_fmt(stamp.geometry.width_mm, 2, " mm"),
-        height_mm=_fmt(stamp.geometry.height_mm, 2, " mm"),
-        crop_image=crop_image,
-        perforation_notation=perforation_mod.perforation_result_notation(
-            stamp.perforation.effective()
-        ),
-        perforation_rows=_perforation_rows(stamp.perforation),
-        perforation_diagnostic=_read_diagnostic(
-            library_root, project_id, stamp.stamp_id, stamp.perforation.meta.diagnostic_image
-        ),
-        perforation_confidence=stamp.perforation.meta.confidence,
-        perforation_warnings=stamp.perforation.meta.warnings,
-        colour_rows=_colour_rows(stamp.colour.clusters),
-        colour_cluster_image=_read_diagnostic(
-            library_root, project_id, stamp.stamp_id, "diagnostics/colour_clusters.png"
-        ),
-        colour_scatter_image=_read_diagnostic(
-            library_root, project_id, stamp.stamp_id, "diagnostics/colour_scatter.png"
-        ),
-        n_inks=stamp.colour.n_inks,
-        tau=stamp.colour.tau,
-        mixed_pixel_fraction=_fmt(
-            stamp.colour.mixed_pixel_fraction * 100 if stamp.colour.mixed_pixel_fraction else None,
-            1,
-            "%",
-        ),
-        ink_paper_delta_e00={k: _fmt(v, 2) for k, v in stamp.colour.ink_paper_delta_e00.items()},
-        colour_confidence=stamp.colour.meta.confidence,
-        colour_warnings=stamp.colour.meta.warnings,
+        sheet=sheet,
+        catalogue=", ".join(stamp.catalogue_numbers),
+        country_issue=stamp.country_issue or "",
+        perforation=_notation(perforation_mod.perforation_result_notation(sides)) if sides else "",
+        perforation_detail="  ".join(detail),
+        perforation_by_hand=bool(manual),
+        perforation_confidence=conf,
+        cancellation=cancellation_text(stamp.cancellation),
+        colours=colours,
+        size=f"{g.width_mm:.1f} × {g.height_mm:.1f} mm" if g.width_mm and g.height_mm else "",
+        notes=stamp.notes.strip(),
         flags=flags,
+        image=image,
     )
 
 
+def _group_summaries(entries: list[overview_mod.OverviewEntry]) -> list[GroupSummary]:
+    by_cat: dict[str, list] = defaultdict(list)
+    for e in entries:
+        by_cat[e.catalogue or NO_CATALOGUE].append(e)
+    if set(by_cat) <= {NO_CATALOGUE}:
+        return []
+    result = []
+    for name in sorted(by_cat, key=lambda n: (n == NO_CATALOGUE, n)):
+        members = by_cat[name]
+        labs = np.array([e.lab for e in members], dtype=np.float64)
+        mean = labs.mean(axis=0)
+        spread = float(np.max(colour_science.delta_E(labs, mean, method="CIE 2000")))
+        lch = colour_science.Lab_to_LCHab(mean)
+        rgb = colour_mod.lab_image_to_display_rgb(mean.reshape(1, 1, 3))[0, 0]
+        perfs = sorted({_notation(e.perforation) for e in members if e.perforation})
+        result.append(
+            GroupSummary(
+                name=name,
+                n_stamps=len({e.stamp_id for e in members}),
+                perforations=", ".join(perfs[:4]) + (" …" if len(perfs) > 4 else ""),
+                mean_lch=f"{lch[0]:.1f} / {lch[1]:.1f} / {lch[2]:.1f}",
+                spread_de00=f"{spread:.1f}",
+                swatch_hex=_hex(tuple(int(v) for v in rgb)),
+            )
+        )
+    return result
+
+
+def _charts(entries, stamps_for_map) -> list[ChartContext]:
+    result: list[ChartContext] = []
+
+    def add(title: str, caption: str, png: bytes | None) -> None:
+        if png:
+            result.append(ChartContext(title, caption, _data_uri(png, "image/png")))
+
+    def catalogue(e) -> str:
+        return e.catalogue or NO_CATALOGUE
+
+    add(
+        "Ink colour by catalogue number",
+        "Mean ink colour of each measured area, labelled with the stamp number. Shades of one "
+        "catalogue number should cluster; outliers are worth a second look.",
+        charts.colour_by_group(entries, catalogue, "Ink colour by catalogue no."),
+    )
+    add(
+        "Ink colour by perforation",
+        "Grouped by the full perforation notation (top/bottom × left/right).",
+        charts.colour_by_group(
+            entries,
+            lambda e: _notation(e.perforation) if e.perforation else "not measured",
+            "Ink colour by perforation",
+        ),
+    )
+    add(
+        "Ink colour by cancellation date",
+        "Colour scale: cancellation year. Squares are estimated dates; hollow grey circles "
+        "have no date.",
+        charts.colour_by_year(entries),
+    )
+    add(
+        "Ink colour by cancellation type",
+        "",
+        charts.colour_by_group(
+            entries,
+            lambda e: e.cancellation_type or "not recorded",
+            "Ink colour by cancellation type",
+        ),
+    )
+    add(
+        "Shade over time",
+        "Hue angle and chroma of the ink against the cancellation year, by catalogue number. "
+        "Estimated dates are drawn slightly to the right of their year.",
+        charts.shade_over_time(entries, catalogue, "Catalogue no."),
+    )
+    add(
+        "Perforation map",
+        "Mean horizontal against mean vertical gauge, one point per stamp, by catalogue "
+        "number. Compound perforations lie off the diagonal; diamonds were set by hand.",
+        charts.perforation_map(stamps_for_map, "Perforation by catalogue no."),
+    )
+    return result
+
+
 def build_report_context(library_root: str | Path, project: Project) -> ReportContext:
-    """Assemble every project/sample/stamp's data into a plain context for
-    the Jinja2 template -- no Qt, no file I/O inside the template itself."""
-    reference_cache: dict[str, Reference] = {}
-    model_cache: dict[str, ref_mod.ColourModel] = {}
-    reference_summaries: list[ReferenceSummary] = []
-    stamp_contexts: list[StampReportContext] = []
-    ink_cluster_entries: list[tuple[str, ColourCluster]] = []
-    overview_rows: list[OverviewRow] = []
+    """Assemble the plain-data context for the template -- no Qt, and no
+    file I/O inside the template."""
+    references: dict[str, Reference] = {}
+    models: dict[str, ref_mod.ColourModel] = {}
+    sheets: list[SheetContext] = []
+    cards: list[StampCard] = []
+    stamps_for_map = []
     notes: list[str] = []
+    n_perf = n_colour = n_dated = 0
+    reported_samples = set()
 
     for sample_id in project.sample_ids:
         sample = project_mod.load_sample(library_root, project.project_id, sample_id)
-        if sample.ref_id not in reference_cache:
-            ref = ref_mod.load_reference(library_root, sample.ref_id)
-            reference_cache[sample.ref_id] = ref
-            reference_summaries.append(
-                ReferenceSummary(
-                    ref_id=ref.ref_id,
-                    name=ref.name,
-                    created=ref.created,
-                    colour_model_kind=ref.colour_model.kind if ref.colour_model else "—",
-                    cv_delta_e00_mean=_fmt(
-                        ref.colour_model.cv_delta_e00.get("mean") if ref.colour_model else None, 2
-                    ),
-                    scale_uncertainty=_fmt(ref.scale.uncertainty_x if ref.scale else None, 4),
-                )
-            )
-            if ref.colour_model is not None:
-                model_cache[sample.ref_id] = ref_mod.load_colour_model(library_root, sample.ref_id)
-
-        ref = reference_cache[sample.ref_id]
-        model = model_cache.get(sample.ref_id)
+        if sample.ref_id not in references:
+            references[sample.ref_id] = ref_mod.load_reference(library_root, sample.ref_id)
+            if references[sample.ref_id].colour_model is not None:
+                models[sample.ref_id] = ref_mod.load_colour_model(library_root, sample.ref_id)
+        ref, model = references[sample.ref_id], models.get(sample.ref_id)
+        title = project_mod.sheet_title(sample)
         if model is None or ref.scale is None:
             notes.append(
-                f"sample {sample_id}: reference {sample.ref_id} missing scale or colour "
-                "model; its stamps are omitted from this report"
+                f"{title}: its reference “{ref.name}” has no colour model or scale; its "
+                "stamps are left out of this report."
             )
             continue
-
+        reported_samples.add(sample_id)
+        scale = (ref.scale.px_per_mm_x, ref.scale.px_per_mm_y)
+        sheets.append(
+            SheetContext(
+                title=title,
+                scanned=(sample.scan_time or "")[:10],
+                n_stamps=len(sample.stamp_ids),
+                image=_sheet_image(library_root, project.project_id, sample, model, scale),
+            )
+        )
         for stamp_id in sample.stamp_ids:
             stamp = project_mod.load_stamp(library_root, project.project_id, stamp_id)
-            stamp_contexts.append(
-                _stamp_context(
-                    library_root,
-                    project.project_id,
-                    sample_id,
-                    stamp,
-                    model,
-                )
-            )
-            for cluster in stamp.colour.clusters:
-                # Same entries and labels as the project page's overview.
-                if (
-                    cluster.label != "paper"
-                    and cluster.mean_lab is not None
-                    and cluster.overview_included
-                ):
-                    label = cluster.overview_label or (
-                        f"{project_mod.stamp_label(stamp.stamp_id)} · {cluster.label}"
-                    )
-                    ink_cluster_entries.append((label, cluster))
-                    lightness, chroma, hue = cluster.mean_lch or (None, None, None)
-                    overview_rows.append(
-                        OverviewRow(
-                            label=label,
-                            sheet=project_mod.sheet_title(sample),
-                            philatelic_name=cluster.philatelic_name or "—",
-                            lightness=_fmt(lightness, 1),
-                            chroma=_fmt(chroma, 1),
-                            hue=_fmt(hue, 1, "°"),
-                            swatch_hex="#{:02x}{:02x}{:02x}".format(
-                                *(cluster.srgb_swatch or (128, 128, 128))
-                            ),
-                        )
-                    )
+            card = _stamp_card(library_root, project.project_id, title, stamp, model)
+            cards.append(card)
+            n_perf += bool(stamp.perforation.effective())
+            n_colour += any(c.mean_lch is not None for c in stamp.colour.clusters)
+            n_dated += bool(stamp.cancellation.date)
+            stamps_for_map.append((card.number, stamp, card.catalogue or NO_CATALOGUE))
 
-    colour_overview_image = None
-    if ink_cluster_entries:
-        colour_overview_image = _png_data_uri(
-            colour_mod.render_colour_overview(ink_cluster_entries)
+    # Ink colours only, and only those left ticked in the project overview.
+    entries = [
+        e
+        for e in overview_mod.project_entries(library_root, project)
+        if e.sample_id in reported_samples and not e.is_paper and e.cluster.overview_included
+    ]
+    chart_list = _charts(entries, stamps_for_map)
+    first_colour = next((c for c in chart_list if c.title.startswith("Ink colour")), None)
+
+    ref_summaries = []
+    for ref in references.values():
+        cv = ref.colour_model.cv_delta_e00 if ref.colour_model else {}
+        dpi = ref.scanner_options.get("resolution")
+        ref_summaries.append(
+            ReferenceSummary(
+                name=ref.name,
+                created=ref.created,
+                colour_model_kind=(
+                    ref.colour_model.kind.replace("_", " ") if ref.colour_model else "—"
+                ),
+                cv_delta_e00_mean=_fmt(cv.get("mean")),
+                cv_delta_e00_p95=_fmt(cv.get("p95")),
+                resolution=f"{float(dpi):.0f} dpi" if dpi else "—",
+                px_per_mm=_fmt(ref.scale.px_per_mm_x if ref.scale else None, 3),
+            )
         )
 
     return ReportContext(
@@ -400,12 +468,25 @@ def build_report_context(library_root: str | Path, project: Project) -> ReportCo
         project_id=project.project_id,
         generated_at=datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),
         software_version=__version__,
-        references=reference_summaries,
-        stamps=stamp_contexts,
+        n_sheets=len(sheets),
+        n_stamps=len(cards),
+        n_perforation=n_perf,
+        n_colour=n_colour,
+        n_dated=n_dated,
+        references=ref_summaries,
+        sheets=sheets,
+        charts=chart_list,
+        groups=_group_summaries(entries),
+        perforations=_perforation_table(cards),
+        stamps=cards,
         notes=notes,
-        colour_overview_image=colour_overview_image,
-        colour_overview_rows=overview_rows,
+        colour_overview_png=(
+            base64.b64decode(first_colour.image.split(",", 1)[1]) if first_colour else None
+        ),
     )
+
+
+# -- rendering and export ----------------------------------------------------------
 
 
 def render_html(context: ReportContext) -> str:
@@ -413,69 +494,54 @@ def render_html(context: ReportContext) -> str:
         loader=jinja2.FileSystemLoader(str(TEMPLATES_DIR)),
         autoescape=jinja2.select_autoescape(["html"]),
     )
-    template = env.get_template("report.html")
-    return template.render(report=context)
+    return env.get_template("report.html").render(report=context)
 
 
 def render_pdf(html: str) -> bytes:
     return HTML(string=html).write_pdf()
 
 
-def _stamp_csv_row(s: StampReportContext) -> dict[str, Any]:
-    paper = next((c for c in s.colour_rows if c.label == "paper"), None)
-    ink = next((c for c in s.colour_rows if c.label != "paper"), None)
-    return {
-        "stamp_id": s.stamp_id,
-        "sample_id": s.sample_id,
-        "catalogue_numbers": "; ".join(s.catalogue_numbers),
-        "country_issue": s.country_issue or "",
-        "width_mm": s.width_mm,
-        "height_mm": s.height_mm,
-        "perforation_notation": s.perforation_notation,
-        "perforation_confidence": s.perforation_confidence,
-        "paper_munsell": paper.munsell if paper else "",
-        "paper_philatelic_name": paper.philatelic_name if paper else "",
-        "ink_munsell": ink.munsell if ink else "",
-        "ink_philatelic_name": ink.philatelic_name if ink else "",
-        "colour_confidence": s.colour_confidence,
-        "flags": "; ".join(s.flags),
-    }
-
-
-_CSV_FIELDNAMES = [
-    "stamp_id",
-    "sample_id",
-    "catalogue_numbers",
-    "country_issue",
-    "width_mm",
-    "height_mm",
-    "perforation_notation",
-    "perforation_confidence",
-    "paper_munsell",
-    "paper_philatelic_name",
-    "ink_munsell",
-    "ink_philatelic_name",
-    "colour_confidence",
-    "flags",
-]
+_CSV_FIELDS = [
+    "stamp_id", "stamp", "sheet", "catalogue", "country_issue", "perforation",
+    "perforation_sides", "perforation_by_hand", "perforation_confidence", "cancellation",
+    "colours", "size", "flags", "notes",
+]  # fmt: skip
 
 
 def export_csv(context: ReportContext) -> str:
     buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=_CSV_FIELDNAMES)
+    writer = csv.DictWriter(buf, fieldnames=_CSV_FIELDS)
     writer.writeheader()
-    writer.writerows(_stamp_csv_row(s) for s in context.stamps)
+    for s in context.stamps:
+        writer.writerow(
+            {
+                "stamp_id": s.stamp_id,
+                "stamp": s.label,
+                "sheet": s.sheet,
+                "catalogue": s.catalogue,
+                "country_issue": s.country_issue,
+                "perforation": s.perforation,
+                "perforation_sides": s.perforation_detail,
+                "perforation_by_hand": s.perforation_by_hand,
+                "perforation_confidence": _fmt(s.perforation_confidence),
+                "cancellation": s.cancellation,
+                "colours": "; ".join(
+                    f"{c.label}: {c.philatelic_name} (LCh {c.lch})" for c in s.colours
+                ),
+                "size": s.size,
+                "flags": "; ".join(s.flags),
+                "notes": s.notes,
+            }
+        )
     return buf.getvalue()
 
 
 def export_json(context: ReportContext) -> str:
-    data = asdict(context)
-    # The embedded base64 images make the JSON export enormous for no
-    # benefit (it's meant for spreadsheet/scripted use, not for re-deriving
-    # images); strip them, keeping every numeric/text field.
-    for stamp in data["stamps"]:
-        stamp.pop("crop_image", None)
-        stamp.pop("colour_cluster_image", None)
-        stamp.pop("colour_scatter_image", None)
-        stamp.pop("perforation_diagnostic", None)
+    data: dict[str, Any] = asdict(context)
+    # Embedded images make the JSON huge and are of no use outside the PDF.
+    for key in ("colour_overview_png", "charts"):
+        data.pop(key, None)
+    for key in ("sheets", "stamps"):
+        for item in data[key]:
+            item.pop("image", None)
     return json.dumps(data, indent=2, ensure_ascii=False)

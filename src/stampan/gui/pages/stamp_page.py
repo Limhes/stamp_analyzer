@@ -6,6 +6,7 @@ from __future__ import annotations
 from PySide6.QtCore import Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFormLayout,
     QGroupBox,
@@ -21,7 +22,7 @@ from PySide6.QtWidgets import (
 
 from stampan.core import models, workflow
 from stampan.core import project as project_mod
-from stampan.gui import icons
+from stampan.gui import icons, preferences
 from stampan.gui.library_tree import KIND_SAMPLE, KIND_STAMP
 from stampan.gui.pages.base import AppContext, Page
 from stampan.gui.pages.colour_tab import ColourTab
@@ -93,6 +94,25 @@ class DetailsTab(QWidget):
         form.addRow("Multiplicity", multiplicity_row)
         layout.addWidget(specimen)
 
+        cancel = QGroupBox("Cancellation")
+        form = QFormLayout(cancel)
+        self.cancel_type_combo = QComboBox()
+        self.cancel_type_combo.setToolTip("The list is set in Edit ▸ Preferences ▸ Stamps")
+        form.addRow("Type", self.cancel_type_combo)
+        self.cancel_date_edit = QLineEdit()
+        self.cancel_date_edit.setPlaceholderText("YYYY, YYYY-MM or YYYY-MM-DD")
+        self.cancel_date_edit.setToolTip(
+            "As precise as the postmark allows: a year alone, a month, or a full date"
+        )
+        form.addRow("Date", self.cancel_date_edit)
+        self.cancel_estimated_check = QCheckBox("Estimated — not read from a legible postmark")
+        self.cancel_estimated_check.setToolTip(
+            "Tick when the date is inferred (partial strike, usage period, other stamps on "
+            "the sheet) rather than read from the cancellation itself."
+        )
+        form.addRow("", self.cancel_estimated_check)
+        layout.addWidget(cancel)
+
         geometry = QGroupBox("Size")
         form = QFormLayout(geometry)
         self.size_label = label("—")
@@ -134,6 +154,9 @@ class DetailsTab(QWidget):
             self.condition_combo.currentIndexChanged,
             self.multiplicity_combo.currentIndexChanged,
             self.count_spin.valueChanged,
+            self.cancel_type_combo.currentIndexChanged,
+            self.cancel_date_edit.textChanged,
+            self.cancel_estimated_check.toggled,
         ):
             signal.connect(self._on_edited)
 
@@ -153,6 +176,9 @@ class DetailsTab(QWidget):
             self.multiplicity_combo.findData(stamp.multiplicity or models.MULTIPLICITY_SINGLE)
         )
         self.count_spin.setValue(max(2, stamp.multiplicity_count or 2))
+        self._fill_cancel_types(stamp.cancellation.type)
+        self.cancel_date_edit.setText(stamp.cancellation.date or "")
+        self.cancel_estimated_check.setChecked(stamp.cancellation.date_estimated)
         g = stamp.geometry
         self.size_label.setText(
             f"{g.width_mm:.2f} × {g.height_mm:.2f} mm" if g.width_mm and g.height_mm else "—"
@@ -162,6 +188,16 @@ class DetailsTab(QWidget):
         self._update_count_enabled()
         self.save_button.setEnabled(False)
         self.banner.show_message("")
+
+    def _fill_cancel_types(self, current: str | None) -> None:
+        self.cancel_type_combo.clear()
+        self.cancel_type_combo.addItem("—  not recorded", None)
+        types = preferences.cancellation_types()
+        if current and current not in types:
+            types.append(current)  # recorded before the list changed: keep it
+        for text in types:
+            self.cancel_type_combo.addItem(text, text)
+        self.cancel_type_combo.setCurrentIndex(max(0, self.cancel_type_combo.findData(current)))
 
     def _update_count_enabled(self) -> None:
         self.count_spin.setEnabled(
@@ -189,7 +225,20 @@ class DetailsTab(QWidget):
         stamp.multiplicity_count = (
             self.count_spin.value() if stamp.multiplicity != models.MULTIPLICITY_SINGLE else None
         )
+        stamp.cancellation.type = self.cancel_type_combo.currentData()
+        stamp.cancellation.date_estimated = self.cancel_estimated_check.isChecked()
+        date_problem = ""
+        try:
+            stamp.cancellation.date = models.parse_partial_date(self.cancel_date_edit.text())
+        except ValueError as exc:
+            date_problem = f"The cancellation date was not saved: {exc}."
         project_mod.save_stamp_results(root, self.project_id, stamp)
+        if date_problem:
+            self.banner.show_message(date_problem, "error")
+            return  # leave Save enabled until the date is fixed
+        self._loading = True  # show the normalised date without marking it edited
+        self.cancel_date_edit.setText(stamp.cancellation.date or "")
+        self._loading = False
         self.save_button.setEnabled(False)
         self.banner.show_message("Saved.", "success")
         self.saved.emit()

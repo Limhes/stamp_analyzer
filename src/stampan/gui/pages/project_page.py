@@ -3,31 +3,25 @@ colour overview (SPEC §9/§10)."""
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QTimer, QUrl
-from PySide6.QtGui import QColor, QDesktopServices
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
-    QAbstractItemView,
     QGridLayout,
-    QHeaderView,
     QMenu,
     QMessageBox,
-    QTableWidget,
-    QTableWidgetItem,
     QToolButton,
 )
 
-from stampan.core import colour as colour_mod
 from stampan.core import project as project_mod
 from stampan.core import workflow
 from stampan.core.calibration import reference as ref_mod
 from stampan.core.io import read_tiff
 from stampan.gui import icons, library_actions
 from stampan.gui.dialogs.add_sheet import SOURCE_SCANNER, AddSheetDialog
-from stampan.gui.library_tree import KIND_SAMPLE
+from stampan.gui.library_tree import KIND_SAMPLE, KIND_STAMP
+from stampan.gui.overview import OverviewWidget
 from stampan.gui.pages.base import AppContext, Page
-from stampan.gui.widgets import Banner, ScaledImage, StatCard, button, label
-
-SAVE_DEBOUNCE_MS = 400
+from stampan.gui.widgets import Banner, StatCard, button, label
 
 
 class ProjectPage(Page):
@@ -35,12 +29,6 @@ class ProjectPage(Page):
         super().__init__(ctx, parent=parent)
         self.project_id: str | None = None
         self._project = None
-        self._stamps: dict[str, object] = {}
-        self._entries: list[tuple[str, object]] = []  # (stamp_id, cluster), one per table row
-
-        self._save_timer = QTimer(self)
-        self._save_timer.setSingleShot(True)
-        self._save_timer.timeout.connect(self._save_overview_choices)
 
         self.add_sheet_button = self.header.add_action(
             button(
@@ -89,121 +77,48 @@ class ProjectPage(Page):
             stats.addWidget(card, i // 2, i % 2)
         self.body_layout.addLayout(stats)
 
-        self.body_layout.addWidget(label("Colour overview", "section"))
+        self.body_layout.addWidget(label("Comparison", "section"))
         self.body_layout.addWidget(
             label(
-                "Every ink colour measured across this project. Untick a row to leave it out "
-                "of the plot and the report; double-click a label to rename it.",
+                "Every measured colour of the project is listed in the main area with its "
+                "perforation, catalogue number and cancellation. Filter and sort there; the "
+                "plots follow the visible, ticked rows. Ticked colours also go into the "
+                "report's colour overview.",
                 "caption",
                 wrap=True,
             )
         )
-        self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["Label", "Philatelic name", "L*  C*  h°"])
-        header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.verticalHeader().setVisible(False)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setAlternatingRowColors(True)
-        self.table.setMinimumHeight(160)
-        self.table.itemChanged.connect(self._on_item_changed)
-        self.body_layout.addWidget(self.table)
-        self.overview_plot = ScaledImage(placeholder="No ink colours measured yet")
-        self.body_layout.addWidget(self.overview_plot)
+        #: The comparison workspace; the main window shows it in the centre.
+        self.overview = OverviewWidget(lambda: self.ctx.library_root)
+        self.overview.open_stamp.connect(lambda pid, sid: self.ctx.navigate(KIND_STAMP, pid, sid))
         self.body_layout.addStretch(1)
 
     # -- loading ---------------------------------------------------------------
 
     def set_project(self, project_id: str) -> None:
-        if self._save_timer.isActive():
-            self._save_timer.stop()
-            self._save_overview_choices()
         self.project_id = project_id
         root = self.ctx.library_root
         self._project = project = project_mod.load_project(root, project_id)
         self.header.set_text(project.name, f"Project · created {project.created}")
-        self._stamps, self._entries = {}, []
-        n_perf = n_colour = 0
+        n = n_perf = n_colour = 0
         for sample_id in project.sample_ids:
             sample = project_mod.load_sample(root, project_id, sample_id)
             for stamp_id in sample.stamp_ids:
                 stamp = project_mod.load_stamp(root, project_id, stamp_id)
-                self._stamps[stamp_id] = stamp
+                n += 1
                 n_perf += bool(stamp.perforation.auto or stamp.perforation.manual)
                 n_colour += bool(stamp.colour.clusters)
-                for cluster in stamp.colour.clusters:
-                    if cluster.label != "paper" and cluster.mean_lab is not None:
-                        self._entries.append((stamp_id, cluster))
-        n = len(self._stamps)
         self.sheets_card.set_value(str(len(project.sample_ids)))
         self.stamps_card.set_value(str(n))
         self.perf_card.set_value(f"{n_perf} / {n}", "stamps measured")
         self.colour_card.set_value(f"{n_colour} / {n}", "stamps measured")
-        self._populate_table()
-        self._replot()
+        self.overview.set_project(project_id)
+
+    def deactivate(self) -> None:
+        self.overview.save()
 
     def show_message(self, text: str, severity: str = "info") -> None:
         self.banner.show_message(text, severity)
-
-    # -- colour overview -------------------------------------------------------
-
-    @staticmethod
-    def _default_label(stamp_id: str, cluster) -> str:
-        return f"{project_mod.stamp_label(stamp_id)} · {cluster.label}"
-
-    def _populate_table(self) -> None:
-        self.table.blockSignals(True)
-        self.table.setRowCount(len(self._entries))
-        for row, (stamp_id, cluster) in enumerate(self._entries):
-            name = QTableWidgetItem(
-                cluster.overview_label or self._default_label(stamp_id, cluster)
-            )
-            name.setFlags(name.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            name.setCheckState(
-                Qt.CheckState.Checked if cluster.overview_included else Qt.CheckState.Unchecked
-            )
-            if cluster.srgb_swatch:
-                name.setData(Qt.ItemDataRole.DecorationRole, QColor(*cluster.srgb_swatch))
-            name.setToolTip(stamp_id)
-            self.table.setItem(row, 0, name)
-            for col, text in (
-                (1, cluster.philatelic_name or ""),
-                (
-                    2,
-                    "  ".join(f"{v:.1f}" for v in cluster.mean_lch) if cluster.mean_lch else "",
-                ),
-            ):
-                item = QTableWidgetItem(text)
-                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                self.table.setItem(row, col, item)
-        self.table.blockSignals(False)
-
-    def _on_item_changed(self, item: QTableWidgetItem) -> None:
-        if item.column() != 0 or item.row() >= len(self._entries):
-            return
-        stamp_id, cluster = self._entries[item.row()]
-        cluster.overview_included = item.checkState() == Qt.CheckState.Checked
-        text = item.text().strip()
-        cluster.overview_label = (
-            None if text in ("", self._default_label(stamp_id, cluster)) else text
-        )
-        self._save_timer.start(SAVE_DEBOUNCE_MS)
-
-    def _save_overview_choices(self) -> None:
-        root = self.ctx.library_root
-        for stamp in self._stamps.values():
-            project_mod.save_stamp_results(root, self.project_id, stamp)
-        self._replot()
-
-    def _replot(self) -> None:
-        entries = [
-            (cluster.overview_label or self._default_label(stamp_id, cluster), cluster)
-            for stamp_id, cluster in self._entries
-            if cluster.overview_included
-        ]
-        self.overview_plot.set_png(colour_mod.render_colour_overview(entries) if entries else None)
 
     # -- actions ---------------------------------------------------------------
 

@@ -20,6 +20,7 @@ from stampan.core import perforation as perforation_mod
 from stampan.core import project as project_mod
 from stampan.core import workflow
 from stampan.core.models import LOW_CONFIDENCE
+from stampan.gui.dialogs.perforation_override import PerforationOverrideDialog
 from stampan.gui.pages.base import AppContext
 from stampan.gui.tasks import TaskRunner
 from stampan.gui.viewer import TOOL_PERF_BOX
@@ -71,14 +72,33 @@ class PerforationTab(QWidget):
         self.confidence = label("", "caption")
         result_layout.addWidget(self.notation)
         result_layout.addWidget(self.confidence)
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Side", "Result", "Gauge", "Holes"])
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Side", "Result", "Gauge", "Holes", "Source"])
         self.table.verticalHeader().setVisible(False)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        self.table.setFixedHeight(4 * 28 + 30)
+        self.table.setFixedHeight(4 * 30 + 34)
         result_layout.addWidget(self.table)
+        override_row = QHBoxLayout()
+        override_row.addStretch(1)
+        self.revert_button = button(
+            "Use Measured", "undo", tooltip="Remove the manual values", slot=self._revert
+        )
+        override_row.addWidget(self.revert_button)
+        override_row.addWidget(
+            button(
+                "Set by Hand…",
+                "edit",
+                tooltip="Override the measured values per side",
+                slot=self._edit_override,
+            )
+        )
+        result_layout.addLayout(override_row)
+        self.override_banner = Banner()
+        result_layout.addWidget(self.override_banner)
         self.warnings = Banner()
         result_layout.addWidget(self.warnings)
         layout.addWidget(result)
@@ -165,6 +185,7 @@ class PerforationTab(QWidget):
             self.confidence.setText("Fit the rectangle if needed, then Measure.")
             self.table.setRowCount(0)
             self.warnings.show_message("")
+            self.override_banner.show_message("")
         else:
             self.notation.setText(_fmt_notation(perforation_mod.perforation_result_notation(sides)))
             conf = stamp.perforation.meta.confidence
@@ -175,6 +196,7 @@ class PerforationTab(QWidget):
             else:
                 self.confidence.setText(f"Confidence {conf:.2f}")
             self.table.setRowCount(len(sides))
+            manual = stamp.perforation.manual
             for row, (name, side) in enumerate(sides.items()):
                 result = _KIND_TEXT.get(side.kind) or _fmt_notation(side.notation or "?")
                 gauge = (
@@ -183,11 +205,29 @@ class PerforationTab(QWidget):
                     else "—"
                 )
                 holes = str(side.hole_count) if side.hole_count is not None else "—"
-                for col, text in enumerate((name.capitalize(), result, gauge, holes)):
-                    self.table.setItem(row, col, QTableWidgetItem(text))
-            warnings = stamp.perforation.meta.warnings or []
+                source = "by hand" if name in manual else "measured"
+                if name in manual:
+                    holes = "—"
+                for col, text in enumerate((name.capitalize(), result, gauge, holes, source)):
+                    item = QTableWidgetItem(text)
+                    if name in manual:
+                        font = item.font()
+                        font.setBold(True)
+                        item.setFont(font)
+                    self.table.setItem(row, col, item)
+            warnings = list(stamp.perforation.meta.warnings or [])
+            self.override_banner.show_message("")
+            if manual:
+                reason = next(iter(stamp.perforation.manual_reason.values()), "")
+                note = (
+                    f"<b>Set by hand</b> on {', '.join(manual)}"
+                    + (f" — {reason}" if reason else "")
+                    + ". The measured values below are kept for reference."
+                )
+                self.override_banner.show_message(note, "info")
             self.warnings.show_message("<br>".join(warnings), "warning")
 
+        self.revert_button.setVisible(bool(stamp.perforation.manual))
         diag_dir = self._stamp_dir() / "diagnostics"
         overview = diag_dir / "perforation.png"
         self.overview.set_png(overview if overview.exists() and sides else None)
@@ -232,6 +272,37 @@ class PerforationTab(QWidget):
     def _update_band_label(self) -> None:
         lo, hi = self._gauge_range
         self.band_label.setText(f"{lo:.2f} – {hi:.2f}")
+
+    # -- manual override -------------------------------------------------------
+
+    def _edit_override(self) -> None:
+        if self.stamp_id is None:
+            return
+        root = self.ctx.library_root
+        stamp = project_mod.load_stamp(root, self.project_id, self.stamp_id)
+        dialog = PerforationOverrideDialog(
+            stamp.perforation, project_mod.stamp_label(self.stamp_id), self.window()
+        )
+        if not dialog.exec():
+            return
+        try:
+            stamp = workflow.set_perforation_override(
+                root, self.project_id, self.stamp_id, dialog.overrides(), dialog.reason()
+            )
+        except workflow.WorkflowError as exc:
+            self.warnings.show_message(str(exc), "error")
+            return
+        self._show_result(stamp)
+        self.changed.emit()
+
+    def _revert(self) -> None:
+        if self.stamp_id is None:
+            return
+        stamp = workflow.set_perforation_override(
+            self.ctx.library_root, self.project_id, self.stamp_id, {}
+        )
+        self._show_result(stamp)
+        self.changed.emit()
 
     # -- measuring -------------------------------------------------------------
 

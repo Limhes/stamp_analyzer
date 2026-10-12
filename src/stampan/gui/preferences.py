@@ -24,6 +24,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -41,6 +43,23 @@ _KEY_LIBRARY = "library/root"
 _KEY_DEVICE = "scanner/device"
 _KEY_DPI = "scanner/reference_dpi"
 _KEY_OVERRIDES = "scanner/capture_overrides"
+_KEY_CANCELLATIONS = "stamps/cancellation_types"
+
+DEFAULT_CANCELLATION_TYPES = [
+    "Circular date stamp (CDS)",
+    "Double-ring CDS",
+    "Numeral",
+    "Barred / dotted obliterator",
+    "Pen cancel",
+    "Railway / TPO",
+    "Ship / paquebot",
+    "Machine cancel",
+    "Rubber handstamp",
+    "Cancelled to order (CTO)",
+    "Fiscal / revenue",
+    "Precancel",
+    "Uncancelled",
+]
 
 _IDENTITY = ",".join(str(i) for i in range(256))
 
@@ -63,6 +82,21 @@ def scanner_device() -> str | None:
 
 def reference_dpi() -> float:
     return float(QSettings().value(_KEY_DPI, 1200.0))
+
+
+def cancellation_types() -> list[str]:
+    text = QSettings().value(_KEY_CANCELLATIONS, "", type=str)
+    try:
+        value = json.loads(text) if text else None
+    except ValueError:
+        value = None
+    if not isinstance(value, list):
+        return list(DEFAULT_CANCELLATION_TYPES)
+    return [str(v) for v in value if str(v).strip()]
+
+
+def set_cancellation_types(types: list[str]) -> None:
+    QSettings().setValue(_KEY_CANCELLATIONS, json.dumps(types))
 
 
 def capture_overrides() -> dict[str, str]:
@@ -101,6 +135,7 @@ class PreferencesDialog(QDialog):
         tabs = QTabWidget()
         tabs.addTab(self._general_tab(current_library), icons.icon("library"), "General")
         tabs.addTab(self._scanner_tab(), icons.icon("scanner"), "Scanner")
+        tabs.addTab(self._stamps_tab(), icons.icon("stamp"), "Stamps")
         layout.addWidget(tabs)
 
         buttons = QDialogButtonBox(
@@ -137,6 +172,54 @@ class PreferencesDialog(QDialog):
         path = QFileDialog.getExistingDirectory(self, "Library Folder", self.library_edit.text())
         if path:
             self.library_edit.setText(path)
+
+    # -- stamps ----------------------------------------------------------------
+
+    def _stamps_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addWidget(label("Cancellation types", "section"))
+        layout.addWidget(
+            label(
+                "The choices offered for a stamp's cancellation. Double-click to edit; the "
+                "order here is the order in the list. Renaming a type does not change stamps "
+                "already recorded with the old name.",
+                "caption",
+                wrap=True,
+            )
+        )
+        self.cancel_list = QListWidget()
+        self.cancel_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        for text in cancellation_types():
+            self._add_cancel_item(text)
+        layout.addWidget(self.cancel_list, stretch=1)
+        row = QHBoxLayout()
+        row.addWidget(button("Add Type", "plus", slot=self._new_cancel_type))
+        row.addWidget(button("Remove", "clear", slot=self._remove_cancel_type))
+        row.addWidget(button("Restore Defaults", "undo", slot=self._default_cancel_types))
+        row.addStretch(1)
+        layout.addLayout(row)
+        return page
+
+    def _add_cancel_item(self, text: str) -> QListWidgetItem:
+        item = QListWidgetItem(text)
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
+        self.cancel_list.addItem(item)
+        return item
+
+    def _new_cancel_type(self) -> None:
+        item = self._add_cancel_item("New type")
+        self.cancel_list.setCurrentItem(item)
+        self.cancel_list.editItem(item)
+
+    def _remove_cancel_type(self) -> None:
+        for item in self.cancel_list.selectedItems():
+            self.cancel_list.takeItem(self.cancel_list.row(item))
+
+    def _default_cancel_types(self) -> None:
+        self.cancel_list.clear()
+        for text in DEFAULT_CANCELLATION_TYPES:
+            self._add_cancel_item(text)
 
     # -- scanner ---------------------------------------------------------------
 
@@ -279,6 +362,12 @@ class PreferencesDialog(QDialog):
         overrides = {k: v for k, v in table.items() if defaults.get(k) != v}
         overrides.update({k: "" for k in defaults if k not in table and k != "resolution"})
         settings.setValue(_KEY_OVERRIDES, json.dumps(overrides))
+        types = []
+        for i in range(self.cancel_list.count()):
+            text = self.cancel_list.item(i).text().strip()
+            if text and text not in types:
+                types.append(text)
+        set_cancellation_types(types)
         self.runner.wait()
         self.accept()
 
