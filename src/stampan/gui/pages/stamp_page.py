@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from stampan.core import models, workflow
+from stampan.core import models, publish, workflow
 from stampan.core import project as project_mod
 from stampan.gui import icons, preferences
 from stampan.gui.library_tree import KIND_SAMPLE, KIND_STAMP
@@ -28,8 +28,9 @@ from stampan.gui.pages.base import AppContext, Page
 from stampan.gui.pages.colour_tab import ColourTab
 from stampan.gui.pages.perforation_tab import PerforationTab
 from stampan.gui.viewer import TOOL_PAN
-from stampan.gui.widgets import Banner, button, label
+from stampan.gui.widgets import Banner, ScaledImage, button, label, rgb_to_pixmap
 
+PICTURE_MAX_HEIGHT = 220
 MODE_DETAILS = "details"
 MODE_PERFORATION = "perforation"
 MODE_COLOUR = "colour"
@@ -276,6 +277,10 @@ class StampPage(Page):
         self.header.add_action(self.prev_button)
         self.header.add_action(self.next_button)
 
+        #: The stamp in calibrated colour, whichever tab is open.
+        self.picture = ScaledImage(upscale=True, max_height=PICTURE_MAX_HEIGHT)
+        self.body_layout.addWidget(self.picture)
+
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
         self.details = DetailsTab(ctx, self._edit_rectangle)
@@ -315,6 +320,13 @@ class StampPage(Page):
         )
         model = workflow.colour_model_for_stamp(root, project_id, stamp_id)
         self.ctx.viewer.set_image(crop, *scale, model.predict_lab if model else None)
+        rgb, calibrated = publish.render_stamp_picture(crop, model, max_px=2 * PICTURE_MAX_HEIGHT)
+        self.picture.set_pixmap(rgb_to_pixmap(rgb))
+        self.picture.setToolTip(
+            "Calibrated colour (through the reference's colour model)"
+            if calibrated
+            else "No colour model: contrast-stretched scanner RGB, not calibrated colour"
+        )
         self.ctx.viewer.set_tool(TOOL_PAN)
 
         self._sample_id = sample.sample_id

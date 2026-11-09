@@ -197,10 +197,16 @@ def _write_webp(path: Path, rgb: np.ndarray) -> None:
     partial.replace(path)
 
 
-def render_stamp_picture(crop: np.ndarray, model) -> tuple[np.ndarray, bool]:
+def render_stamp_picture(
+    crop: np.ndarray, model, max_px: int | None = None
+) -> tuple[np.ndarray, bool]:
     """Display sRGB of a stamp crop, through the reference's colour model
     (scanner RGB -> Lab D50 -> sRGB) when there is one. Without a model it
-    is only a per-channel stretch, and the second value says so."""
+    is only a per-channel stretch, and the second value says so.
+    ``max_px`` downsamples first (long side), for a quick preview."""
+    if max_px is not None and max(crop.shape[:2]) > max_px:
+        scale = max_px / max(crop.shape[:2])
+        crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
     if model is None:
         return cv2.normalize(crop, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U), False
     lab = colour_mod.rgb_to_lab_d50(crop, model.predict_lab)

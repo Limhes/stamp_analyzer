@@ -254,7 +254,25 @@ class ImageViewer(QGraphicsView):
         width = float(np.linalg.norm(e01))
         height = float(np.linalg.norm(e12))
         theta = float(np.arctan2(e01[1], e01[0]))
+        # Corners carry no "which edge is the top": cv2.boxPoints, for one,
+        # starts on a vertical edge. Describe the box closest to upright.
+        while theta > np.pi / 4:
+            theta, width, height = theta - np.pi / 2, height, width
+        while theta <= -np.pi / 4:
+            theta, width, height = theta + np.pi / 2, height, width
         self._perf_box = (float(centre[0]), float(centre[1]), width / 2.0, height / 2.0, theta)
+        self._refresh_perf_box()
+
+    def set_perf_box_rect(
+        self, centre: tuple[float, float], size: tuple[float, float], angle_deg: float
+    ) -> None:
+        """Show the editable rectangle exactly as described -- including
+        which edge is the top, e.g. a stamp the user turned upside down --
+        which 4 corners alone cannot convey."""
+        self._perf_box = (
+            float(centre[0]), float(centre[1]), size[0] / 2.0, size[1] / 2.0,
+            float(np.radians(angle_deg)),
+        )  # fmt: skip
         self._refresh_perf_box()
 
     def zoom_to_perf_box(self, margin_factor: float = 2.5) -> None:

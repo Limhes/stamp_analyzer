@@ -131,3 +131,25 @@ def test_overview_cells_save_through_workflow(app, tmp_path):
     assert model.setData(cell(gui_overview.C_CDATE), "c. 1890-02")
     stamp = project_mod.load_stamp(tmp_path, project.project_id, stamp_id)
     assert stamp.cancellation.date == "1890-02" and stamp.cancellation.date_estimated
+
+
+def test_viewer_rectangle_round_trip_keeps_orientation(app):
+    """Selecting a stamp on the sheet and pressing Apply must re-crop it
+    exactly as before -- not turned a quarter turn (cv2.boxPoints starts its
+    corners on a vertical edge)."""
+    import cv2
+    import numpy as np
+    import pytest
+
+    from stampan.gui.viewer import ImageViewer
+
+    viewer = ImageViewer()
+    viewer.set_image(np.zeros((300, 300, 3), np.uint16))
+    for angle in (0.0, 0.3, -1.2, 10.0):
+        viewer.set_perf_box(cv2.boxPoints(((150, 150), (101, 114), angle)))
+        _centre, size, got = viewer.get_perf_box_rect()
+        assert got == pytest.approx(angle, abs=1e-4)
+        assert size == pytest.approx((101, 114), abs=1e-3)
+    for angle in (179.0, -90.0):  # turned by the user: kept as is
+        viewer.set_perf_box_rect((150, 150), (101, 114), angle)
+        assert viewer.get_perf_box_rect()[2] == pytest.approx(angle)

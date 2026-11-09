@@ -177,12 +177,17 @@ class SheetPage(Page):
         self.list.blockSignals(False)
         self.open_button.setEnabled(False)
 
-    def _box_for(self, stamp_id: str) -> np.ndarray | None:
+    def _rect_for(self, stamp_id: str):
+        """(centre, size, angle) of a stamp's rectangle on the sheet, px."""
         g = project_mod.load_stamp(self.ctx.library_root, self.project_id, stamp_id).geometry
         if self._scale is None or g.sample_centre_px is None or not g.width_mm or not g.height_mm:
             return None
         size = (g.width_mm * self._scale[0], g.height_mm * self._scale[1])
-        return cv2.boxPoints((g.sample_centre_px, size, g.rotation_deg or 0.0))
+        return tuple(g.sample_centre_px), size, g.rotation_deg or 0.0
+
+    def _box_for(self, stamp_id: str) -> np.ndarray | None:
+        rect = self._rect_for(stamp_id)
+        return cv2.boxPoints(rect) if rect is not None else None
 
     def _show_all_boxes(self, fit: bool = True) -> None:
         boxes = []
@@ -408,8 +413,8 @@ class SheetPage(Page):
         self._end_region()
         if self._adding:
             self._end_edit(show_boxes=False)
-        box = self._box_for(stamp_id)
-        if box is None:
+        rect = self._rect_for(stamp_id)
+        if rect is None:
             self.banner.show_message(
                 f"{stamp_label(stamp_id)} has no detected rectangle to adjust.",
                 "warning",
@@ -417,7 +422,9 @@ class SheetPage(Page):
             return
         viewer = self.ctx.viewer
         viewer.clear_static_boxes()
-        viewer.set_perf_box(box)
+        # The exact stored rectangle: corners alone would lose which edge is
+        # the stamp's top, and Apply would re-crop it turned.
+        viewer.set_perf_box_rect(*rect)
         viewer.zoom_to_perf_box()
         viewer.set_tool(TOOL_PERF_BOX)
         self._editing = stamp_id

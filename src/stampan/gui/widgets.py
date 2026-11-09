@@ -51,6 +51,13 @@ def button(
     return widget
 
 
+def rgb_to_pixmap(rgb: np.ndarray) -> QPixmap:
+    """8-bit (H, W, 3) RGB -> QPixmap."""
+    rgb = np.ascontiguousarray(rgb)
+    h, w = rgb.shape[:2]
+    return QPixmap.fromImage(QImage(rgb.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy())
+
+
 def png_to_pixmap(png: bytes | Path | str) -> QPixmap:
     data = Path(png).read_bytes() if isinstance(png, Path | str) else png
     arr = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
@@ -161,10 +168,14 @@ class ScaledImage(QWidget):
     which keeps small plots crisp.
     """
 
-    def __init__(self, upscale: bool = False, placeholder: str = "", parent=None) -> None:
+    def __init__(
+        self, upscale: bool = False, placeholder: str = "", max_height: int | None = None,
+        parent=None,
+    ) -> None:  # fmt: skip
         super().__init__(parent)
         self._pixmap = QPixmap()
         self._upscale = upscale
+        self._max_height = max_height
         self._placeholder = placeholder
         policy = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         policy.setHeightForWidth(True)
@@ -189,7 +200,9 @@ class ScaledImage(QWidget):
             return QSize(width, 0)
         pw, ph = self._pixmap.width(), self._pixmap.height()
         w = width if self._upscale else min(width, pw)
-        return QSize(w, round(ph * w / pw))
+        if self._max_height is not None and ph * w / pw > self._max_height:
+            w = pw * self._max_height / ph
+        return QSize(round(w), round(ph * w / pw))
 
     def hasHeightForWidth(self) -> bool:  # noqa: N802 -- Qt override
         return True
