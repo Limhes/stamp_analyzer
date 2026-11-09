@@ -46,6 +46,8 @@ _PATHS: dict[str, str] = {
     "undo": '<path d="M9 14L4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/>',
     "redo": '<path d="M15 14l5-5-5-5"/><path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H13"/>',
     "clear": '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/>',
+    "rotate-cw": '<path d="M19 12a7 7 0 1 1-2.05-4.95L19 9"/><path d="M19 4.5V9h-4.5"/>',
+    "rotate-ccw": '<path d="M5 12a7 7 0 1 0 2.05-4.95L5 9"/><path d="M5 4.5V9h4.5"/>',
     "refresh": '<path d="M20 11.5a8 8 0 1 1-2.4-5.7L20 8"/><path d="M20 3.5V8h-4.5"/>',
     "run": '<path d="M7.5 4.8v14.4L19 12z"/>',
     "check": '<path d="M5 12.5l4.5 4.5L19 7"/>',

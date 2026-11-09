@@ -2,7 +2,7 @@
 colour, carrying everything needed to sort, filter and compare stamps --
 colour (Lab and LCh), perforation, catalogue numbers and cancellation.
 
-Pure data; the GUI's overview and the report both build on it.
+Pure data; the GUI's overview, the exports and the published table build on it.
 """
 
 from __future__ import annotations
@@ -62,41 +62,48 @@ def _side_values(stamp: Stamp) -> dict[str, str]:
     return values
 
 
+def stamp_entries(stamp: Stamp, sample_id: str, sheet: str) -> list[OverviewEntry]:
+    """The rows of one stamp: one per measured colour (colours not drawn or
+    measured yet, without Lab, are left out)."""
+    sides = stamp.perforation.effective()
+    notation = perforation_mod.perforation_result_notation(sides) if sides else ""
+    entries = []
+    for cluster in stamp.colour.clusters:
+        if cluster.mean_lab is None or cluster.mean_lch is None:
+            continue
+        entries.append(
+            OverviewEntry(
+                stamp=stamp,
+                stamp_id=stamp.stamp_id,
+                sample_id=sample_id,
+                stamp_label=project_mod.stamp_label(stamp.stamp_id),
+                sheet=sheet,
+                cluster=cluster,
+                is_paper=cluster.label.strip().lower() == "paper",
+                lab=tuple(cluster.mean_lab),
+                lch=tuple(cluster.mean_lch),
+                perforation=notation,
+                side_gauges=_side_values(stamp),
+                perforation_manual=bool(stamp.perforation.manual),
+                catalogue=", ".join(stamp.catalogue_numbers),
+                country_issue=stamp.country_issue or "",
+                cancellation_type=stamp.cancellation.type or "",
+                cancellation_date=stamp.cancellation.date or "",
+                cancellation_estimated=stamp.cancellation.date_estimated,
+            )
+        )
+    return entries
+
+
 def project_entries(library_root: str | Path, project: Project) -> list[OverviewEntry]:
-    """Every measured colour of every stamp in ``project``, in sheet order.
-    Colours not drawn/measured yet (no Lab) are left out."""
+    """Every measured colour of every stamp in ``project``, in sheet order."""
     entries = []
     for sample_id in project.sample_ids:
         sample = project_mod.load_sample(library_root, project.project_id, sample_id)
         sheet = project_mod.sheet_title(sample)
         for stamp_id in sample.stamp_ids:
             stamp = project_mod.load_stamp(library_root, project.project_id, stamp_id)
-            sides = stamp.perforation.effective()
-            notation = perforation_mod.perforation_result_notation(sides) if sides else ""
-            for cluster in stamp.colour.clusters:
-                if cluster.mean_lab is None or cluster.mean_lch is None:
-                    continue
-                entries.append(
-                    OverviewEntry(
-                        stamp=stamp,
-                        stamp_id=stamp_id,
-                        sample_id=sample_id,
-                        stamp_label=project_mod.stamp_label(stamp_id),
-                        sheet=sheet,
-                        cluster=cluster,
-                        is_paper=cluster.label.strip().lower() == "paper",
-                        lab=tuple(cluster.mean_lab),
-                        lch=tuple(cluster.mean_lch),
-                        perforation=notation,
-                        side_gauges=_side_values(stamp),
-                        perforation_manual=bool(stamp.perforation.manual),
-                        catalogue=", ".join(stamp.catalogue_numbers),
-                        country_issue=stamp.country_issue or "",
-                        cancellation_type=stamp.cancellation.type or "",
-                        cancellation_date=stamp.cancellation.date or "",
-                        cancellation_estimated=stamp.cancellation.date_estimated,
-                    )
-                )
+            entries.extend(stamp_entries(stamp, sample_id, sheet))
     return entries
 
 
@@ -131,7 +138,7 @@ EXPORT_COLUMNS: list[tuple[str, str | None]] = [
     ("ΔE00 spread", "0.00"), ("Perforation", None),
     ("Gauge top", "0.00"), ("Gauge bottom", "0.00"), ("Gauge left", "0.00"),
     ("Gauge right", "0.00"), ("Perforation by hand", None), ("Cancellation", None),
-    ("Cancellation date", None), ("Date estimated", None), ("In report", None),
+    ("Cancellation date", None), ("Date estimated", None), ("In overview", None),
     ("Stamp ID", None),
 ]  # fmt: skip
 

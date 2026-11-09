@@ -290,3 +290,9 @@ tick spacing), and a user guide in docs/USER_GUIDE.md (workflow, with the
 measurement-uncertainty discussion). Run a full end-to-end test on the complete test
 data set and list the remaining issues by priority.
 ```
+
+---
+
+**2026-11-09:** the PDF report (phase 6) was removed at René's request. Results leave
+the app through the published export (SPEC §3.2) and the comparison table's Excel/CSV
+export.

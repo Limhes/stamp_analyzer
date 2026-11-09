@@ -1,5 +1,6 @@
-"""Perforation tab (SPEC §6): the measured gauge per side, the editable stamp
-rectangle on the viewer, the gauge search band, and the diagnostics."""
+"""Perforation tab (SPEC §6): the perforation typed by hand -- the usual way
+-- or measured from the editable stamp rectangle and gauge search band,
+with the per-side results and the diagnostics."""
 
 from __future__ import annotations
 
@@ -20,23 +21,14 @@ from stampan.core import perforation as perforation_mod
 from stampan.core import project as project_mod
 from stampan.core import workflow
 from stampan.core.models import LOW_CONFIDENCE
-from stampan.gui.dialogs.perforation_override import PerforationOverrideDialog
 from stampan.gui.pages.base import AppContext
+from stampan.gui.perforation_entry import PerforationEntry
 from stampan.gui.tasks import TaskRunner
 from stampan.gui.viewer import TOOL_PERF_BOX
 from stampan.gui.widgets import Banner, RangeSlider, ScaledImage, button, label
 
 REMEASURE_DEBOUNCE_MS = 400
 _KIND_TEXT = {"imperf": "imperforate", "straight_edge": "straight edge"}
-
-
-def _fmt_notation(notation: str) -> str:
-    return (
-        notation.replace(" 1/4", "¼")
-        .replace(" 1/2", "½")
-        .replace(" 3/4", "¾")
-        .replace(" x ", " × ")
-    )
 
 
 class PerforationTab(QWidget):
@@ -65,13 +57,18 @@ class PerforationTab(QWidget):
         self.condition_banner = Banner()
         layout.addWidget(self.condition_banner)
 
-        result = QGroupBox("Result")
+        result = QGroupBox("Perforation")
         result_layout = QVBoxLayout(result)
         self.notation = label("—", "value")
         self.notation.setStyleSheet("font-size: 20pt;")
         self.confidence = label("", "caption")
         result_layout.addWidget(self.notation)
         result_layout.addWidget(self.confidence)
+        self.entry = PerforationEntry()
+        self.entry.apply_requested.connect(self._set_by_hand)
+        result_layout.addWidget(self.entry)
+        self.override_banner = Banner()
+        result_layout.addWidget(self.override_banner)
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(["Side", "Result", "Gauge", "Holes", "Source"])
         self.table.verticalHeader().setVisible(False)
@@ -82,23 +79,13 @@ class PerforationTab(QWidget):
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.table.setFixedHeight(4 * 30 + 34)
         result_layout.addWidget(self.table)
-        override_row = QHBoxLayout()
-        override_row.addStretch(1)
+        revert_row = QHBoxLayout()
+        revert_row.addStretch(1)
         self.revert_button = button(
-            "Use Measured", "undo", tooltip="Remove the manual values", slot=self._revert
+            "Use Measured", "undo", tooltip="Remove the values set by hand", slot=self._revert
         )
-        override_row.addWidget(self.revert_button)
-        override_row.addWidget(
-            button(
-                "Set by Hand…",
-                "edit",
-                tooltip="Override the measured values per side",
-                slot=self._edit_override,
-            )
-        )
-        result_layout.addLayout(override_row)
-        self.override_banner = Banner()
-        result_layout.addWidget(self.override_banner)
+        revert_row.addWidget(self.revert_button)
+        result_layout.addLayout(revert_row)
         self.warnings = Banner()
         result_layout.addWidget(self.warnings)
         layout.addWidget(result)
@@ -127,7 +114,7 @@ class PerforationTab(QWidget):
         buttons = QHBoxLayout()
         buttons.addWidget(button("Reset Rectangle", "box", slot=self._reset_box))
         buttons.addStretch(1)
-        buttons.addWidget(button("Measure", "run", "primary", slot=self.measure))
+        buttons.addWidget(button("Measure", "run", slot=self.measure))
         settings_layout.addLayout(buttons)
         layout.addWidget(settings)
 
@@ -187,7 +174,9 @@ class PerforationTab(QWidget):
             self.warnings.show_message("")
             self.override_banner.show_message("")
         else:
-            self.notation.setText(_fmt_notation(perforation_mod.perforation_result_notation(sides)))
+            self.notation.setText(
+                perforation_mod.pretty_notation(perforation_mod.perforation_result_notation(sides))
+            )
             conf = stamp.perforation.meta.confidence
             if conf is None:
                 self.confidence.setText("")
@@ -198,7 +187,9 @@ class PerforationTab(QWidget):
             self.table.setRowCount(len(sides))
             manual = stamp.perforation.manual
             for row, (name, side) in enumerate(sides.items()):
-                result = _KIND_TEXT.get(side.kind) or _fmt_notation(side.notation or "?")
+                result = _KIND_TEXT.get(side.kind) or perforation_mod.pretty_notation(
+                    side.notation or "?"
+                )
                 gauge = (
                     f"{side.gauge:.2f}" + (f" ± {side.uncertainty:.2f}" if side.uncertainty else "")
                     if side.gauge is not None
@@ -228,6 +219,7 @@ class PerforationTab(QWidget):
             self.warnings.show_message("<br>".join(warnings), "warning")
 
         self.revert_button.setVisible(bool(stamp.perforation.manual))
+        self.entry.set_perforation(stamp.perforation)
         diag_dir = self._stamp_dir() / "diagnostics"
         overview = diag_dir / "perforation.png"
         self.overview.set_png(overview if overview.exists() and sides else None)
@@ -242,6 +234,7 @@ class PerforationTab(QWidget):
         self.ctx.viewer.set_tool(TOOL_PERF_BOX)
         if self._box is not None:
             self.ctx.viewer.set_perf_box(self._box)
+        self.entry.focus()
 
     def deactivate(self) -> None:
         self._active = False
@@ -275,24 +268,18 @@ class PerforationTab(QWidget):
 
     # -- manual override -------------------------------------------------------
 
-    def _edit_override(self) -> None:
+    def _set_by_hand(self, sides: dict) -> None:
         if self.stamp_id is None:
-            return
-        root = self.ctx.library_root
-        stamp = project_mod.load_stamp(root, self.project_id, self.stamp_id)
-        dialog = PerforationOverrideDialog(
-            stamp.perforation, project_mod.stamp_label(self.stamp_id), self.window()
-        )
-        if not dialog.exec():
             return
         try:
             stamp = workflow.set_perforation_override(
-                root, self.project_id, self.stamp_id, dialog.overrides(), dialog.reason()
+                self.ctx.library_root, self.project_id, self.stamp_id, sides
             )
         except workflow.WorkflowError as exc:
             self.warnings.show_message(str(exc), "error")
             return
         self._show_result(stamp)
+        self.entry.focus()
         self.changed.emit()
 
     def _revert(self) -> None:

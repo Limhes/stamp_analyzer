@@ -35,6 +35,7 @@ TOOL_ELLIPSE = "ellipse"
 TOOL_POLYGON = "polygon"
 TOOL_BRUSH = "brush"
 TOOL_PERF_BOX = "perf_box"
+TOOL_REGION = "region"  # drag out an axis-aligned search region (sheet page)
 
 MODE_INCLUDE = "include"
 MODE_ERASE = "erase"
@@ -53,6 +54,8 @@ _PERF_HANDLE_HIT_PX = 26.0
 _PERF_ROTATE_OFFSET_PX = 28.0
 _PERF_MIN_HALF_SIZE_PX = 5.0
 _PERF_CORNER_SIGNS = {0: (-1, -1), 1: (1, -1), 2: (1, 1), 3: (-1, 1)}
+
+_REGION_COLOUR = QColor(255, 140, 0)
 
 #: Non-interactive "every detected stamp" overview (SPEC §5), shown while
 #: no single stamp is being edited.
@@ -82,6 +85,7 @@ class ImageViewer(QGraphicsView):
     roi_changed = Signal(str)  # the active ROI's name, whenever its mask changes
     perf_box_changed = Signal()  # the perforation-box overlay geometry changed
     zoom_changed = Signal(float)  # current scale factor (1.0 = one image px per screen px)
+    region_changed = Signal()  # the search region was drawn or cleared
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -122,6 +126,9 @@ class ImageViewer(QGraphicsView):
         self._perf_drag_start: tuple[float, float, float, float, float] | None = None
         self._perf_drag_start_corners: np.ndarray | None = None
 
+        self._region: QRectF | None = None
+        self._region_item = None
+
         self._static_box_items: list = []
         self._pan_origin = None  # viewport pos while drag-panning
         self._perf_drag_anchor: np.ndarray | None = None
@@ -146,6 +153,7 @@ class ImageViewer(QGraphicsView):
         self._perf_box = None
         self._perf_box_items = []
         self._static_box_items = []
+        self._region = self._region_item = None
 
         self._scene.clear()
         pixmap = QPixmap.fromImage(_to_qimage(_display_image(rgb)))
@@ -161,6 +169,7 @@ class ImageViewer(QGraphicsView):
         self._perf_box = None
         self._perf_box_items = []
         self._static_box_items = []
+        self._region = self._region_item = None
         self._scene.clear()
         self._pixmap_item = self._mask_item = None
 
@@ -302,6 +311,40 @@ class ImageViewer(QGraphicsView):
 
     def zoom_actual_size(self) -> None:
         self.zoom_by(1.0 / self.zoom_level())
+
+    # -- search region -------------------------------------------------
+
+    def region(self) -> tuple[float, float, float, float] | None:
+        """The drawn search region as (x0, y0, x1, y1) image px, or None."""
+        if self._region is None:
+            return None
+        r = self._region
+        return (r.left(), r.top(), r.right(), r.bottom())
+
+    def clear_region(self) -> None:
+        had = self._region is not None
+        self._region = None
+        self._show_region(None)
+        if had:
+            self.region_changed.emit()
+
+    def _show_region(self, rect: QRectF | None) -> None:
+        if self._region_item is not None:
+            self._scene.removeItem(self._region_item)
+            self._region_item = None
+        if rect is None:
+            return
+        pen = QPen(_REGION_COLOUR, 2, Qt.PenStyle.DashLine)
+        pen.setCosmetic(True)
+        self._region_item = QGraphicsRectItem(rect)
+        self._region_item.setPen(pen)
+        self._region_item.setBrush(QColor(255, 140, 0, 28))
+        self._region_item.setZValue(7)
+        self._scene.addItem(self._region_item)
+
+    def _region_rect(self, end_pt: QPointF) -> QRectF:
+        rect = QRectF(self._start_pt, end_pt).normalized()
+        return rect.intersected(self._scene.sceneRect())
 
     def set_static_boxes(self, boxes: list[tuple[str, np.ndarray]]) -> None:
         """Non-interactive rectangles with a small label each -- e.g. every
@@ -582,6 +625,8 @@ class ImageViewer(QGraphicsView):
             self._stamp_brush(scene_pt)
         elif self._drawing and self._tool in (TOOL_RECT, TOOL_ELLIPSE):
             self._update_shape_preview(scene_pt)
+        elif self._drawing and self._tool == TOOL_REGION:
+            self._show_region(self._region_rect(scene_pt))
 
     def _emit_pixel_info(self, scene_pt: QPointF) -> None:
         x, y = int(scene_pt.x()), int(scene_pt.y())
@@ -627,6 +672,11 @@ class ImageViewer(QGraphicsView):
             self._pan_origin = event.position().toPoint()
             self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
             return
+        if self._tool == TOOL_REGION and self._rgb is not None:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._drawing = True
+                self._start_pt = self.mapToScene(event.pos())
+            return
         if (
             self._rgb is None
             or self._tool == TOOL_PAN
@@ -657,6 +707,15 @@ class ImageViewer(QGraphicsView):
             self._perf_drag_start_corners = None
             self._drawing = False
             self.set_cursor_for_tool()
+            return
+        if self._drawing and self._tool == TOOL_REGION:
+            self._drawing = False
+            rect = self._region_rect(self.mapToScene(event.pos()))
+            # A click without a drag keeps the previous region.
+            if rect.width() >= 4 and rect.height() >= 4:
+                self._region = rect
+                self.region_changed.emit()
+            self._show_region(self._region)
             return
         if self._drawing and self._tool in (TOOL_RECT, TOOL_ELLIPSE):
             self._commit_shape(self.mapToScene(event.pos()))

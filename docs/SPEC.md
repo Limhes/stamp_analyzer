@@ -15,7 +15,7 @@ colorimetric calibration. For every stamp it determines:
    dropped).
 3. **Geometry**: stamp dimensions in mm.
 
-It then produces a PDF report with one page per stamp and an overview page.
+It then publishes the results per project (§3.2) for a website or other software.
 
 Out of scope for v1: syncopated or irregular perforation patterns, watermark
 detection, plate flaws, OCR of the design, and multi-scanner management.
@@ -58,7 +58,7 @@ Consequences:
 - Stamps may slightly overlap strip edges or each other.
 - **Known limitation (accepted for v1):** the glassine changes the colour (haze, tint,
   specular effects), but the IT8 reference is scanned without glassine. This gives
-  a systematic colour error. The app must state this on the report as
+  a systematic colour error. The app must state this with the results as
   "measured through glassine; not corrected". A later experiment (IT8 behind glassine
   vs. bare) will quantify the error. The design must allow a "glassine
   correction" to be added later without restructuring.
@@ -70,7 +70,7 @@ back and verified, is simpler and no less trustworthy for a flatbed scanner).
 The IT8 reference data (CGATS, 288 patches A1–L22 + GS0–GS23, XYZ and Lab D50 2°,
 plus per-patch STDEV and MEAN_DE) is at `reference_data/R240103.txt`.
 
-Another known limitation, documented on the report but not corrected: the target is
+Another known limitation, documented with the results but not corrected: the target is
 glossy photographic paper while stamp paper is matte, which can give a small
 gloss-dependent bias.
 
@@ -93,15 +93,19 @@ stampan/
     naming.py           # Munsell notation
     philatelic_colours.py   # Lab -> philatelic colour name (§9, replaces ISCC–NBS)
     project.py          # sample/project persistence
+    library.py          # library layout: record / raw / cache, .gitignore
+    publish.py          # the published export for other software (§3.2)
     workflow.py         # end-to-end steps shared by CLI and GUI (capture, ingest,
-                        #   place/measure stamp, batch perforation, report export)
-    report/             # Jinja2 templates + WeasyPrint
+                        #   place/measure/rotate stamp, batch perforation)
   cli.py                # `stampan` command -- thin layer over core.workflow
   gui/                  # PySide6 app (`stampan-gui`) -- thin layer over core.workflow
     main_window.py      # menus, toolbars, docks, navigation, status bar
     pages/              # inspector pages: project, sheet, stamp (+ tabs), reference
     dialogs/            # Add Sheet dialog, New Reference wizard
     viewer.py, library_tree.py
+    overview.py         # project comparison workspace (editable table, linked plots)
+    perforation_entry.py  # perforation typed by hand: one value / H × V / per side
+    publisher.py        # keeps published/ current in the background
     theme.py, icons.py, widgets.py   # look and feel: stylesheet, SVG icons, shared widgets
     tasks.py, workers.py             # background tasks, one busy indicator
 tests/
@@ -126,23 +130,52 @@ as separate fields next to the automatic result, never by overwriting it. That w
 
 ```
 <library_root>/
+  .gitignore, README.md # written when missing: what is tracked and what is not
+  published.json        # index of published projects (§3.2)
   references/<ref_id>/
     reference.json      # name, date, scanner options, scales, model, validation
     reference_scan.tif  # raw 16-bit scan
     model.npz           # characterisation coefficients / LUT
     diagnostics/*.png
   projects/<project_id>/
-    project.json        # name, date, ref_id, notes
+    project.json        # name, date, notes, sheet ids
     sample_<n>.tif      # raw scans
+    sample_<n>.json     # sheet: scan time, reference, stamp ids
     stamps/<stamp_id>/
-      crop.tif          # rotated, full-res crop with black margin
+      crop.tif          # rotated, full-res crop with black margin (cache)
       stamp.json        # all results + manual edits + metadata (catalogue no., notes)
+      colour_rois/*.png # colour areas drawn by hand
       diagnostics/*.png
-  stampan.sqlite        # index of all stamps and key results, for cross-project queries
+    published/          # §3.2
 ```
+
+The library's files fall in three classes:
+
+- **Record**: the JSON files, hand-drawn colour areas, references' `reference.json`
+  and `model.npz`, and `published/`. Small and text-like; the library folder is a git
+  repository and these are tracked (the user commits).
+- **Raw**: the 16-bit scans (`*.tif`). Hundreds of MB each and never changed after
+  scanning, so they are backed up separately (Nextcloud, NAS, restic), not in git.
+- **Cache**: `crop.tif` and `diagnostics/`. A missing crop is re-cut from the sheet
+  scan with the stored geometry (bit-identical to the original); diagnostics are
+  re-rendered by measuring again.
+
+Records are written atomically (temporary file + rename) because the background
+publisher and other programs read them while the app runs.
 
 The library root can be configured. The default is `~/StampAnalyzer`. **It must not live inside
 a sync folder that touches files while they are being written.**
+
+### 3.2 Published export
+
+`projects/<id>/published/` is the stable interface for other software (a website):
+`project.json` (schema `stampan.published/1`, see `docs/published-format.md`),
+`table.csv` and per stamp a full-resolution WebP picture plus a 400 px thumbnail.
+Pictures go through the reference's colour model (scanner RGB → Lab D50 → sRGB);
+without a model they are marked `image_calibrated: false`. The export is rewritten in
+the background after every change; pictures are re-rendered only when the stamp's
+geometry, reference or colour model changed. Sheet scans are not published.
+`<library_root>/published.json` lists all published projects.
 
 ## 4. Reference (calibration)
 
@@ -252,7 +285,7 @@ further cross-check. Its scan settings are unknown, so it is never the reference
 If the scanner output is not linear (gamma applied), first linearise it with the GS
 grey-ramp patches (1-D curve per channel, monotone spline).
 
-**Validation (mandatory, shown in the GUI and on every report):**
+**Validation (mandatory, shown in the GUI and in the published export):**
 
 - Training ΔE00: mean, median, 95th percentile and max over all 288 patches.
 - **Leave-one-out or k-fold cross-validated ΔE00.** This is the realistic number.
@@ -287,12 +320,26 @@ implement it later.
   and fit a `minAreaRect`.
 - Touching stamps: split them with a distance-transform watershed. If that fails, flag
   the region for manual splitting.
+- **By region (the default).** A whole-sheet pass fails on uneven stock cards and
+  glassine strips, so adding a sheet does not detect stamps unless asked to. The user
+  drags a rectangle around one or more stamps; detection runs on that region only, so
+  the Otsu threshold adapts to the local background. Rectangles touching the region's
+  border (cut off) and ones whose centre lies in an existing stamp are not added. New
+  stamps are numbered in reading order. Each detection can be undone. Components that
+  are not plausible stamps (dust, strip edges) are dropped silently.
+- `minAreaRect` reports a rectangle's angle anywhere in a 90° range with width and
+  height swapped to match; the rectangle is normalised to |angle| ≤ 45°, so a stamp is
+  cropped the way it lies on the scan. (Stamps detected before this fix may have been
+  cropped turned by 90°.)
 - **Manual.** The user draws, moves, rotates and deletes rotated rectangles. Detected
   rectangles are editable the same way.
 - **Output per stamp:** a crop rotated upright (bicubic, 16-bit) with a black margin
   of at least 3 mm around the tooth tips, plus the transform back to sample coordinates.
-  The user can rotate the crop by 90° steps and mirror it (never needed in practice,
-  but keep the transform general).
+  The user can rotate a stamp by quarter turns (stamp page ↺ ↻, Ctrl+R / Ctrl+Shift+R,
+  or the sheet's stamp list). The crop is cut again from the sheet with the rotation
+  changed by 90°; per-side perforation results and reasons move to their new side, and
+  the perforation rectangle, colour masks and diagnostics turn with it. Colour
+  measurements are unchanged. Mirroring is not implemented (never needed in practice).
 
 ## 6. Perforation
 
@@ -340,7 +387,7 @@ assumed, since guessing wrong here would silently apply the wrong algorithm.
      rough perforation).
 7. **Confidence.** High when (A) and (B) agree within 0.1 gauge, the spectral peak is
    dominant, there are at least 8 holes and the spacing is regular. Low otherwise. Low
-   confidence is flagged in the GUI and on the report.
+   confidence is flagged in the GUI and in the published export.
 8. **Imperforate detection.** The profile shows no significant periodic component
    (the peak is not above the noise floor), and the edge is straight with small
    amplitude. A straight edge on one side combined with perforated sides is
@@ -355,10 +402,15 @@ On the dedicated perforation view, the user can:
 
 - click tooth tips or hole centres (snap to the nearest local extremum). The gauge is
   then computed by the same regression as estimator (B);
-- override the value per side, with a mandatory reason field;
+- set the perforation by hand -- in practice the usual way, with Measure as a check.
+  Three levels of detail: one gauge for all four sides, horizontal × vertical, or per
+  side; the level last used is remembered. Gauges are typed as `11`, `11½`, `11 1/2`
+  or `11.25`; a side can be `imperf` or `straight edge`. Compound notation
+  (`11/12 × imperf`, top/bottom × left/right) is accepted wherever a perforation is
+  typed, including the overview table. An optional reason is kept;
 - mark a side as imperf or straight edge.
 
-### 6.3 Diagnostic image (also used in the report)
+### 6.3 Diagnostic image
 
 The stamp crop with the fitted tip and bottom lines, detected hole centres (numbered
 every 5th), excluded corners, and per-side labels (gauge ± uncertainty, auto/manual,
@@ -501,35 +553,18 @@ iscc_nbs/` has been deleted; nothing in the codebase references it.
    surfaced, not hidden), and the Munsell notation.
 5. **Colour overview** (SPEC §10 extension, requested by René): all of a project's
    ink clusters (across every stamp) plotted together in CIELAB a*b* and CIELCh
-   (C*-h polar), via `core.colour.render_colour_overview`. Embedded as its own section
-   on the report's overview page and also written standalone as
-   `<project>/colour_overview.png`, so stamps can be compared to each other directly,
-   not just read one at a time.
+   (C*-h polar), shown in the project's comparison workspace (and drawn by the website from the
+   published data), so stamps can be compared to each other directly, not just read
+   one at a time.
 
-Note on the report that the Munsell notation assumes illuminant C viewing.
+Note with the results that the Munsell notation assumes illuminant C viewing.
 
-## 10. Report
+## 10. Output
 
-A4 PDF, comparison first (rewritten 2026-10-12 at René's request -- the earlier
-one-page-per-stamp layout with full diagnostics was too detailed):
-
-1. **Summary**: counts; calibration references with resolution, scale, colour model and
-   cross-validated ΔE00; ink colour per catalogue number (mean LCh, max ΔE00 from the
-   group mean, perforations seen); perforation × catalogue-number counts; a short
-   methods note.
-2. **Sheets**: each sheet in calibrated colour with the current stamp rectangles and
-   stamp numbers.
-3. **Comparison charts** (left out when there is nothing to compare): ink colour (a*b*
-   and L*-C*) by catalogue number, by perforation, by cancellation year (continuous
-   scale; estimated dates and undated stamps marked), by cancellation type; shade (h,
-   C*) over time; horizontal vs vertical gauge map. Points carry stamp numbers. Only
-   ink colours ticked in the project overview are used.
-4. **Index**: one line per stamp.
-5. **Stamp cards**, four per page: a large calibrated-colour picture, perforation
-   (notation, per-side gauges, "by hand"), cancellation, colours, size, flags, notes.
-
-Per-side perforation diagnostics stay in the project folder and the GUI. CSV and JSON
-exports carry the per-stamp data; `colour_overview.png` is the first colour chart.
+There is no PDF report (removed 2026-11-09 at René's request: not useful in practice).
+Results leave the app through the published export (§3.2, `docs/published-format.md`),
+which a website renders, and the comparison table's Excel/CSV export and clipboard
+copy (§12).
 
 ## 11. Test data, ground truth, validation
 
@@ -557,8 +592,8 @@ exports carry the per-stamp data; `colour_overview.png` is the first colour char
     out / % / in / fit / 1:1. Area tools are enabled only while a colour area is being
     edited. An empty state is shown when nothing is loaded.
   - *Inspector* dock (right): the page for the selected item -- Project (statistics,
-    colour overview, report), Sheet (detected stamps, adjust rectangle, add a missed
-    stamp), Stamp (Details / Perforation / Colour tabs, previous/next), Reference
+    colour overview), Sheet (find stamps in a selected region with undo,
+    adjust a rectangle, place a stamp by hand), Stamp (Details / Perforation / Colour tabs, previous/next), Reference
     (accuracy, scale, scanner settings, diagnostics; rename/archive/compare).
 - **Project comparison** (centre area while a project is selected): one row per measured
   colour with Lab/LCh, perforation, catalogue no. and cancellation; search, filter (inks/paper,
@@ -568,12 +603,17 @@ exports carry the per-stamp data; `colour_overview.png` is the first colour char
   LibreOffice with numbers as numbers; Export writes the visible rows to .xlsx (openpyxl:
   frozen header, autofilter, number formats, colour-filled swatch cells) or .csv (UTF-8). Linked a*b* and L*–C* plots show the visible, ticked
   rows, coloured by measured colour or grouped by perforation, cancellation, sheet or catalogue
-  no.; hover names a point, clicking selects its row.
-- **Perforation override** (§6.2): per side, kind and gauge set by hand with an optional reason;
-  stored in `manual` next to the measured result, shown as "by hand", flagged on the report.
+  no.; hover names a point, clicking selects its row. Catalogue no., perforation,
+  cancellation type (drop-down), date (`c. 1889` for an estimate) and the colour's display
+  name are edited in place; every edit is saved at once through the same workflow function
+  as on the stamp page, so validation and clean-up are identical.
+- **Perforation by hand** (§6.2): one value / H × V / per side, kind and gauge, optional reason;
+  stored in `manual` next to the measured result, shown as "by hand", flagged in the published export.
 - **Cancellation** (Details tab): type from a user-defined list (Preferences), date as YYYY,
   YYYY-MM or YYYY-MM-DD, and whether it is estimated rather than read from a legible postmark.
-- **Dialogs:** Add Sheet (reference + scanner or TIFF, validated before OK); New
+- **Colour areas** are named `ink`, `ink2`, ... when added, and renamed in place.
+- **Dialogs:** Add Sheet (reference + scanner or TIFF, optional whole-sheet detection,
+  validated before OK); New
   Reference wizard (acquire → describe → review with per-model ΔE00 table and the
   patch-location diagnostic → save).
 - **Status bar:** a single busy indicator for all background work, and the pixel

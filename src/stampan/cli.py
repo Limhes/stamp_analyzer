@@ -367,30 +367,6 @@ def colour(
 
 
 @app.command()
-def report(
-    project: str = typer.Argument(..., help="Project name or id."),
-    output: Path | None = typer.Option(
-        None, "-o", "--output", help="PDF path (default: <project>/report.pdf)."
-    ),
-    library_root: Path = typer.Option(DEFAULT_LIBRARY_ROOT),
-) -> None:
-    """Generate the PDF report plus CSV/JSON export for a project (SPEC §10)."""
-    proj = _resolve_project(library_root, project)
-    try:
-        files = workflow.export_report(library_root, proj, pdf_path=output)
-    except workflow.WorkflowError as exc:
-        typer.echo(str(exc), err=True)
-        raise typer.Exit(code=1) from exc
-    for note in files.notes:
-        typer.echo(f"warning: {note}", err=True)
-    overview_note = f", {files.colour_overview.name}" if files.colour_overview else ""
-    typer.echo(
-        f"wrote {files.pdf}, {files.csv.name}, {files.json.name}{overview_note} "
-        f"({files.n_stamps} stamp(s))"
-    )
-
-
-@app.command()
 def run(
     sample_path: Path = typer.Argument(..., help="Sample-sheet scan TIFF."),
     reference: str = typer.Option(..., "--reference", help="Reference id (for px/mm scale)."),
@@ -398,9 +374,9 @@ def run(
     inks: int = typer.Option(1, "--inks", help="Number of ink clusters (N), SPEC §8.3."),
     library_root: Path = typer.Option(DEFAULT_LIBRARY_ROOT),
 ) -> None:
-    """Run detect -> perf -> colour -> report fully automatically (SPEC Phase 6).
+    """Run detect -> perf -> colour fully automatically, then publish (SPEC Phase 6).
 
-    Each step is the same command `stampan detect|perf|colour|report` would
+    Each step is the same command `stampan detect|perf|colour` would
     run, invoked in-process (so typer's own option defaults resolve
     correctly) rather than duplicated here. `colour` runs without an
     inclusion ROI, since this is unattended -- see its own warning about
@@ -410,7 +386,7 @@ def run(
         ["detect", str(sample_path), "--reference", reference, "--project", project],
         ["perf", project],
         ["colour", project, "--inks", str(inks)],
-        ["report", project],
+        ["publish", project],
     ]
     for step in steps:
         step_args = [*step, "--library-root", str(library_root)]
@@ -424,6 +400,22 @@ def run(
         except Exception as exc:  # noqa: BLE001 -- surface any step's failure and stop the chain
             typer.echo(f"'{step[0]}' failed: {exc}; stopping.", err=True)
             raise typer.Exit(code=1) from exc
+
+
+@app.command()
+def publish(
+    project: str = typer.Argument(..., help="Project name or id."),
+    library_root: Path = typer.Option(DEFAULT_LIBRARY_ROOT),
+) -> None:
+    """Write the project's published export: project.json, table.csv, pictures (SPEC §3.2)."""
+    from stampan.core import publish as publish_mod
+
+    proj = _resolve_project(library_root, project)
+    result = publish_mod.publish_project(library_root, proj.project_id, progress=typer.echo)
+    typer.echo(
+        f"published {result.n_stamps} stamp(s) to {result.path} "
+        f"({result.n_images_rendered} picture(s) rendered)"
+    )
 
 
 if __name__ == "__main__":

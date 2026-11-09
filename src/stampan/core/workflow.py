@@ -22,10 +22,12 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 from stampan.core import colour as colour_mod
 from stampan.core import detection as detection_mod
+from stampan.core import models
 from stampan.core import perforation as perforation_mod
 from stampan.core import project as project_mod
 from stampan.core import scanner as scanner_mod
@@ -46,8 +48,7 @@ Progress = Callable[[str], None] | None
 DEFAULT_LIBRARY_ROOT = Path.home() / "StampAnalyzer"
 REFERENCE_DATA_DIR = Path(__file__).resolve().parents[3] / "reference_data"
 DEFAULT_CGATS_PATH = REFERENCE_DATA_DIR / "R240103.txt"
-#: Black margin kept around the tooth tips of every extracted crop (SPEC §5).
-DEFAULT_STAMP_MARGIN_MM = 3.0
+DEFAULT_STAMP_MARGIN_MM = detection_mod.DEFAULT_MARGIN_MM
 
 #: Keys of a scanner option dict that ``capture_scan`` passes as dedicated
 #: ``acquire_scan`` arguments rather than as extra ``--option=value`` flags.
@@ -272,13 +273,6 @@ def _crop_and_save(
     return crop
 
 
-def _background_level(scan_image: np.ndarray) -> float:
-    # The 1st percentile of a background-dominated sheet is stable under
-    # heavy subsampling; computing it once per sheet avoids extract_crop's
-    # own fallback re-sorting the whole (multi-hundred-MB) scan per stamp.
-    return float(np.percentile(scan_image[::8, ::8], 1))
-
-
 def ingest_sample(
     library_root: str | Path,
     project: Project,
@@ -286,21 +280,26 @@ def ingest_sample(
     scan_image: np.ndarray,
     scan_metadata: ScanMetadata,
     margin_mm: float = DEFAULT_STAMP_MARGIN_MM,
+    detect: bool = True,
     progress: Progress = None,
 ) -> IngestResult:
-    """Add a sample sheet to ``project``: store the scan, detect the stamps,
-    extract an upright crop per stamp, write the overview and contact-sheet
-    diagnostics (SPEC §5)."""
+    """Add a sample sheet to ``project``: store the scan and -- with
+    ``detect`` -- detect the stamps on the whole sheet, extract an upright
+    crop per stamp, write the overview and contact-sheet diagnostics
+    (SPEC §5). Without it the sheet starts empty and stamps are added by
+    region (:func:`detect_stamps_in_region`) or by hand."""
     reference = ref_mod.load_reference(library_root, ref_id)
     scale = scale_of(reference)
 
     _report(progress, "Storing sample sheet…")
     scan_metadata.ref_id = ref_id
     sample = project_mod.add_sample(library_root, project, scan_image, scan_metadata, ref_id)
+    if not detect:
+        return IngestResult(sample=sample, n_stamps=0, n_flagged=0, warnings=[])
 
     _report(progress, "Detecting stamps…")
     result = detection_mod.detect_stamps(scan_image, *scale)
-    background_level = _background_level(scan_image)
+    background_level = detection_mod.background_level(scan_image)
 
     crops = []
     for i, detected in enumerate(result.stamps):
@@ -375,11 +374,258 @@ def place_stamp(
         detected,
         scale,
         stamp,
-        _background_level(scan_image),
+        detection_mod.background_level(scan_image),
         margin_mm,
     )
     if stamp_id is None:
         project_mod.save_sample(library_root, sample)
+    return stamp
+
+
+@dataclass
+class RegionDetection:
+    added: list[str]  # new stamp ids, in reading order
+    n_cut: int  # objects cut by the region's border, left alone
+    n_existing: int  # objects that are already a stamp on this sheet
+
+
+#: A detected rectangle closer than this to the region's border is taken to
+#: be cut by it.
+_REGION_BORDER_PX = 3
+
+
+def detect_stamps_in_region(
+    library_root: str | Path,
+    project_id: str,
+    sample_id: str,
+    region_px: tuple[float, float, float, float],
+    margin_mm: float = DEFAULT_STAMP_MARGIN_MM,
+    progress: Progress = None,
+) -> RegionDetection:
+    """Detect stamps inside ``region_px`` = (x0, y0, x1, y1) of a sheet
+    and add each as a new stamp (SPEC §5).
+
+    Thresholding only the region adapts the Otsu level to the local
+    background, which is what makes this work where a whole-sheet pass
+    fails. Rectangles touching the region's border are not added (they are
+    cut off), nor are ones whose centre lies in an existing stamp. New
+    stamps are numbered in reading order (rows top to bottom, then left to
+    right). Writes ``diagnostics/<sheet>_region.png`` with what was found.
+    """
+    sample = project_mod.load_sample(library_root, project_id, sample_id)
+    reference = ref_mod.load_reference(library_root, sample.ref_id)
+    scale = scale_of(reference)
+    _report(progress, "Loading sheet…")
+    scan_image, _meta = project_mod.load_sample_scan(library_root, project_id, sample)
+
+    h, w = scan_image.shape[:2]
+    x0, y0, x1, y1 = (int(round(v)) for v in region_px)
+    x0, x1 = sorted((max(0, min(w, x0)), max(0, min(w, x1))))
+    y0, y1 = sorted((max(0, min(h, y0)), max(0, min(h, y1))))
+    min_side_px = detection_mod.MIN_STAMP_SIDE_MM * min(scale)
+    if x1 - x0 < min_side_px or y1 - y0 < min_side_px:
+        raise WorkflowError("The selected region is smaller than a stamp.")
+
+    _report(progress, "Detecting stamps in the region…")
+    region = scan_image[y0:y1, x0:x1]
+    result = detection_mod.detect_stamps(region, *scale)
+
+    existing = []
+    for stamp_id in sample.stamp_ids:
+        g = project_mod.load_stamp(library_root, project_id, stamp_id).geometry
+        if g.sample_centre_px is not None and g.width_mm and g.height_mm:
+            size = (g.width_mm * scale[0], g.height_mm * scale[1])
+            existing.append(cv2.boxPoints((tuple(g.sample_centre_px), size, g.rotation_deg or 0.0)))
+
+    kept, n_cut, n_existing = [], 0, 0
+    for detected in result.stamps:
+        box = detected.box_points()
+        if (
+            box[:, 0].min() < _REGION_BORDER_PX
+            or box[:, 1].min() < _REGION_BORDER_PX
+            or box[:, 0].max() > (x1 - x0) - _REGION_BORDER_PX
+            or box[:, 1].max() > (y1 - y0) - _REGION_BORDER_PX
+        ):
+            n_cut += 1
+            continue
+        cx, cy = detected.centre_px
+        centre = (float(cx + x0), float(cy + y0))
+        if any(cv2.pointPolygonTest(b.astype(np.float32), centre, False) >= 0 for b in existing):
+            n_existing += 1
+            continue
+        detected.centre_px = centre
+        kept.append(detected)
+
+    # Reading order: rows are bands one median stamp height apart.
+    if kept:
+        row_height = float(np.median([min(d.size_px) for d in kept]))
+        kept.sort(key=lambda d: (round(d.centre_px[1] / row_height), d.centre_px[0]))
+
+    background = detection_mod.background_level(scan_image)
+    added = []
+    for i, detected in enumerate(kept, start=1):
+        _report(progress, f"Extracting stamp {i} of {len(kept)}…")
+        stamp = Stamp(stamp_id=project_mod.next_stamp_id(sample), geometry=GeometryResult())
+        _crop_and_save(
+            library_root, sample, scan_image, detected, scale, stamp, background, margin_mm
+        )
+        added.append(stamp.stamp_id)
+    project_mod.save_sample(library_root, sample)
+
+    diagnostics_dir = project_mod.project_dir(library_root, project_id) / "diagnostics"
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    (diagnostics_dir / f"{sample_id}_region.png").write_bytes(
+        detection_mod.render_overview(region, result)
+    )
+    return RegionDetection(added=added, n_cut=n_cut, n_existing=n_existing)
+
+
+def remove_stamps(library_root: str | Path, project_id: str, stamp_ids: list[str]) -> None:
+    """Remove several stamps (e.g. undoing a region detection)."""
+    for stamp_id in stamp_ids:
+        project_mod.delete_stamp(library_root, project_id, stamp_id)
+
+
+# -- stamp details -------------------------------------------------------------
+
+#: "Leave this field as it is" for :func:`update_stamp_details`, where None
+#: is itself a value ("not recorded").
+KEEP = object()
+
+
+def update_stamp_details(
+    library_root: str | Path,
+    project_id: str,
+    stamp_id: str,
+    *,
+    catalogue=KEEP,
+    country_issue=KEEP,
+    notes=KEEP,
+    condition=KEEP,
+    multiplicity=KEEP,
+    multiplicity_count=KEEP,
+    cancellation_type=KEEP,
+    cancellation_date=KEEP,
+    date_estimated=KEEP,
+) -> Stamp:
+    """Change a stamp's user-recorded details, from text as typed -- the
+    one place their clean-up and validation happen, whether the edit comes
+    from the stamp page or a table cell.
+
+    ``catalogue`` is comma-separated; ``cancellation_date`` is a partial
+    date, optionally prefixed "c." for an estimate (which then sets
+    ``date_estimated`` too). Either everything is saved or, on invalid
+    input, nothing (WorkflowError).
+    """
+    stamp = project_mod.load_stamp(library_root, project_id, stamp_id)
+    if catalogue is not KEEP:
+        stamp.catalogue_numbers = models.parse_catalogue_numbers(catalogue or "")
+    if country_issue is not KEEP:
+        stamp.country_issue = " ".join((country_issue or "").split()) or None
+    if notes is not KEEP:
+        stamp.notes = (notes or "").strip()
+    if condition is not KEEP:
+        stamp.condition = condition
+    if multiplicity is not KEEP:
+        stamp.multiplicity = multiplicity
+    if multiplicity_count is not KEEP:
+        stamp.multiplicity_count = multiplicity_count
+    if stamp.multiplicity in (None, models.MULTIPLICITY_SINGLE):
+        stamp.multiplicity_count = None
+    if cancellation_type is not KEEP:
+        stamp.cancellation.type = " ".join((cancellation_type or "").split()) or None
+    if date_estimated is not KEEP:
+        stamp.cancellation.date_estimated = bool(date_estimated)
+    if cancellation_date is not KEEP:
+        try:
+            date, prefixed = models.parse_cancellation_date(cancellation_date or "")
+        except ValueError as exc:
+            raise WorkflowError(f"Cancellation date: {exc}.") from None
+        stamp.cancellation.date = date
+        if date_estimated is KEEP:
+            stamp.cancellation.date_estimated = prefixed
+        else:
+            stamp.cancellation.date_estimated = prefixed or bool(date_estimated)
+    project_mod.save_stamp_results(library_root, project_id, stamp)
+    return stamp
+
+
+#: Where each side of a stamp ends up after a quarter turn of its crop.
+_SIDE_AFTER_CW = {"top": "right", "right": "bottom", "bottom": "left", "left": "top"}
+_SIDE_AFTER_CCW = {new: old for old, new in _SIDE_AFTER_CW.items()}
+
+
+def rotate_stamp(
+    library_root: str | Path, project_id: str, stamp_id: str, clockwise: bool = True
+) -> Stamp:
+    """Turn a stamp's crop a quarter turn, keeping everything measured on it.
+
+    The crop is cut again from the sheet scan with the rotation changed by
+    90° (so it stays reproducible from the stored geometry), and whatever
+    refers to crop coordinates or to sides follows: per-side perforation
+    results (measured and hand-set) and their reasons move to their new
+    side, the perforation rectangle and the colour-area masks are turned
+    with the picture, and the per-side diagnostic images are renamed. The
+    colour measurements themselves are unaffected (same pixels).
+    Hand-set gauge search intervals per side are dropped: their direction
+    along a side is not preserved by the turn.
+    """
+    stamp = project_mod.load_stamp(library_root, project_id, stamp_id)
+    g = stamp.geometry
+    if g.sample_centre_px is None or not g.width_mm or not g.height_mm:
+        raise WorkflowError(f"{stamp_id} has no rectangle on its sheet to rotate.")
+    old_w, old_h = g.crop_size_px or (None, None)
+    if old_w is None:
+        old_h, old_w = project_mod.load_stamp_crop(library_root, project_id, stamp_id).shape[:2]
+
+    # extract_crop rotates the content by -angle: one more -90° turns it clockwise.
+    angle = (g.rotation_deg or 0.0) + (-90.0 if clockwise else 90.0)
+    g.rotation_deg = (angle + 180.0) % 360.0 - 180.0
+    g.width_mm, g.height_mm = g.height_mm, g.width_mm
+
+    side_map = _SIDE_AFTER_CW if clockwise else _SIDE_AFTER_CCW
+    perf = stamp.perforation
+    perf.auto = {side_map[k]: v for k, v in perf.auto.items()}
+    perf.manual = {side_map[k]: v for k, v in perf.manual.items()}
+    perf.manual_reason = {side_map[k]: v for k, v in perf.manual_reason.items()}
+    perf.roi_override_mm = {}
+
+    def turn_point(x: float, y: float) -> tuple[float, float]:
+        return (old_h - y, x) if clockwise else (y, old_w - x)
+
+    if perf.box_override_px is not None:
+        perf.box_override_px = [turn_point(x, y) for x, y in perf.box_override_px]
+
+    stamp_dir = project_mod.project_dir(library_root, project_id) / "stamps" / stamp_id
+    (stamp_dir / "crop.tif").unlink(missing_ok=True)
+    project_mod.save_stamp_results(library_root, project_id, stamp)
+    crop = project_mod.rebuild_stamp_crop(library_root, project_id, stamp_id)
+    stamp.geometry.crop_size_px = (int(crop.shape[1]), int(crop.shape[0]))
+
+    k = -1 if clockwise else 1  # np.rot90 turns counter-clockwise for k > 0
+    for cluster in stamp.colour.clusters:
+        mask = project_mod.load_stamp_roi_mask(library_root, project_id, cluster.mask_path or "")
+        if mask is not None:
+            project_mod.save_stamp_roi_mask(
+                library_root, project_id, stamp_id, cluster.label, np.rot90(mask, k).copy()
+            )
+
+    diag = stamp_dir / "diagnostics"
+    renamed = {}
+    for old, new in side_map.items():
+        path = diag / f"perforation_{old}.png"
+        if path.exists():
+            renamed[new] = path.read_bytes()
+            path.unlink()
+    for new, data in renamed.items():
+        (diag / f"perforation_{new}.png").write_bytes(data)
+    overview = diag / "perforation.png"
+    if overview.exists():
+        image = cv2.imread(str(overview), cv2.IMREAD_UNCHANGED)
+        if image is not None:
+            cv2.imwrite(str(overview), np.rot90(image, k).copy())
+
+    project_mod.save_stamp_results(library_root, project_id, stamp)
     return stamp
 
 
@@ -468,23 +714,27 @@ def set_perforation_override(
     project_id: str,
     stamp_id: str,
     sides: dict[str, tuple[str, float | None]],
-    reason: str = "",
+    reason: str | None = None,
 ) -> Stamp:
     """Replace the manual perforation values of a stamp (SPEC §6.2).
 
     ``sides`` maps a side to ``(kind, gauge)`` -- kind "perforated" (gauge
     required), "imperf" or "straight_edge". Sides left out have no override
     and show the measured value. The measured result itself is untouched, so
-    "measured" and "set by hand" stay distinguishable (and the report flags
-    the override).
+    "measured" and "set by hand" stay distinguishable (and the published
+    export flags the override). ``reason`` None keeps the reason already recorded.
     """
     stamp = project_mod.load_stamp(library_root, project_id, stamp_id)
+    if reason is None:
+        reason = next(iter(stamp.perforation.manual_reason.values()), "")
     manual, reasons = {}, {}
     for side, (kind, gauge) in sides.items():
         if side not in perforation_mod.SIDES:
             raise WorkflowError(f"unknown side '{side}'")
         if kind == "perforated":
-            if gauge is None or not perforation_mod.GAUGE_MIN <= gauge <= 30:
+            if gauge is None or not (
+                perforation_mod.GAUGE_MIN <= gauge <= perforation_mod.MANUAL_GAUGE_MAX
+            ):
                 raise WorkflowError(f"{side}: a perforated side needs a plausible gauge")
             manual[side] = PerforationSide(
                 kind=kind, gauge=float(gauge), notation=perforation_mod.notation_for_gauge(gauge)
@@ -499,6 +749,26 @@ def set_perforation_override(
     stamp.perforation.manual_reason = reasons
     project_mod.save_stamp_results(library_root, project_id, stamp)
     return stamp
+
+
+def set_perforation_text(
+    library_root: str | Path,
+    project_id: str,
+    stamp_id: str,
+    text: str,
+    reason: str | None = None,
+) -> Stamp:
+    """Set the perforation by hand from compound notation as typed --
+    "11", "11 × 11½", "11/12 × imperf" (see
+    ``perforation.sides_from_notation``). Empty text removes the override,
+    so the measured values show again."""
+    if not text.strip():
+        return set_perforation_override(library_root, project_id, stamp_id, {})
+    try:
+        sides = perforation_mod.sides_from_notation(text)
+    except ValueError as exc:
+        raise WorkflowError(f"Perforation: {exc}.") from None
+    return set_perforation_override(library_root, project_id, stamp_id, sides, reason)
 
 
 def measure_project_perforation(
@@ -551,6 +821,30 @@ def measure_roi_colour(
     return cluster, warnings
 
 
+def set_colour_overview(
+    library_root: str | Path,
+    project_id: str,
+    stamp_id: str,
+    colour_label: str,
+    *,
+    included=KEEP,
+    display_label=KEEP,
+) -> Stamp:
+    """Whether one of a stamp's colours is plotted and published as part of
+    the project overview, and the name it is shown under there (None: the
+    default "Stamp 4 · ink")."""
+    stamp = project_mod.load_stamp(library_root, project_id, stamp_id)
+    cluster = next((c for c in stamp.colour.clusters if c.label == colour_label), None)
+    if cluster is None:
+        raise WorkflowError(f"{stamp_id} has no colour named “{colour_label}”.")
+    if included is not KEEP:
+        cluster.overview_included = bool(included)
+    if display_label is not KEEP:
+        cluster.overview_label = " ".join((display_label or "").split()) or None
+    project_mod.save_stamp_results(library_root, project_id, stamp)
+    return stamp
+
+
 def save_stamp_colours(
     library_root: str | Path, project_id: str, stamp_id: str, clusters: list[ColourCluster]
 ) -> Stamp:
@@ -560,58 +854,3 @@ def save_stamp_colours(
     stamp.colour.meta.confidence = 1.0 if clusters else 0.0
     project_mod.save_stamp_results(library_root, project_id, stamp)
     return stamp
-
-
-# -- report -------------------------------------------------------------------
-
-
-@dataclass
-class ReportFiles:
-    pdf: Path
-    csv: Path
-    json: Path
-    colour_overview: Path | None
-    n_stamps: int
-    notes: list[str]
-
-
-def export_report(
-    library_root: str | Path,
-    project: Project,
-    pdf_path: Path | None = None,
-    progress: Progress = None,
-) -> ReportFiles:
-    """Write the PDF report plus CSV/JSON export (and the standalone colour
-    overview image) for ``project`` (SPEC §10)."""
-    from stampan.core.report import generator as report_mod
-
-    _report(progress, "Collecting results…")
-    context = report_mod.build_report_context(library_root, project)
-    if not context.stamps:
-        raise WorkflowError("This project has no stamps with a usable reference to report on.")
-
-    _report(progress, "Rendering PDF…")
-    pdf_bytes = report_mod.render_pdf(report_mod.render_html(context))
-    pdf_path = pdf_path or (
-        project_mod.project_dir(library_root, project.project_id) / "report.pdf"
-    )
-    pdf_path.parent.mkdir(parents=True, exist_ok=True)
-    pdf_path.write_bytes(pdf_bytes)
-    csv_path = pdf_path.with_suffix(".csv")
-    csv_path.write_text(report_mod.export_csv(context), encoding="utf-8")
-    json_path = pdf_path.with_suffix(".json")
-    json_path.write_text(report_mod.export_json(context), encoding="utf-8")
-
-    overview_path = None
-    if context.colour_overview_png:
-        overview_path = pdf_path.parent / "colour_overview.png"
-        overview_path.write_bytes(context.colour_overview_png)
-
-    return ReportFiles(
-        pdf=pdf_path,
-        csv=csv_path,
-        json=json_path,
-        colour_overview=overview_path,
-        n_stamps=len(context.stamps),
-        notes=list(context.notes),
-    )

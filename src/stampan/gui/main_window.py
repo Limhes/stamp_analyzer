@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from stampan import __version__
+from stampan.core import library as library_mod
 from stampan.core import project as project_mod
 from stampan.core import workflow
 from stampan.gui import icons, library_actions, preferences, theme
@@ -47,6 +48,7 @@ from stampan.gui.pages.project_page import ProjectPage
 from stampan.gui.pages.reference_page import ReferencePage
 from stampan.gui.pages.sheet_page import SheetPage
 from stampan.gui.pages.stamp_page import MODE_COLOUR_AREA, StampPage
+from stampan.gui.publisher import Publisher
 from stampan.gui.tasks import hub
 from stampan.gui.viewer import (
     MODE_ERASE,
@@ -95,11 +97,12 @@ class MainWindow(QMainWindow):
             self.library_root = _DEV_LIBRARY_ROOT
         else:
             self.library_root = workflow.DEFAULT_LIBRARY_ROOT
-        self.library_root.mkdir(parents=True, exist_ok=True)
+        library_mod.ensure_layout(self.library_root)
 
         self.viewer = ImageViewer()
         self.ctx = AppContext(lambda: self.library_root, self.viewer, self.navigate)
         self._current: Page | None = None
+        self.publisher = Publisher(self, lambda: self.library_root)
 
         self._build_centre()
         self._build_library_dock()
@@ -120,6 +123,8 @@ class MainWindow(QMainWindow):
         self._reload_tree()
         self._show_page(self.welcome_page)
         self._update_title()
+        self.publisher.failed.connect(lambda m: self.statusBar().showMessage(m, 15000))
+        self.publisher.mark_all()
 
     # -- layout --------------------------------------------------------------
 
@@ -174,6 +179,9 @@ class MainWindow(QMainWindow):
         ):
             self.pages.addWidget(page)
             page.changed.connect(self._reload_tree)
+            page.changed.connect(
+                lambda page=page: self.publisher.mark_changed(getattr(page, "project_id", None))
+            )
         self.stamp_page.mode_changed.connect(self._on_stamp_mode)
         self.stamp_page.edit_rectangle_requested.connect(self.sheet_page.select_and_edit)
         self.reference_page.new_reference_requested.connect(self.new_reference)
@@ -233,14 +241,6 @@ class MainWindow(QMainWindow):
         self.act_show_folder = a("Show Library Folder", "folder", self._show_library_folder)
         self.act_quit = a("Quit", "quit", self.close, QKeySequence.StandardKey.Quit)
 
-        self.act_report = a(
-            "Generate Report",
-            "report",
-            self._generate_report,
-            "Ctrl+R",
-            "Write the project's PDF report with CSV/JSON export",
-        )
-        self.act_open_report = a("Open Last Report", "open-external", self._open_report)
         self.act_remeasure = a(
             "Re-measure Perforation…",
             "run",
@@ -405,9 +405,6 @@ class MainWindow(QMainWindow):
         for act in (
             self.act_add_sheet,
             self.act_remeasure,
-            None,
-            self.act_report,
-            self.act_open_report,
         ):
             project_menu.addSeparator() if act is None else project_menu.addAction(act)
         project_menu.addSeparator()
@@ -427,7 +424,6 @@ class MainWindow(QMainWindow):
             self.act_new_reference,
             None,
             self.act_add_sheet,
-            self.act_report,
         ):
             main.addSeparator() if act is None else main.addAction(act)
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, main)
@@ -550,8 +546,6 @@ class MainWindow(QMainWindow):
         has_project = self._current_project_id() is not None
         for act in (
             self.act_add_sheet,
-            self.act_report,
-            self.act_open_report,
             self.act_remeasure,
             self.act_rename_project,
             self.act_remove_project,
@@ -585,9 +579,10 @@ class MainWindow(QMainWindow):
     def set_library(self, path: Path) -> None:
         if self._current is not None:
             self._current.deactivate()
-        path.mkdir(parents=True, exist_ok=True)
+        library_mod.ensure_layout(path)
         self.library_root = path
         preferences.set_library_root(path)
+        self.publisher.mark_all()
         self.tree.clearSelection()
         self._reload_tree()
         self._show_page(self.welcome_page)
@@ -603,6 +598,7 @@ class MainWindow(QMainWindow):
         if not ok or not name.strip():
             return
         project = project_mod.get_or_create_project(self.library_root, name.strip())
+        self.publisher.mark_changed(project.project_id)
         self._reload_tree()
         self.navigate(KIND_PROJECT, project.project_id, "")
 
@@ -632,14 +628,6 @@ class MainWindow(QMainWindow):
         if (page := self._with_project_page()) is not None:
             page.add_sheet()
 
-    def _generate_report(self) -> None:
-        if (page := self._with_project_page()) is not None:
-            page.generate_report()
-
-    def _open_report(self) -> None:
-        if (page := self._with_project_page()) is not None:
-            page.open_report()
-
     def _remeasure(self) -> None:
         if (page := self._with_project_page()) is not None:
             page.remeasure_perforation()
@@ -659,9 +647,6 @@ class MainWindow(QMainWindow):
             if kind == KIND_PROJECT:
                 menu.addAction(self.act_add_sheet)
                 menu.addAction(self.act_remeasure)
-                menu.addSeparator()
-                menu.addAction(self.act_report)
-                menu.addAction(self.act_open_report)
                 menu.addSeparator()
                 menu.addAction(
                     icons.icon("edit"), "Rename Project…", self.project_page.rename_project
@@ -731,6 +716,7 @@ class MainWindow(QMainWindow):
             self._current.deactivate()  # save pending edits while the stamp still exists
         if library_actions.remove_stamp(self, self.library_root, project_id, stamp_id):
             self._current = None  # the removed stamp's page must not save again
+            self.publisher.mark_changed(project_id)
             self._reload_tree()
             self.navigate(KIND_SAMPLE, project_id, sample_id)
         else:

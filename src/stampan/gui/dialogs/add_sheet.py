@@ -6,8 +6,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -28,6 +30,7 @@ from stampan.gui.widgets import Banner, button, label
 
 SOURCE_SCANNER = "scanner"
 SOURCE_FILE = "file"
+_DETECT_KEY = "sheets/detect_whole_sheet"
 
 
 @dataclass
@@ -36,6 +39,7 @@ class SheetSource:
     source: str  # SOURCE_SCANNER | SOURCE_FILE
     device: str | None = None
     path: Path | None = None
+    detect_whole_sheet: bool = False
 
 
 class AddSheetDialog(QDialog):
@@ -51,7 +55,7 @@ class AddSheetDialog(QDialog):
         layout.addWidget(label(f"Add a sheet to “{project_name}”", "title"))
         layout.addWidget(
             label(
-                "Stamps on the sheet are detected and cropped automatically. "
+                "After adding, select regions of the sheet to find its stamps. "
                 "Measurements use the calibration reference chosen here.",
                 "subtitle",
                 wrap=True,
@@ -103,6 +107,14 @@ class AddSheetDialog(QDialog):
         file_layout.addWidget(button("Browse…", slot=self._browse))
         source_layout.addWidget(file_row)
         layout.addWidget(source_box)
+
+        self.detect_check = QCheckBox("Detect stamps on the whole sheet right away")
+        self.detect_check.setToolTip(
+            "Works on a clean, evenly dark stock card. Otherwise select regions "
+            "on the sheet afterwards, which adapts to the local background."
+        )
+        self.detect_check.setChecked(bool(QSettings().value(_DETECT_KEY, False, type=bool)))
+        layout.addWidget(self.detect_check)
 
         self.banner = Banner()
         layout.addWidget(self.banner)
@@ -192,6 +204,18 @@ class AddSheetDialog(QDialog):
 
     def result_source(self) -> SheetSource:
         ref = self.ref_combo.currentData()
+        detect = self.detect_check.isChecked()
+        QSettings().setValue(_DETECT_KEY, detect)
         if self.scanner_radio.isChecked():
-            return SheetSource(ref.ref_id, SOURCE_SCANNER, device=self.device_combo.currentData())
-        return SheetSource(ref.ref_id, SOURCE_FILE, path=Path(self.path_edit.text().strip()))
+            return SheetSource(
+                ref.ref_id,
+                SOURCE_SCANNER,
+                device=self.device_combo.currentData(),
+                detect_whole_sheet=detect,
+            )
+        return SheetSource(
+            ref.ref_id,
+            SOURCE_FILE,
+            path=Path(self.path_edit.text().strip()),
+            detect_whole_sheet=detect,
+        )

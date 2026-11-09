@@ -3,7 +3,7 @@ colour overview (SPEC §9/§10)."""
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QGridLayout,
@@ -36,16 +36,10 @@ class ProjectPage(Page):
             )
         )
         more = QToolButton()
-        more.setIcon(icons.icon("report"))
-        more.setText("Report")
-        more.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        more.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
-        more.setToolTip("Generate the PDF report with CSV/JSON export")
-        more.clicked.connect(self.generate_report)
+        more.setIcon(icons.icon("edit"))
+        more.setToolTip("Re-measure, rename or remove this project")
+        more.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         menu = QMenu(more)
-        menu.addAction(icons.icon("report"), "Generate Report", self.generate_report)
-        menu.addAction(icons.icon("open-external"), "Open Last Report", self.open_report)
-        menu.addSeparator()
         menu.addAction(
             icons.icon("perforation"), "Re-measure Perforation…", self.remeasure_perforation
         )
@@ -82,8 +76,8 @@ class ProjectPage(Page):
             label(
                 "Every measured colour of the project is listed in the main area with its "
                 "perforation, catalogue number and cancellation. Filter and sort there; the "
-                "plots follow the visible, ticked rows. Ticked colours also go into the "
-                "report's colour overview.",
+                "plots follow the visible, ticked rows. Ticked colours are also the ones "
+                "published for comparison.",
                 "caption",
                 wrap=True,
             )
@@ -91,6 +85,7 @@ class ProjectPage(Page):
         #: The comparison workspace; the main window shows it in the centre.
         self.overview = OverviewWidget(lambda: self.ctx.library_root)
         self.overview.open_stamp.connect(lambda pid, sid: self.ctx.navigate(KIND_STAMP, pid, sid))
+        self.overview.saved.connect(self.changed)
         self.body_layout.addStretch(1)
 
     # -- loading ---------------------------------------------------------------
@@ -113,9 +108,6 @@ class ProjectPage(Page):
         self.perf_card.set_value(f"{n_perf} / {n}", "stamps measured")
         self.colour_card.set_value(f"{n_colour} / {n}", "stamps measured")
         self.overview.set_project(project_id)
-
-    def deactivate(self) -> None:
-        self.overview.save()
 
     def show_message(self, text: str, severity: str = "info") -> None:
         self.banner.show_message(text, severity)
@@ -147,14 +139,23 @@ class ProjectPage(Page):
                 image, metadata = read_tiff(source.path)
             project = project_mod.load_project(root, project_id)
             result = workflow.ingest_sample(
-                root, project, source.ref_id, image, metadata, progress=progress
+                root,
+                project,
+                source.ref_id,
+                image,
+                metadata,
+                detect=source.detect_whole_sheet,
+                progress=progress,
             )
             return result, warnings + result.warnings
 
         def done(res) -> None:
             result, warnings = res
+            title = project_mod.sheet_title(result.sample)
             text = (
-                f"Added {project_mod.sheet_title(result.sample)} with {result.n_stamps} stamp(s)."
+                f"Added {title} with {result.n_stamps} stamp(s)."
+                if source.detect_whole_sheet
+                else f"Added {title}. Select a region on it to find its stamps."
             )
             if result.n_flagged:
                 text += f" {result.n_flagged} flagged for review."
@@ -204,27 +205,6 @@ class ProjectPage(Page):
             error_title="Re-measuring failed",
         )
 
-    def generate_report(self) -> None:
-        if self._project is None:
-            return
-        root, project = self.ctx.library_root, self._project
-
-        def done(files) -> None:
-            url = QUrl.fromLocalFile(str(files.pdf)).toString()
-            text = f'Report written for {files.n_stamps} stamp(s). <a href="{url}">Open PDF</a>'
-            if files.notes:
-                text += "<br>" + "<br>".join(files.notes)
-            self.show_message(text, "warning" if files.notes else "success")
-
-        self.runner.run(
-            workflow.export_report,
-            root,
-            project,
-            description="Generating report…",
-            on_done=done,
-            error_title="Could not generate the report",
-        )
-
     def rename_project(self) -> None:
         if self.project_id and library_actions.rename_project(
             self.window(), self.ctx.library_root, self.project_id
@@ -239,19 +219,6 @@ class ProjectPage(Page):
             self.project_id = None
             self.changed.emit()
             self.ctx.navigate("", "", "")
-
-    def report_path(self):
-        if self.project_id is None:
-            return None
-        path = project_mod.project_dir(self.ctx.library_root, self.project_id) / "report.pdf"
-        return path if path.exists() else None
-
-    def open_report(self) -> None:
-        path = self.report_path()
-        if path is None:
-            self.show_message("No report has been generated for this project yet.", "info")
-            return
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
     def open_folder(self) -> None:
         if self.project_id is not None:

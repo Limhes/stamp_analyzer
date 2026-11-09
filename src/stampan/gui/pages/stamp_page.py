@@ -100,7 +100,9 @@ class DetailsTab(QWidget):
         self.cancel_type_combo.setToolTip("The list is set in Edit ▸ Preferences ▸ Stamps")
         form.addRow("Type", self.cancel_type_combo)
         self.cancel_date_edit = QLineEdit()
-        self.cancel_date_edit.setPlaceholderText("YYYY, YYYY-MM or YYYY-MM-DD")
+        self.cancel_date_edit.setPlaceholderText(
+            "YYYY, YYYY-MM or YYYY-MM-DD (“c. 1889” = estimated)"
+        )
         self.cancel_date_edit.setToolTip(
             "As precise as the postmark allows: a year alone, a month, or a full date"
         )
@@ -213,31 +215,30 @@ class DetailsTab(QWidget):
     def save(self) -> None:
         if self.stamp_id is None or not self.save_button.isEnabled():
             return
-        root = self.ctx.library_root
-        stamp = project_mod.load_stamp(root, self.project_id, self.stamp_id)
-        stamp.catalogue_numbers = [
-            s.strip() for s in self.catalogue_edit.text().split(",") if s.strip()
-        ]
-        stamp.country_issue = self.country_edit.text().strip() or None
-        stamp.notes = self.notes_edit.toPlainText()
-        stamp.condition = self.condition_combo.currentData()
-        stamp.multiplicity = self.multiplicity_combo.currentData()
-        stamp.multiplicity_count = (
-            self.count_spin.value() if stamp.multiplicity != models.MULTIPLICITY_SINGLE else None
-        )
-        stamp.cancellation.type = self.cancel_type_combo.currentData()
-        stamp.cancellation.date_estimated = self.cancel_estimated_check.isChecked()
-        date_problem = ""
+        multiplicity = self.multiplicity_combo.currentData()
         try:
-            stamp.cancellation.date = models.parse_partial_date(self.cancel_date_edit.text())
-        except ValueError as exc:
-            date_problem = f"The cancellation date was not saved: {exc}."
-        project_mod.save_stamp_results(root, self.project_id, stamp)
-        if date_problem:
-            self.banner.show_message(date_problem, "error")
-            return  # leave Save enabled until the date is fixed
-        self._loading = True  # show the normalised date without marking it edited
+            stamp = workflow.update_stamp_details(
+                self.ctx.library_root,
+                self.project_id,
+                self.stamp_id,
+                catalogue=self.catalogue_edit.text(),
+                country_issue=self.country_edit.text(),
+                notes=self.notes_edit.toPlainText(),
+                condition=self.condition_combo.currentData(),
+                multiplicity=multiplicity,
+                multiplicity_count=self.count_spin.value(),
+                cancellation_type=self.cancel_type_combo.currentData(),
+                cancellation_date=self.cancel_date_edit.text(),
+                date_estimated=self.cancel_estimated_check.isChecked(),
+            )
+        except workflow.WorkflowError as exc:
+            self.banner.show_message(f"Not saved. {exc}", "error")
+            return  # Save stays enabled until the input is fixed
+        self._loading = True  # show the cleaned-up values without marking them edited
+        self.catalogue_edit.setText(", ".join(stamp.catalogue_numbers))
+        self.country_edit.setText(stamp.country_issue or "")
         self.cancel_date_edit.setText(stamp.cancellation.date or "")
+        self.cancel_estimated_check.setChecked(stamp.cancellation.date_estimated)
         self._loading = False
         self.save_button.setEnabled(False)
         self.banner.show_message("Saved.", "success")
@@ -255,6 +256,21 @@ class StampPage(Page):
         self.project_id: str | None = None
         self.stamp_id: str | None = None
 
+        for icon_name, tooltip, clockwise, keys in (
+            (
+                "rotate-ccw",
+                "Rotate a quarter turn anticlockwise (Ctrl+Shift+R)",
+                False,
+                "Ctrl+Shift+R",
+            ),
+            ("rotate-cw", "Rotate a quarter turn clockwise (Ctrl+R)", True, "Ctrl+R"),
+        ):
+            tool = QToolButton()
+            tool.setIcon(icons.icon(icon_name))
+            tool.setToolTip(tooltip)
+            tool.clicked.connect(lambda _c=False, cw=clockwise: self.rotate(cw))
+            QShortcut(QKeySequence(keys), self, activated=lambda cw=clockwise: self.rotate(cw))
+            self.header.add_action(tool)
         self.prev_button = self._nav_button("chevron-left", "Previous stamp (Alt+Left)", -1)
         self.next_button = self._nav_button("chevron-right", "Next stamp (Alt+Right)", +1)
         self.header.add_action(self.prev_button)
@@ -312,6 +328,30 @@ class StampPage(Page):
         self.perforation.set_stamp(project_id, stamp_id, crop)
         self.colour.set_stamp(project_id, stamp_id)
         self._on_tab_changed(self.tabs.currentIndex())
+
+    def rotate(self, clockwise: bool) -> None:
+        """Turn the stamp a quarter turn; its measurements follow (see
+        ``workflow.rotate_stamp``)."""
+        if self.stamp_id is None or self.runner.is_running():
+            return
+        self.details.save()
+        project_id, stamp_id = self.project_id, self.stamp_id
+
+        def done(_stamp) -> None:
+            self.changed.emit()
+            if (project_id, stamp_id) == (self.project_id, self.stamp_id):
+                self.set_stamp(project_id, stamp_id)
+
+        self.runner.run(
+            workflow.rotate_stamp,
+            self.ctx.library_root,
+            project_id,
+            stamp_id,
+            clockwise,
+            description="Rotating stamp…",
+            on_done=done,
+            error_title="Could not rotate the stamp",
+        )
 
     def _refresh_header(self) -> None:
         stamp = project_mod.load_stamp(self.ctx.library_root, self.project_id, self.stamp_id)

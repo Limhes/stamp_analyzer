@@ -6,10 +6,15 @@
   sample_<n>.tif
   sample_<n>.json
   stamps/<stamp_id>/
-    crop.tif
+    crop.tif            cache: re-cut from the sheet scan when missing
     stamp.json
+    colour_rois/*.png
     diagnostics/*.png
+  published/            see core.publish
 ```
+
+What is the record, what is raw data and what is a rebuildable cache is
+spelled out in ``LIBRARY_GITIGNORE`` (SPEC §3.1).
 """
 
 from __future__ import annotations
@@ -47,6 +52,14 @@ def stamp_label(stamp_id: str) -> str:
     return f"Stamp {int(m.group(1)) + 1}" if m else stamp_id
 
 
+def write_text_atomic(path: Path, text: str) -> None:
+    """Write via a temporary file and rename, so a reader (the background
+    publisher, another program, git) never sees a half-written record."""
+    partial = path.with_name(path.name + ".partial")
+    partial.write_text(text, encoding="utf-8")
+    partial.replace(path)
+
+
 def project_dir(library_root: str | Path, project_id: str) -> Path:
     return Path(library_root) / "projects" / project_id
 
@@ -66,7 +79,7 @@ def create_project(library_root: str | Path, name: str, notes: str = "") -> Proj
 def save_project(library_root: str | Path, project: Project) -> Path:
     p_dir = project_dir(library_root, project.project_id)
     p_dir.mkdir(parents=True, exist_ok=True)
-    (p_dir / "project.json").write_text(project.to_json(), encoding="utf-8")
+    write_text_atomic(p_dir / "project.json", project.to_json())
     return p_dir
 
 
@@ -133,7 +146,7 @@ def add_sample(
 def save_sample(library_root: str | Path, sample: Sample) -> Path:
     p_dir = project_dir(library_root, sample.project_id)
     path = p_dir / f"{sample.sample_id}.json"
-    path.write_text(sample.to_json(), encoding="utf-8")
+    write_text_atomic(path, sample.to_json())
     return path
 
 
@@ -161,9 +174,9 @@ def save_stamp(
     stamp_dir = project_dir(library_root, sample.project_id) / "stamps" / stamp.stamp_id
     (stamp_dir / "diagnostics").mkdir(parents=True, exist_ok=True)
 
-    write_tiff(stamp_dir / "crop.tif", crop.astype(np.uint16))
+    _write_crop(stamp_dir, crop)
     stamp.crop_path = f"stamps/{stamp.stamp_id}/crop.tif"
-    (stamp_dir / "stamp.json").write_text(stamp.to_json(), encoding="utf-8")
+    write_text_atomic(stamp_dir / "stamp.json", stamp.to_json())
 
     for filename, data in (diagnostics or {}).items():
         (stamp_dir / "diagnostics" / filename).write_bytes(data)
@@ -184,7 +197,7 @@ def save_stamp_results(
     colour, ...) that run on an already-extracted crop."""
     stamp_dir = project_dir(library_root, project_id) / "stamps" / stamp.stamp_id
     (stamp_dir / "diagnostics").mkdir(parents=True, exist_ok=True)
-    (stamp_dir / "stamp.json").write_text(stamp.to_json(), encoding="utf-8")
+    write_text_atomic(stamp_dir / "stamp.json", stamp.to_json())
     for filename, data in (diagnostics or {}).items():
         (stamp_dir / "diagnostics" / filename).write_bytes(data)
     return stamp_dir
@@ -195,10 +208,60 @@ def load_stamp(library_root: str | Path, project_id: str, stamp_id: str) -> Stam
     return Stamp.from_json((stamp_dir / "stamp.json").read_text(encoding="utf-8"))
 
 
+def _write_crop(stamp_dir: Path, crop: np.ndarray) -> None:
+    # Written to a temporary name and renamed: a crop being rebuilt by a
+    # background task must never be read half-written.
+    partial = stamp_dir / "crop.partial.tif"
+    write_tiff(partial, crop.astype(np.uint16))
+    partial.replace(stamp_dir / "crop.tif")
+
+
 def load_stamp_crop(library_root: str | Path, project_id: str, stamp_id: str) -> np.ndarray:
-    stamp_dir = project_dir(library_root, project_id) / "stamps" / stamp_id
-    image, _ = read_tiff(stamp_dir / "crop.tif")
+    """The stamp's 16-bit crop. crop.tif is a cache: when it is missing (a
+    fresh clone of the library, or a cleaned-up disk) it is re-cut from the
+    sheet scan with the stored geometry."""
+    path = project_dir(library_root, project_id) / "stamps" / stamp_id / "crop.tif"
+    if not path.exists():
+        return rebuild_stamp_crop(library_root, project_id, stamp_id)
+    image, _ = read_tiff(path)
     return image
+
+
+def rebuild_stamp_crop(library_root: str | Path, project_id: str, stamp_id: str) -> np.ndarray:
+    """Re-cut a stamp's crop from its sheet scan exactly as it was first
+    extracted: same centre, size, rotation and margin."""
+    from stampan.core import detection
+    from stampan.core.calibration import reference as ref_mod
+
+    stamp = load_stamp(library_root, project_id, stamp_id)
+    sample = load_sample(
+        library_root, project_id, find_sample_for_stamp(library_root, project_id, stamp_id)
+    )
+    g = stamp.geometry
+    reference = ref_mod.load_reference(library_root, sample.ref_id)
+    if g.sample_centre_px is None or not g.width_mm or not g.height_mm or reference.scale is None:
+        raise FileNotFoundError(
+            f"{stamp_id}: crop.tif is missing and cannot be rebuilt (no stored geometry or scale)"
+        )
+    sx, sy = reference.scale.px_per_mm_x, reference.scale.px_per_mm_y
+    scan, _ = load_sample_scan(library_root, project_id, sample)
+    size = (g.width_mm * sx, g.height_mm * sy)
+    placed = detection.DetectedStamp(
+        index=0,
+        centre_px=tuple(g.sample_centre_px),
+        size_px=size,
+        angle_deg=g.rotation_deg or 0.0,
+        area_px=size[0] * size[1],
+        fill_ratio=1.0,
+        confidence=1.0,
+    )
+    crop, _ = detection.extract_crop(
+        scan, placed, sx, sy, background_level=detection.background_level(scan)
+    )
+    stamp_dir = project_dir(library_root, project_id) / "stamps" / stamp_id
+    stamp_dir.mkdir(parents=True, exist_ok=True)
+    _write_crop(stamp_dir, crop)
+    return crop
 
 
 def _trailing_number(identifier: str) -> int:
@@ -234,7 +297,10 @@ def rename_project(library_root: str | Path, project_id: str, name: str) -> Proj
 
 def delete_project(library_root: str | Path, project_id: str) -> None:
     """Permanently remove a project with all its sheets, stamps and reports."""
+    from stampan.core import publish  # publish builds on this module
+
     shutil.rmtree(project_dir(library_root, project_id))
+    publish.remove_from_index(library_root, project_id)
 
 
 def rename_sample(

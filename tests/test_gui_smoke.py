@@ -67,3 +67,67 @@ def test_main_window_opens_pages(app, tmp_path, monkeypatch):
         hub().wait_all()
         window.close()
         QSettings().clear()
+
+
+def test_perforation_entry_modes(app):
+    from PySide6.QtCore import QSettings
+
+    from stampan.gui.perforation_entry import MODE_HV, MODE_ONE, MODE_SIDES, PerforationEntry
+
+    QSettings().remove("perforation/entry_mode")
+    entry = PerforationEntry()
+    assert entry.mode() == MODE_ONE
+    got = []
+    entry.apply_requested.connect(got.append)
+    entry.one.setText("11½")
+    entry.one.returnPressed.emit()
+    assert got[-1]["left"] == ("perforated", 11.5)
+
+    entry.set_mode(MODE_HV)
+    assert PerforationEntry().mode() == MODE_HV  # remembered
+    entry.horizontal.setText("11")
+    entry.vertical.setText("12 1/2")
+    entry.vertical.returnPressed.emit()
+    assert got[-1]["top"] == ("perforated", 11.0) and got[-1]["right"] == ("perforated", 12.5)
+    entry.vertical.setText("nonsense")
+    assert not entry.apply_button.isEnabled()
+
+    entry.set_mode(MODE_SIDES)
+    entry.side_edits["left"].setText("imperf")
+    entry._apply()
+    assert got[-1] == {"left": ("imperf", None)}  # other sides: measured
+
+
+def test_overview_cells_save_through_workflow(app, tmp_path):
+    from PySide6.QtCore import Qt
+
+    from stampan.core import overview as overview_mod
+    from stampan.core import project as project_mod
+    from stampan.gui import overview as gui_overview
+    from tests.test_overview import _project_with_stamp
+
+    project, stamp_id = _project_with_stamp(tmp_path)
+    model = gui_overview.OverviewModel(lambda: tmp_path)
+    model.set_entries(project.project_id, overview_mod.project_entries(tmp_path, project))
+    errors = []
+    model.edit_failed.connect(errors.append)
+
+    def cell(col):
+        return model.index(0, col)
+
+    assert model.setData(cell(gui_overview.C_CAT), " SG 4 ,Mi  5")
+    assert model.data(cell(gui_overview.C_CAT)) == "SG 4, Mi 5"
+    assert model.entries[1].catalogue == "SG 4, Mi 5"  # the stamp's other row too
+
+    # Unchanged perforation text must not turn the measured value into "by hand".
+    text = model.data(cell(gui_overview.C_PERF), Qt.ItemDataRole.EditRole)
+    assert not model.setData(cell(gui_overview.C_PERF), text)
+    assert model.setData(cell(gui_overview.C_PERF), "11 × 12½")
+    stamp = project_mod.load_stamp(tmp_path, project.project_id, stamp_id)
+    assert stamp.perforation.manual["left"].notation == "12 1/2"
+
+    assert not model.setData(cell(gui_overview.C_CDATE), "1889-13")
+    assert errors and "date" in errors[-1].lower()
+    assert model.setData(cell(gui_overview.C_CDATE), "c. 1890-02")
+    stamp = project_mod.load_stamp(tmp_path, project.project_id, stamp_id)
+    assert stamp.cancellation.date == "1890-02" and stamp.cancellation.date_estimated

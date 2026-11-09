@@ -26,6 +26,8 @@ from skimage.segmentation import watershed
 MIN_STAMP_SIDE_MM = 8.0
 MAX_STAMP_SIDE_MM = 80.0
 MIN_FILL_RATIO = 0.5
+#: Black margin kept around the tooth tips of every extracted crop (SPEC §5).
+DEFAULT_MARGIN_MM = 3.0
 
 
 @dataclass
@@ -245,11 +247,9 @@ def detect_stamps(
             direct_stamp.flagged_for_manual_review = True
             stamps.append(_offset_stamp(direct_stamp, x0, y0))
             index += 1
-        else:
-            warnings.append(
-                f"connected component {label} is not a plausible stamp and could not be "
-                "split; flagged for manual review"
-            )
+        # Anything else (dust, glassine edges, hinge remnants, a stamp cut by
+        # the search region's border) is simply not a stamp: no warning --
+        # one line per speck told the user nothing they could act on.
 
     if not stamps:
         warnings.append("no stamps detected")
@@ -273,6 +273,15 @@ def _rect_from_mask(
         return None, []
 
     (cx, cy), (w, h), angle = cv2.minAreaRect(contour)
+    # OpenCV reports a rectangle's angle anywhere in a 90° range, with width
+    # and height swapped to match -- an upright stamp can come back as
+    # "-90°, 24 x 20 mm" and be cropped lying on its side. A stamp on a
+    # stock card is never tilted by more than 45°, so take the equivalent
+    # description closest to upright.
+    if angle > 45:
+        angle, w, h = angle - 90, h, w
+    elif angle < -45:
+        angle, w, h = angle + 90, h, w
     rect_area = w * h
     fill_ratio = area / rect_area if rect_area > 0 else 0.0
 
@@ -314,6 +323,14 @@ def _rect_from_mask(
 # --------------------------------------------------------------------------
 
 
+def background_level(sample: np.ndarray) -> float:
+    """The stock card's level, for filling a crop's margin. The 1st
+    percentile of a background-dominated sheet is stable under heavy
+    subsampling; computing it once per sheet avoids ``extract_crop``'s own
+    fallback re-sorting the whole (multi-hundred-MB) scan per stamp."""
+    return float(np.percentile(sample[::8, ::8], 1))
+
+
 @dataclass
 class CropTransform:
     """The transform needed to map crop-local (px) coordinates back to the
@@ -339,7 +356,7 @@ def extract_crop(
     stamp: DetectedStamp,
     px_per_mm_x: float,
     px_per_mm_y: float,
-    margin_mm: float = 3.0,
+    margin_mm: float = DEFAULT_MARGIN_MM,
     background_level: float | None = None,
 ) -> tuple[np.ndarray, CropTransform]:
     """Extract an upright crop around a detected stamp with a black margin

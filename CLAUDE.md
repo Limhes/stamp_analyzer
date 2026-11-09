@@ -2,7 +2,8 @@
 
 Desktop application for measuring postage stamps from calibrated flatbed scans:
 perforation gauge per side, cancellation segmentation, and calibrated ink/paper
-colour (CIELAB/LCh D50, ΔE00, ISCC–NBS names). The output is a PDF report with one page per stamp.
+colour (CIELAB/LCh D50, ΔE00, ISCC–NBS names). The output is a published export per project (`project.json`, `table.csv`, stamp pictures;
+`docs/published-format.md`) for a website or other software. There is no PDF report.
 
 The full design is in `docs/SPEC.md`. Read it before starting any phase.
 The development phases and their acceptance criteria are in `docs/PHASES.md`.
@@ -48,7 +49,6 @@ choices at an expert level. Do not simplify, and do not hand-wave.
 - numpy, scipy, opencv-python-headless, scikit-image, scikit-learn,
   colour-science, tifffile.
 - PySide6 and pyqtgraph (including `pyqtgraph.opengl`) for the GUI.
-- Jinja2 and WeasyPrint for reports.
 - pytest for tests and ruff for linting/formatting.
 - ArgyllCMS (system package, `argyll` + `argyll-ref`) -- **required**, not optional:
   `scanin` does all IT8 patch location (SPEC §4.3). `colprof`/`cctiff` remain an

@@ -314,6 +314,42 @@ def parse_partial_date(text: str) -> str | None:
     return "-".join([f"{year:04d}", *(f"{v:02d}" for v in rest)])
 
 
+_ESTIMATED_PREFIX = re.compile(r"^\s*(?:c\.|ca\.|circa|~)\s*", re.IGNORECASE)
+
+
+def parse_cancellation_date(text: str) -> tuple[str | None, bool]:
+    """A date as typed in a table cell: "1889-03", or "c. 1889" for an
+    estimated one (also "ca.", "circa", "~"). Returns (ISO date, estimated);
+    raises ValueError like :func:`parse_partial_date`."""
+    m = _ESTIMATED_PREFIX.match(text)
+    estimated = m is not None
+    return parse_partial_date(text[m.end() :] if m else text), estimated
+
+
+def cancellation_date_text(cancellation: Cancellation) -> str:
+    """The inverse of :func:`parse_cancellation_date`."""
+    if not cancellation.date:
+        return ""
+    return f"c. {cancellation.date}" if cancellation.date_estimated else cancellation.date
+
+
+def parse_catalogue_numbers(text: str) -> list[str]:
+    """ "SG 123, Mi 45" -> ["SG 123", "Mi 45"]; inner whitespace collapsed."""
+    return [" ".join(part.split()) for part in text.split(",") if part.strip()]
+
+
+def next_colour_label(existing) -> str:
+    """The default name for a newly added colour area: "ink", then "ink2",
+    "ink3", ... -- the first one not already used on the stamp."""
+    used = set(existing)
+    if "ink" not in used:
+        return "ink"
+    n = 2
+    while f"ink{n}" in used:
+        n += 1
+    return f"ink{n}"
+
+
 @dataclass
 class Stamp:
     stamp_id: str

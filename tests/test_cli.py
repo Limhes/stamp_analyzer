@@ -224,11 +224,11 @@ def test_detect_command_writes_project_and_stamps(tmp_path):
         assert diag_path.exists()
 
 
-def test_colour_and_report_commands_produce_outputs(tmp_path):
+def test_colour_and_publish_commands_produce_outputs(tmp_path):
     from stampan.core import project as project_mod
 
     library_root = tmp_path / "library"
-    ref_result = _build_test_reference("report-test reference")
+    ref_result = _build_test_reference("publish-test reference")
     ref_mod.save_reference(ref_result, library_root)
     ref_id = ref_result.reference.ref_id
 
@@ -263,7 +263,7 @@ def test_colour_and_report_commands_produce_outputs(tmp_path):
             "--reference",
             ref_id,
             "--project",
-            "report cli test",
+            "publish cli test",
             "--library-root",
             str(library_root),
         ],
@@ -283,29 +283,22 @@ def test_colour_and_report_commands_produce_outputs(tmp_path):
     assert colour_result.exit_code == 0, colour_result.stdout
     assert "no inclusion area selected" in colour_result.output
 
-    report_result = runner.invoke(
-        app, ["report", project.project_id, "--library-root", str(library_root)]
+    publish_result = runner.invoke(
+        app, ["publish", project.project_id, "--library-root", str(library_root)]
     )
-    assert report_result.exit_code == 0, report_result.stdout
+    assert publish_result.exit_code == 0, publish_result.stdout
 
-    project_dir = project_mod.project_dir(library_root, project.project_id)
-    pdf_path = project_dir / "report.pdf"
-    csv_path = project_dir / "report.csv"
-    json_path = project_dir / "report.json"
-    assert pdf_path.exists() and pdf_path.stat().st_size > 1000
-    assert pdf_path.read_bytes().startswith(b"%PDF")
-    assert csv_path.exists()
-
-    csv_text = csv_path.read_text(encoding="utf-8")
-    report_data = json.loads(json_path.read_text(encoding="utf-8"))
-    assert len(report_data["stamps"]) == 2
-    for stamp in report_data["stamps"]:
-        assert stamp["stamp_id"] in csv_text
-        # the big embedded images are stripped from the JSON export
-        assert "crop_image" not in stamp
+    published = project_mod.project_dir(library_root, project.project_id) / "published"
+    doc = json.loads((published / "project.json").read_text(encoding="utf-8"))
+    assert len(doc["stamps"]) == 2
+    csv_text = (published / "table.csv").read_text(encoding="utf-8-sig")
+    for stamp in doc["stamps"]:
+        assert (published / stamp["image"]).exists()
+        if stamp["colours"]:
+            assert stamp["id"] in csv_text
 
 
-def test_run_command_chains_detect_perf_colour_report(tmp_path):
+def test_run_command_chains_detect_perf_colour_publish(tmp_path):
     from stampan.core import project as project_mod
 
     library_root = tmp_path / "library"
@@ -350,9 +343,8 @@ def test_run_command_chains_detect_perf_colour_report(tmp_path):
     assert "measured colour on 1/1" in result.stdout
 
     project = project_mod.list_projects(library_root)[0]
-    report_path = project_mod.project_dir(library_root, project.project_id) / "report.pdf"
-    assert report_path.exists()
-    assert report_path.read_bytes().startswith(b"%PDF")
+    published = project_mod.project_dir(library_root, project.project_id) / "published"
+    assert (published / "project.json").exists()
 
 
 def test_scan_command_upscales_8bit_scanner_output_to_16bit(tmp_path, monkeypatch):

@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QSpinBox,
     QSplitter,
+    QStyledItemDelegate,
     QTableView,
     QToolButton,
     QVBoxLayout,
@@ -44,12 +45,14 @@ from PySide6.QtWidgets import (
 )
 
 from stampan.core import overview as overview_mod
+from stampan.core import perforation as perforation_mod
 from stampan.core import project as project_mod
+from stampan.core import workflow
+from stampan.core.models import cancellation_date_text
 from stampan.core.overview import OverviewEntry
-from stampan.gui import icons, theme
-from stampan.gui.widgets import EmptyState, FlowLayout, button, label
+from stampan.gui import icons, preferences, theme
+from stampan.gui.widgets import Banner, EmptyState, FlowLayout, button, label
 
-SAVE_DEBOUNCE_MS = 400
 SORT_ROLE = Qt.ItemDataRole.UserRole + 1
 
 # columns
@@ -78,20 +81,36 @@ _PALETTE = [
 
 
 def _date_text(e: OverviewEntry) -> str:
-    if not e.cancellation_date:
-        return ""
-    return f"c. {e.cancellation_date}" if e.cancellation_estimated else e.cancellation_date
+    return cancellation_date_text(e.stamp.cancellation)
+
+
+#: Columns edited in place. Each edit is saved at once through the same
+#: workflow function the stamp page uses, so validation and clean-up are
+#: identical wherever a value is typed.
+EDITABLE = {C_COLOUR, C_CAT, C_PERF, C_CTYPE, C_CDATE}
+_EDIT_HINTS = {
+    C_CAT: "Catalogue numbers, comma-separated. Double-click to edit.",
+    C_PERF: "Double-click to set by hand: 11, 11½ × 12, 11/12 × imperf. "
+    "Empty: use the measured values.",
+    C_CTYPE: "Double-click to choose the cancellation type.",
+    C_CDATE: "YYYY, YYYY-MM or YYYY-MM-DD; “c. 1889” for an estimate. Double-click to edit.",
+    C_COLOUR: "The name shown in plots and the published overview. Double-click to rename.",
+}
 
 
 class OverviewModel(QAbstractTableModel):
-    edited = Signal(str)  # stamp_id whose label or tick changed (to be saved)
+    edited = Signal()  # a value was saved to the library
+    edit_failed = Signal(str)  # the user-facing reason an edit was refused
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, library_root_getter, parent=None) -> None:
         super().__init__(parent)
+        self._root = library_root_getter
+        self.project_id: str | None = None
         self.entries: list[OverviewEntry] = []
 
-    def set_entries(self, entries: list[OverviewEntry]) -> None:
+    def set_entries(self, project_id: str, entries: list[OverviewEntry]) -> None:
         self.beginResetModel()
+        self.project_id = project_id
         self.entries = entries
         self.endResetModel()
 
@@ -105,17 +124,28 @@ class OverviewModel(QAbstractTableModel):
         if orientation == Qt.Orientation.Horizontal:
             if role == Qt.ItemDataRole.DisplayRole:
                 return _HEADERS[section]
-            if role == Qt.ItemDataRole.ToolTipRole and section == C_USE:
-                return "Ticked colours are plotted and go into the report"
+            if role == Qt.ItemDataRole.ToolTipRole:
+                if section == C_USE:
+                    return "Ticked colours are plotted and published"
+                return _EDIT_HINTS.get(section)
         return None
 
     def flags(self, index):
         base = super().flags(index)
         if index.column() == C_USE:
             return base | Qt.ItemFlag.ItemIsUserCheckable
-        if index.column() == C_COLOUR:
+        if index.column() in EDITABLE:
             return base | Qt.ItemFlag.ItemIsEditable
         return base
+
+    def _edit_text(self, e: OverviewEntry, col: int) -> str:
+        return {
+            C_COLOUR: e.label,
+            C_CAT: e.catalogue,
+            C_PERF: perforation_mod.pretty_notation(e.perforation),
+            C_CTYPE: e.cancellation_type,
+            C_CDATE: _date_text(e),
+        }[col]
 
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         e = self.entries[index.row()]
@@ -125,19 +155,19 @@ class OverviewModel(QAbstractTableModel):
             return Qt.CheckState.Checked if c.overview_included else Qt.CheckState.Unchecked
         if role == Qt.ItemDataRole.DecorationRole and col == C_COLOUR and c.srgb_swatch:
             return QColor(*c.srgb_swatch)
+        if role == Qt.ItemDataRole.EditRole and col in EDITABLE:
+            return self._edit_text(e, col)
         if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole):
             if col in _NUMERIC:
                 attr, i = _NUMERIC[col]
                 return f"{getattr(e, attr)[i]:.1f}"
+            if col == C_PERF:
+                return self._edit_text(e, col) + ("  ✎" if e.perforation_manual else "")
+            if col in EDITABLE:
+                return self._edit_text(e, col)
             return {
-                C_COLOUR: e.label,
                 C_STAMP: e.stamp_label,
                 C_SHEET: e.sheet,
-                C_CAT: e.catalogue,
-                C_PERF: e.perforation.replace(" x ", " × ")
-                + ("  ✎" if e.perforation_manual else ""),
-                C_CTYPE: e.cancellation_type,
-                C_CDATE: _date_text(e),
                 C_NAME: c.philatelic_name or "",
             }.get(col)
         if role == SORT_ROLE:
@@ -153,11 +183,12 @@ class OverviewModel(QAbstractTableModel):
             return str(self.data(index) or "").lower()
         if role == Qt.ItemDataRole.ToolTipRole:
             if col == C_PERF and e.perforation_manual:
-                return "Perforation set by hand"
+                return "Set by hand. " + _EDIT_HINTS[C_PERF]
             if col == C_CDATE and e.cancellation_estimated:
-                return "Estimated date (not read from a legible postmark)"
+                return "Estimated date (not read from a legible postmark). " + _EDIT_HINTS[C_CDATE]
             if col == C_COLOUR:
-                return f"{e.stamp_id} — double-click to rename"
+                return f"{e.stamp_id} — {_EDIT_HINTS[C_COLOUR]}"
+            return _EDIT_HINTS.get(col)
         if role == Qt.ItemDataRole.TextAlignmentRole and col in _NUMERIC:
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         if role == Qt.ItemDataRole.ForegroundRole and not c.overview_included:
@@ -166,17 +197,80 @@ class OverviewModel(QAbstractTableModel):
 
     def setData(self, index, value, role=Qt.ItemDataRole.EditRole) -> bool:  # noqa: N802
         e = self.entries[index.row()]
-        if index.column() == C_USE and role == Qt.ItemDataRole.CheckStateRole:
-            e.cluster.overview_included = Qt.CheckState(value) == Qt.CheckState.Checked
-        elif index.column() == C_COLOUR and role == Qt.ItemDataRole.EditRole:
-            text = str(value).strip()
-            e.cluster.overview_label = None if text in ("", e.default_label) else text
-        else:
+        col = index.column()
+        root, project_id = self._root(), self.project_id
+        if col == C_USE and role == Qt.ItemDataRole.CheckStateRole:
+            included = Qt.CheckState(value) == Qt.CheckState.Checked
+            return self._save(
+                lambda: workflow.set_colour_overview(
+                    root, project_id, e.stamp_id, e.cluster.label, included=included
+                )
+            )
+        if role != Qt.ItemDataRole.EditRole or col not in EDITABLE:
             return False
-        row = index.row()
-        self.dataChanged.emit(self.index(row, 0), self.index(row, len(_HEADERS) - 1))
-        self.edited.emit(e.stamp_id)
+        text = "" if value is None else str(value).strip()
+        if text == self._edit_text(e, col).strip():
+            return False  # unchanged: e.g. a measured perforation must not become "by hand"
+        if col == C_COLOUR:
+            label = None if text in ("", e.default_label) else text
+            save = lambda: workflow.set_colour_overview(  # noqa: E731
+                root, project_id, e.stamp_id, e.cluster.label, display_label=label
+            )
+        elif col == C_PERF:
+            save = lambda: workflow.set_perforation_text(root, project_id, e.stamp_id, text)  # noqa: E731
+        else:
+            field = {C_CAT: "catalogue", C_CTYPE: "cancellation_type", C_CDATE: "cancellation_date"}
+            save = lambda: workflow.update_stamp_details(  # noqa: E731
+                root, project_id, e.stamp_id, **{field[col]: text}
+            )
+        return self._save(save)
+
+    def _save(self, save) -> bool:
+        try:
+            stamp = save()
+        except workflow.WorkflowError as exc:
+            self.edit_failed.emit(str(exc))
+            return False
+        self._replace_stamp(stamp)
+        self.edited.emit()
         return True
+
+    def _replace_stamp(self, stamp) -> None:
+        """Rebuild the rows of a stamp just saved, from the saved record."""
+        rows = [i for i, e in enumerate(self.entries) if e.stamp_id == stamp.stamp_id]
+        first = self.entries[rows[0]]
+        fresh = overview_mod.stamp_entries(stamp, first.sample_id, first.sheet)
+        if len(fresh) != len(rows):  # cannot happen through these edits; be safe
+            self.set_entries(self.project_id, [*self.entries])
+            return
+        for row, entry in zip(rows, fresh, strict=True):
+            self.entries[row] = entry
+            self.dataChanged.emit(self.index(row, 0), self.index(row, len(_HEADERS) - 1))
+
+
+class _CancellationTypeDelegate(QStyledItemDelegate):
+    """A drop-down of the cancellation types from the preferences."""
+
+    def createEditor(self, parent, option, index):  # noqa: N802
+        combo = QComboBox(parent)
+        combo.addItem("—  not recorded", "")
+        current = index.data(Qt.ItemDataRole.EditRole) or ""
+        types = preferences.cancellation_types()
+        if current and current not in types:
+            types.append(current)  # recorded before the list changed: keep it
+        for text in types:
+            combo.addItem(text, text)
+        combo.setCurrentIndex(max(0, combo.findData(current)))
+        # One click chooses: commit as soon as a type is picked.
+        combo.activated.connect(lambda _i: self.commitData.emit(combo))
+        combo.activated.connect(lambda _i: self.closeEditor.emit(combo))
+        return combo
+
+    def setEditorData(self, editor, index) -> None:  # noqa: N802
+        editor.showPopup()
+
+    def setModelData(self, editor, model, index) -> None:  # noqa: N802
+        model.setData(index, editor.currentData(), Qt.ItemDataRole.EditRole)
 
 
 class OverviewFilter(QSortFilterProxyModel):
@@ -311,16 +405,15 @@ class OverviewWidget(QWidget):
         super().__init__(parent)
         self._root = library_root_getter
         self.project_id: str | None = None
-        self._dirty: set[str] = set()
-        self._save_timer = QTimer(self, singleShot=True, interval=SAVE_DEBOUNCE_MS)
-        self._save_timer.timeout.connect(self.save)
         self._replot_timer = QTimer(self, singleShot=True, interval=30)
         self._replot_timer.timeout.connect(self._replot)
 
-        self.model = OverviewModel(self)
+        self.model = OverviewModel(library_root_getter, self)
         self.proxy = OverviewFilter(self)
         self.proxy.setSourceModel(self.model)
-        self.model.edited.connect(self._on_edited)
+        self.model.edited.connect(self.saved)
+        self.model.edited.connect(lambda: self.banner.show_message(""))
+        self.model.edit_failed.connect(lambda message: self.banner.show_message(message, "error"))
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -377,6 +470,7 @@ class OverviewWidget(QWidget):
             self.table.setColumnWidth(col, width)  # fmt: skip
         for col in _NUMERIC:
             self.table.setColumnWidth(col, 52)
+        self.table.setItemDelegateForColumn(C_CTYPE, _CancellationTypeDelegate(self.table))
         self.table.doubleClicked.connect(self._on_double_click)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._table_menu)
@@ -394,10 +488,10 @@ class OverviewWidget(QWidget):
         table_layout.setContentsMargins(8, 4, 8, 8)
         table_layout.addWidget(self.table)
         hint = label(
-            "Click a point to select its row (Ctrl+click adds); double-click a row to open the "
-            "stamp, or its colour name to rename it. Untick a colour to leave it out of the "
-            "plots and the report. Ctrl+C copies the selected rows for pasting into a "
-            "spreadsheet; right-click for export to Excel or CSV.",
+            "Double-click Colour, Catalogue, Perforation, Cancellation or Date to edit it in "
+            "place; elsewhere it opens the stamp. Click a point to select its row (Ctrl+click "
+            "adds). Untick a colour to leave it out of the plots and the published overview. "
+            "Ctrl+C copies the selected rows for a spreadsheet; right-click to export.",
             "caption",
             wrap=True,
         )
@@ -405,6 +499,8 @@ class OverviewWidget(QWidget):
         self.splitter.addWidget(table_box)
         self.splitter.setSizes([420, 380])
         layout.addWidget(self.splitter, stretch=1)
+        self.banner = Banner()
+        layout.addWidget(self.banner)
         layout.addWidget(self.empty, stretch=1)
 
     # -- filter bar --------------------------------------------------------------
@@ -548,29 +644,15 @@ class OverviewWidget(QWidget):
     # -- loading and saving ----------------------------------------------------
 
     def set_project(self, project_id: str) -> None:
-        self.save()
         self.project_id = project_id
         project = project_mod.load_project(self._root(), project_id)
-        self.model.set_entries(overview_mod.project_entries(self._root(), project))
+        self.model.set_entries(project_id, overview_mod.project_entries(self._root(), project))
         self._fill_choice_combos()
         self._apply_filters()
+        self.banner.show_message("")
         has = bool(self.model.entries)
         self.splitter.setVisible(has)
         self.empty.setVisible(not has)
-
-    def _on_edited(self, stamp_id: str) -> None:
-        self._dirty.add(stamp_id)
-        self._save_timer.start()
-
-    def save(self) -> None:
-        self._save_timer.stop()
-        if not self._dirty or self.project_id is None:
-            return
-        stamps = {e.stamp_id: e.stamp for e in self.model.entries if e.stamp_id in self._dirty}
-        for stamp in stamps.values():
-            project_mod.save_stamp_results(self._root(), self.project_id, stamp)
-        self._dirty.clear()
-        self.saved.emit()
 
     # -- plots -----------------------------------------------------------------
 
@@ -642,14 +724,13 @@ class OverviewWidget(QWidget):
         self.table.scrollTo(index)
 
     def _on_double_click(self, index) -> None:
-        if index.column() != C_COLOUR:  # double-clicking the name edits it
+        if index.column() not in EDITABLE:  # double-clicking an editable cell edits it
             self._open_row(index)
 
     def _open_row(self, index) -> None:
         if not index.isValid() or self.project_id is None:
             return
         e = self.model.entries[self.proxy.mapToSource(index).row()]
-        self.save()
         self.open_stamp.emit(self.project_id, e.stamp_id)
 
     # -- export and clipboard ------------------------------------------------------

@@ -1,12 +1,22 @@
-"""The sheet page: the stamps detected on one sample sheet, with correction
-of a stamp's rectangle and adding a stamp the detection missed (SPEC §5)."""
+"""The sheet page: the stamps on one sample sheet. Stamps are found by
+detection inside a region the user drags out (undoable), or placed by hand;
+any stamp's rectangle can be corrected (SPEC §5)."""
 
 from __future__ import annotations
 
 import cv2
 import numpy as np
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QHBoxLayout, QListWidget, QListWidgetItem, QMenu, QToolButton
+from PySide6.QtWidgets import (
+    QGroupBox,
+    QHBoxLayout,
+    QListWidget,
+    QListWidgetItem,
+    QMenu,
+    QMessageBox,
+    QToolButton,
+    QVBoxLayout,
+)
 
 from stampan.core import project as project_mod
 from stampan.core import workflow
@@ -19,13 +29,16 @@ from stampan.gui.library_tree import (
     stamp_status,
 )
 from stampan.gui.pages.base import AppContext, Page
-from stampan.gui.viewer import TOOL_PAN, TOOL_PERF_BOX
-from stampan.gui.widgets import Banner, button
+from stampan.gui.viewer import TOOL_PAN, TOOL_PERF_BOX, TOOL_REGION
+from stampan.gui.widgets import Banner, button, label
 
 _IDLE_HINT = (
-    "Click a stamp to adjust its rectangle on the sheet, or use “Add Missed Stamp” "
-    "for one the detection did not find. Double-click opens the stamp; right-click "
-    "for more."
+    "Find stamps by dragging a region around them, or place one by hand. Click a stamp "
+    "in the list to adjust its rectangle; double-click opens it; right-click for more."
+)
+_REGION_HINT = (
+    "Drag a rectangle around one or more stamps (right-drag pans, wheel zooms), then "
+    "Detect Stamps. Stamps cut by the region's border are left out."
 )
 
 
@@ -38,6 +51,9 @@ class SheetPage(Page):
         self._scale: tuple[float, float] | None = None
         self._editing: str | None = None  # stamp id being corrected
         self._adding = False
+        self._selecting = False  # dragging out a detection region
+        #: Stamp ids added by each region detection on this sheet, for undo.
+        self._detections: list[list[str]] = []
 
         self.open_button = self.header.add_action(
             button(
@@ -60,6 +76,34 @@ class SheetPage(Page):
         self.banner = Banner(_IDLE_HINT, "info")
         self.body_layout.addWidget(self.banner)
 
+        find = QGroupBox("Find Stamps")
+        find_layout = QVBoxLayout(find)
+        find_layout.addWidget(
+            label(
+                "Detection works on the region you select, so the background "
+                "threshold adapts to that part of the sheet.",
+                "caption",
+                wrap=True,
+            )
+        )
+        find_row = QHBoxLayout()
+        self.region_button = button(
+            "Select Region", "box", tooltip="Drag a rectangle on the sheet", slot=self._start_region
+        )
+        self.region_button.setCheckable(True)
+        self.detect_button = button(
+            "Detect Stamps", "run", "primary", tooltip="Detect stamps inside the region",
+            slot=self._detect_in_region,
+        )  # fmt: skip
+        self.undo_button = button("Undo", "undo", slot=self._undo_detection)
+        find_row.addWidget(self.region_button)
+        find_row.addWidget(self.detect_button)
+        find_row.addStretch(1)
+        find_row.addWidget(self.undo_button)
+        find_layout.addLayout(find_row)
+        self.body_layout.addWidget(find)
+        self.ctx.viewer.region_changed.connect(self._update_find_ui)
+
         self.list = QListWidget()
         self.list.setAlternatingRowColors(True)
         self.list.itemSelectionChanged.connect(self._on_row_selected)
@@ -69,7 +113,10 @@ class SheetPage(Page):
         self.body_layout.addWidget(self.list, stretch=1)
 
         row = QHBoxLayout()
-        self.add_button = button("Add Missed Stamp", "plus", slot=self._start_add)
+        self.add_button = button(
+            "Place Stamp by Hand", "plus", tooltip="Fit a rectangle to a stamp yourself",
+            slot=self._start_add,
+        )  # fmt: skip
         self.apply_button = button("Apply", "check", "primary", slot=self._apply)
         self.cancel_button = button("Cancel", "close", slot=self._cancel)
         row.addWidget(self.add_button)
@@ -83,6 +130,8 @@ class SheetPage(Page):
 
     def set_sample(self, project_id: str, sample_id: str) -> None:
         self._end_edit(show_boxes=False)
+        if (project_id, sample_id) != (self.project_id, self.sample_id):
+            self._detections = []
         self.project_id, self.sample_id = project_id, sample_id
         root = self.ctx.library_root
         self._sample = project_mod.load_sample(root, project_id, sample_id)
@@ -102,6 +151,9 @@ class SheetPage(Page):
         self.ctx.viewer.set_tool(TOOL_PAN)
         self._populate_list()
         self._show_all_boxes()
+        self._update_find_ui()
+        if not self._sample.stamp_ids:
+            self._start_region()  # a new, empty sheet: finding stamps is the next step
 
     def deactivate(self) -> None:
         self._end_edit(show_boxes=False)
@@ -132,16 +184,17 @@ class SheetPage(Page):
         size = (g.width_mm * self._scale[0], g.height_mm * self._scale[1])
         return cv2.boxPoints((g.sample_centre_px, size, g.rotation_deg or 0.0))
 
-    def _show_all_boxes(self) -> None:
+    def _show_all_boxes(self, fit: bool = True) -> None:
         boxes = []
         for stamp_id in self._sample.stamp_ids:
             box = self._box_for(stamp_id)
             if box is not None:
                 boxes.append((stamp_label(stamp_id).replace("Stamp ", ""), box))
         self.ctx.viewer.set_static_boxes(boxes)
-        self.ctx.viewer.fit_whole_image()
+        if fit:
+            self.ctx.viewer.fit_whole_image()
 
-    # -- correcting a detected stamp ------------------------------------------
+    # -- the stamp list ---------------------------------------------------------
 
     def _selected_stamp(self) -> str | None:
         items = self.list.selectedItems()
@@ -174,6 +227,12 @@ class SheetPage(Page):
         menu.addAction(
             icons.icon("box"), "Adjust Rectangle", lambda: self.list.setCurrentItem(item)
         )
+        menu.addAction(
+            icons.icon("rotate-cw"), "Rotate Clockwise", lambda: self._rotate(stamp_id, True)
+        )
+        menu.addAction(
+            icons.icon("rotate-ccw"), "Rotate Anticlockwise", lambda: self._rotate(stamp_id, False)
+        )
         menu.addSeparator()
         menu.addAction(icons.icon("clear"), "Remove Stamp…", lambda: self.remove_stamp(stamp_id))
         menu.exec(self.list.viewport().mapToGlobal(pos))
@@ -203,20 +262,150 @@ class SheetPage(Page):
         ):
             return
         self._end_edit(show_boxes=False)
-        self._sample = project_mod.load_sample(
-            self.ctx.library_root, self.project_id, self.sample_id
-        )
-        self._populate_list()
-        self._show_all_boxes()
+        for added in self._detections:
+            if stamp_id in added:
+                added.remove(stamp_id)
+        self._reload_sheet()
+        self._update_find_ui()
         self.changed.emit()
         self.banner.show_message(f"Removed {stamp_label(stamp_id)}.", "success")
+
+    def _rotate(self, stamp_id: str, clockwise: bool) -> None:
+        self._end_edit(show_boxes=False)
+
+        def done(_stamp) -> None:
+            self._reload_sheet()
+            self.changed.emit()
+            self.banner.show_message(f"Rotated {stamp_label(stamp_id)}.", "success")
+
+        self.runner.run(
+            workflow.rotate_stamp,
+            self.ctx.library_root,
+            self.project_id,
+            stamp_id,
+            clockwise,
+            description="Rotating stamp…",
+            on_done=done,
+            error_title="Could not rotate the stamp",
+        )
 
     def _open_selected(self) -> None:
         stamp_id = self._selected_stamp()
         if stamp_id is not None:
             self.ctx.navigate(KIND_STAMP, self.project_id, stamp_id)
 
+    # -- detecting stamps in a region -------------------------------------------
+
+    def _start_region(self) -> None:
+        if self._sample is None:
+            return
+        if self._selecting:  # the button toggles
+            self._end_region()
+            self.banner.show_message(_IDLE_HINT, "info")
+            return
+        self._end_edit()
+        self._selecting = True
+        self.ctx.viewer.set_tool(TOOL_REGION)
+        self.banner.show_message(_REGION_HINT, "info")
+        self._update_find_ui()
+
+    def _end_region(self) -> None:
+        if self._selecting:
+            self._selecting = False
+            self.ctx.viewer.clear_region()
+            self.ctx.viewer.set_tool(TOOL_PAN)
+        self._update_find_ui()
+
+    def _update_find_ui(self) -> None:
+        self.region_button.setChecked(self._selecting)
+        self.detect_button.setEnabled(self._selecting and self.ctx.viewer.region() is not None)
+        n = len(self._detections[-1]) if self._detections else 0
+        self.undo_button.setEnabled(n > 0)
+        self.undo_button.setToolTip(
+            f"Remove the {n} stamp(s) the last detection added" if n else "Nothing to undo"
+        )
+
+    def _detect_in_region(self) -> None:
+        region = self.ctx.viewer.region()
+        if region is None or self._sample is None:
+            return
+        root, project_id, sample_id = self.ctx.library_root, self.project_id, self.sample_id
+
+        def done(result) -> None:
+            if result.added:
+                self._detections.append(result.added)
+            self._reload_sheet()
+            self.ctx.viewer.clear_region()
+            self._update_find_ui()
+            text = f"Found {len(result.added)} stamp(s)."
+            skipped = []
+            if result.n_cut:
+                skipped.append(f"{result.n_cut} cut by the region's border")
+            if result.n_existing:
+                skipped.append(f"{result.n_existing} already on the sheet")
+            if skipped:
+                text += " Left out: " + ", ".join(skipped) + "."
+            if not result.added:
+                text += " Try a region with more background around the stamps."
+            self.banner.show_message(text, "success" if result.added else "warning")
+            self.changed.emit()
+
+        self.runner.run(
+            workflow.detect_stamps_in_region,
+            root,
+            project_id,
+            sample_id,
+            region,
+            description="Detecting stamps…",
+            on_done=done,
+            error_title="Could not detect stamps",
+        )
+
+    def _undo_detection(self) -> None:
+        if not self._detections:
+            return
+        stamp_ids = self._detections[-1]
+        root = self.ctx.library_root
+        worked_on = [
+            stamp_label(s)
+            for s in stamp_ids
+            if (st := project_mod.load_stamp(root, self.project_id, s)).perforation.auto
+            or st.perforation.manual
+            or st.colour.clusters
+            or st.catalogue_numbers
+        ]
+        if worked_on:
+            answer = QMessageBox.question(
+                self.window(),
+                "Undo Detection",
+                f"Remove the {len(stamp_ids)} stamps of the last detection?\n\n"
+                f"{', '.join(worked_on)} already have measurements or details, "
+                "which are removed with them.",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self._end_edit(show_boxes=False)
+        workflow.remove_stamps(root, self.project_id, stamp_ids)
+        self._detections.pop()
+        self._reload_sheet()
+        self._update_find_ui()
+        self.changed.emit()
+        self.banner.show_message(
+            f"Removed the {len(stamp_ids)} stamp(s) of that detection.", "info"
+        )
+
+    def _reload_sheet(self) -> None:
+        self._sample = project_mod.load_sample(
+            self.ctx.library_root, self.project_id, self.sample_id
+        )
+        self._populate_list()
+        if self._editing is None and not self._adding:
+            self._show_all_boxes(fit=False)
+
+    # -- correcting a stamp's rectangle -------------------------------------------
+
     def _begin_edit(self, stamp_id: str) -> None:
+        self._end_region()
         if self._adding:
             self._end_edit(show_boxes=False)
         box = self._box_for(stamp_id)
@@ -244,6 +433,7 @@ class SheetPage(Page):
     # -- adding a stamp the detection missed ----------------------------------
 
     def _start_add(self) -> None:
+        self._end_region()
         if self._sample is None or self._scale is None:
             self.banner.show_message("This sheet's reference has no scale calibration.", "warning")
             return
@@ -295,9 +485,7 @@ class SheetPage(Page):
         def done(stamp) -> None:
             verb = "Added" if stamp_id is None else "Updated"
             self._end_edit()
-            self._sample = project_mod.load_sample(root, project_id, self.sample_id)
-            self._populate_list()
-            self._show_all_boxes()
+            self._reload_sheet()
             self.changed.emit()
             self.banner.show_message(f"{verb} {stamp_label(stamp.stamp_id)}.", "success")
 
@@ -320,6 +508,7 @@ class SheetPage(Page):
         self.banner.show_message(_IDLE_HINT, "info")
 
     def _end_edit(self, show_boxes: bool = True) -> None:
+        self._end_region()
         was_active = self._editing is not None or self._adding
         self._editing = None
         self._adding = False
@@ -338,3 +527,4 @@ class SheetPage(Page):
         self.apply_button.setVisible(editing)
         self.cancel_button.setVisible(editing)
         self.add_button.setEnabled(not editing)
+        self.region_button.setEnabled(not editing)

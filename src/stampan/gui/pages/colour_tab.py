@@ -9,7 +9,6 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
     QHeaderView,
-    QInputDialog,
     QMessageBox,
     QTableWidget,
     QTableWidgetItem,
@@ -18,9 +17,9 @@ from PySide6.QtWidgets import (
 )
 
 from stampan.core import colour as colour_mod
+from stampan.core import models, workflow
 from stampan.core import philatelic_colours as philatelic_mod
 from stampan.core import project as project_mod
-from stampan.core import workflow
 from stampan.core.models import ColourCluster
 from stampan.gui.pages.base import AppContext
 from stampan.gui.tasks import TaskRunner
@@ -63,7 +62,7 @@ class ColourTab(QWidget):
             )
         )
         buttons = QHBoxLayout()
-        buttons.addWidget(button("Add Colour…", "plus", "primary", slot=self._add))
+        buttons.addWidget(button("Add Colour", "plus", "primary", slot=self._add))
         self.remove_button = button("Remove", "clear", "danger", slot=self._remove)
         buttons.addWidget(self.remove_button)
         buttons.addStretch(1)
@@ -229,15 +228,8 @@ class ColourTab(QWidget):
     def _add(self) -> None:
         if self.stamp_id is None:
             return
-        name, ok = QInputDialog.getText(
-            self.window(), "Add Colour", "Name for this colour (e.g. “paper”, “frame”, “centre”):"
-        )
-        name = name.strip()
-        if not ok or not name:
-            return
-        if any(c.label == name for c in self._clusters):
-            QMessageBox.warning(self.window(), "Add Colour", f"“{name}” already exists.")
-            return
+        # Named "ink", "ink2", ... -- renamed in the table if needed.
+        name = models.next_colour_label(c.label for c in self._clusters)
         self._clusters.append(ColourCluster(label=name))
         self._populate()
         self._select(name)

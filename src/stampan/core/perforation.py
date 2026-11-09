@@ -23,6 +23,7 @@ with a materially anisotropic x/y scale.
 from __future__ import annotations
 
 import io
+import re
 from dataclasses import dataclass, field
 
 import cv2
@@ -1070,6 +1071,80 @@ def perforation_result_notation(sides: dict) -> str:
         return "/".join(vals) if vals else "?"
 
     return f"{fmt(('top', 'bottom'))} x {fmt(('left', 'right'))}"
+
+
+# --------------------------------------------------------------------------
+# Perforation typed by hand
+# --------------------------------------------------------------------------
+
+#: Upper bound for a gauge entered by hand (rouletting can exceed GAUGE_MAX).
+MANUAL_GAUGE_MAX = 30.0
+
+_IMPERF_WORDS = {"imperf", "imperforate", "imp", "i"}
+_STRAIGHT_EDGE_WORDS = {"straight edge", "straight_edge", "se", "-", "—"}
+_UNICODE_FRACTIONS = {"¼": "1/4", "½": "1/2", "¾": "3/4"}
+_MIXED_FRACTION = re.compile(r"(\d+)(?:\s+|-)([13])/([24])(?!\d)")
+
+
+def pretty_notation(notation: str) -> str:
+    """'11 1/2/12 x 11' -> '11½/12 × 11', for display. ``sides_from_notation``
+    reads both forms."""
+    for frac, symbol in (("1/4", "¼"), ("1/2", "½"), ("3/4", "¾")):
+        notation = notation.replace(f" {frac}", symbol)
+    return notation.replace(" x ", " × ")
+
+
+def _normalise_fractions(text: str) -> str:
+    """'11½' / '11 1/2' / '11-1/2' -> '11.5', so that '/' is left meaning
+    only "the two opposite sides differ"."""
+    for symbol, frac in _UNICODE_FRACTIONS.items():
+        text = re.sub(rf"(\d+)\s*{symbol}", rf"\1 {frac}", text)
+    return _MIXED_FRACTION.sub(lambda m: str(int(m[1]) + int(m[2]) / int(m[3])), text)
+
+
+def parse_side_value(text: str) -> tuple[str, float | None]:
+    """One side as typed: a gauge ("11", "11.5", "11½", "11 1/2", decimal
+    comma allowed), "imperf" or "straight edge". Returns (kind, gauge);
+    raises ValueError with a message meant for the user."""
+    t = " ".join(_normalise_fractions(text).strip().lower().split())
+    if t in _IMPERF_WORDS:
+        return "imperf", None
+    if t in _STRAIGHT_EDGE_WORDS:
+        return "straight_edge", None
+    try:
+        gauge = float(t.replace(",", "."))
+    except ValueError:
+        raise ValueError(
+            f"“{text.strip()}” is not a gauge (e.g. 11, 11½, 11.75), “imperf” or “straight edge”"
+        ) from None
+    if not GAUGE_MIN <= gauge <= MANUAL_GAUGE_MAX:
+        raise ValueError(f"gauge {gauge:g} is outside {GAUGE_MIN:g}–{MANUAL_GAUGE_MAX:g}")
+    return "perforated", gauge
+
+
+def sides_from_notation(text: str) -> dict[str, tuple[str, float | None]]:
+    """All four sides from compound notation -- the inverse of
+    :func:`perforation_result_notation`:
+
+    ``"11"`` (all round), ``"11 x 11½"`` (top/bottom x left/right),
+    ``"11/12 x imperf"`` (top 11, bottom 12, left and right imperforate).
+    "×" and "X" work as the separator too."""
+    t = _normalise_fractions(text.strip()).replace("×", "x").replace("X", "x")
+    if not t:
+        raise ValueError("enter a gauge, e.g. 11 or 11 x 11½")
+    parts = [p.strip() for p in t.split("x")]
+    if len(parts) > 2 or not all(parts):
+        raise ValueError("use one value, or two separated by × (horizontal × vertical)")
+    horizontal, vertical = parts if len(parts) == 2 else (parts[0], parts[0])
+    sides: dict[str, tuple[str, float | None]] = {}
+    for names, part in ((("top", "bottom"), horizontal), (("left", "right"), vertical)):
+        values = [v.strip() for v in part.split("/")]
+        if len(values) > 2 or not all(values):
+            raise ValueError(f"“{part}”: at most two values per direction, as in 11/12")
+        first, second = values if len(values) == 2 else (values[0], values[0])
+        sides[names[0]] = parse_side_value(first)
+        sides[names[1]] = parse_side_value(second)
+    return sides
 
 
 # --------------------------------------------------------------------------

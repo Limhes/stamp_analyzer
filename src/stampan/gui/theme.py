@@ -65,6 +65,9 @@ QPushButton[role="primary"] {{ background: {ACCENT}; border-color: {ACCENT}; col
 QPushButton[role="primary"]:hover {{ background: {ACCENT_HOVER}; border-color: {ACCENT_HOVER}; }}
 QPushButton[role="primary"]:disabled {{ background: #9db5ef; border-color: #9db5ef; color: #eef2fb; }}
 QPushButton[role="danger"]:hover {{ border-color: {DANGER}; color: {DANGER}; }}
+QPushButton[role="segment"] {{ border-radius: 0; padding: 4px 12px; margin-right: -1px; }}
+QPushButton[role="segment"]:checked {{ background: {ACCENT_SOFT}; border-color: {ACCENT};
+    color: {ACCENT}; font-weight: 600; }}
 QPushButton[role="flat"] {{ border-color: transparent; background: transparent; padding: 4px 6px; }}
 QPushButton[role="flat"]:hover {{ background: {SURFACE_ALT}; border-color: {BORDER}; }}
 

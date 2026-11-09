@@ -11,7 +11,7 @@
 
 > [!IMPORTANT]
 > **This whole project was written by AI.** Every line of code, every test, the GUI, the icons,
-> the report templates, the design documents and this README were written by
+> the design documents and this README were written by
 > **[Claude](https://www.anthropic.com/claude)** (Anthropic's AI model), working in
 > [Claude Code](https://claude.com/claude-code).
 > The human side of the collaboration, [René](https://github.com/Limhes), is a philatelist with
@@ -36,7 +36,7 @@ how sure it is about every number.
 | **Sheets** | Scan a whole stock card of stamps with exactly the reference's settings (applied *and read back* before scanning). Every stamp is detected and cropped upright automatically. Rectangles can be corrected, and missed stamps can be added by hand. |
 | **Perforation** | The gauge is measured per side from the tooth profile (spectral peak cross-checked against hole positions), with uncertainty, hole count, compound perforations (e.g. `12½ × 12½/12¾`), imperforate and straight-edge detection, and a diagnostic image for every side. |
 | **Colour** | Mark an area of clean ink or paper. It is measured in CIELAB/LCh D50 with spread (ΔE00) and given the nearest philatelic colour name ("rose red", "grayish vermilion", …). A project-wide overview compares every shade in a*b* and C\*h. |
-| **Report** | A PDF with one page per stamp (crop, perforation diagnostics, colour table), a colour overview of all stamps, and CSV/JSON exports. |
+| **Published export** | Per project a stable `project.json`, `table.csv` and calibrated WebP pictures of every stamp, kept up to date automatically, for a website or other software ([format](docs/published-format.md)). The comparison table also exports to Excel/CSV. |
 
 ### Design principles
 
@@ -70,7 +70,6 @@ sudo apt install argyll argyll-ref sane-utils
 
 - **ArgyllCMS** (`argyll`, `argyll-ref`) is required: `scanin` locates the IT8 patches.
 - **SANE** (`scanimage`) is needed only for scanning from inside the app. You can also import TIFF scans.
-- WeasyPrint (PDF reports) needs Pango; see the [WeasyPrint docs](https://doc.courtbouillon.org/weasyprint/stable/first_steps.html) if PDF output fails.
 
 ```bash
 git clone https://github.com/Limhes/stamp_analyzer.git
@@ -88,12 +87,14 @@ uv run stampan-gui
 
 1. **New Reference…** Scan (or load) an IT8.7/2 target, review the fit (cross-validated ΔE00
    per candidate model and the patch-location diagnostic), then save.
-2. **New Project…**, then **Add Sheet…** Scan a stock card or import a 16-bit TIFF. The stamps
-   are detected and listed under the sheet.
+2. **New Project…**, then **Add Sheet…** Scan a stock card or import a 16-bit TIFF. On the
+   sheet, drag a region around some stamps and **Detect Stamps** (undoable), or place one by
+   hand. Rotate a stamp a quarter turn with the ↺ ↻ buttons (Ctrl+Shift+R / Ctrl+R).
 3. Open a stamp:
-   - *Perforation*: fit the rectangle to the stamp. It re-measures as you edit.
-   - *Colour*: add a colour (e.g. "paper", "frame") and draw its area.
-4. **Generate Report** writes the PDF, CSV and JSON into the project folder.
+   - *Perforation*: type the gauge (`12½`, `11 × 12½`, …) and press Enter, or **Measure**.
+   - *Colour*: **Add Colour** (named ink, ink2, …) and draw its area.
+4. Compare and edit catalogue numbers, perforation, cancellation and dates in the project
+   table. The published export in `projects/<id>/published/` follows every change.
 
 Right-drag pans the image and the mouse wheel zooms. F2 / Delete rename or remove the item
 selected in the library. **Edit ▸ Preferences** sets the library folder, the default scanner and
@@ -107,15 +108,15 @@ The whole pipeline also runs headless:
 uv run stampan scanner-info                 # list scanners and their options
 uv run stampan reference --help             # build / list / inspect references
 uv run stampan scan --help                  # verified scan with a reference's settings
-uv run stampan run --help                   # detect → perforation → colour → report
-uv run stampan report --help
+uv run stampan run --help                   # detect → perforation → colour → publish
+uv run stampan publish --help
 ```
 
 ## Project layout
 
 ```
 src/stampan/
-  core/          # pure Python, no Qt: calibration, detection, perforation, colour, report
+  core/          # pure Python, no Qt: calibration, detection, perforation, colour, publish
     workflow.py  # end-to-end steps shared by the CLI and the GUI
   cli.py         # `stampan`
   gui/           # `stampan-gui` (PySide6): main window, pages, dialogs, viewer, theme, icons
