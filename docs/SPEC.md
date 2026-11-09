@@ -563,7 +563,10 @@ exports carry the per-stamp data; `colour_overview.png` is the first colour char
 - **Project comparison** (centre area while a project is selected): one row per measured
   colour with Lab/LCh, perforation, catalogue no. and cancellation; search, filter (inks/paper,
   perforation "X on all sides" / "X on any side" / exact notation, cancellation type, year
-  range), sort on any column, CSV export. Linked a*b* and L*–C* plots show the visible, ticked
+  range), sort on any column. Ctrl+C / right-click copies the selected (or all visible)
+  rows to the clipboard as tab-separated text plus an HTML table, so they paste into Excel or
+  LibreOffice with numbers as numbers; Export writes the visible rows to .xlsx (openpyxl:
+  frozen header, autofilter, number formats, colour-filled swatch cells) or .csv (UTF-8). Linked a*b* and L*–C* plots show the visible, ticked
   rows, coloured by measured colour or grouped by perforation, cancellation, sheet or catalogue
   no.; hover names a point, clicking selects its row.
 - **Perforation override** (§6.2): per side, kind and gauge set by hand with an optional reason;

@@ -73,3 +73,27 @@ def test_overview_entries_and_override(tmp_path):
         workflow.set_perforation_override(
             tmp_path, project.project_id, stamp_id, {"top": ("perforated", None)}
         )
+
+
+def test_export_formats(tmp_path):
+    from openpyxl import load_workbook
+
+    project, _ = _project_with_stamp(tmp_path)
+    entries = overview.project_entries(tmp_path, project)
+    headers = [h for h, _ in overview.EXPORT_COLUMNS]
+
+    tsv = overview.to_tsv(entries).splitlines()
+    assert tsv[0].split("\t") == headers and len(tsv) == 3
+    row = dict(zip(headers, tsv[1].split("\t"), strict=True))
+    assert row["L*"] == "50" and row["Gauge top"] == "11.02" and row["Date estimated"] == "yes"
+    assert '<td x:num="50.0">50</td>' in overview.to_html(entries)
+
+    overview.write_csv(tmp_path / "t.csv", entries)
+    assert (tmp_path / "t.csv").read_text(encoding="utf-8-sig").splitlines()[0].startswith("Stamp,")
+
+    overview.write_xlsx(tmp_path / "t.xlsx", entries, title="P")
+    ws = load_workbook(tmp_path / "t.xlsx").active
+    assert [c.value for c in ws[1]] == headers
+    assert ws.cell(row=2, column=headers.index("L*") + 1).value == 50.0  # a number, not text
+    assert ws.cell(row=2, column=headers.index("Catalogue no.") + 1).value == "Mi 23"
+    assert ws.freeze_panes == "A2"

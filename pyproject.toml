@@ -19,6 +19,7 @@ dependencies = [
     "typer>=0.12",
     "matplotlib>=3.9",
     "pillow>=10.0",
+    "openpyxl>=3.1",
 ]
 
 [project.optional-dependencies]

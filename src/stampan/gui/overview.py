@@ -11,7 +11,6 @@ perforation, cancellation type or sheet to compare groups.
 
 from __future__ import annotations
 
-import csv
 from pathlib import Path
 
 import numpy as np
@@ -19,13 +18,14 @@ import pyqtgraph as pg
 from PySide6.QtCore import (
     QAbstractTableModel,
     QItemSelectionModel,
+    QMimeData,
     QModelIndex,
     QSortFilterProxyModel,
     Qt,
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QBrush, QColor
+from PySide6.QtGui import QAction, QBrush, QColor, QGuiApplication, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -33,9 +33,12 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLineEdit,
+    QMenu,
+    QMessageBox,
     QSpinBox,
     QSplitter,
     QTableView,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -375,6 +378,10 @@ class OverviewWidget(QWidget):
         for col in _NUMERIC:
             self.table.setColumnWidth(col, 52)
         self.table.doubleClicked.connect(self._on_double_click)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._table_menu)
+        copy = QShortcut(QKeySequence.StandardKey.Copy, self.table, self.copy_selected)
+        copy.setContext(Qt.ShortcutContext.WidgetShortcut)
         self.table.selectionModel().selectionChanged.connect(self._schedule_replot)
         self.proxy.layoutChanged.connect(self._schedule_replot)
         self.proxy.rowsInserted.connect(self._schedule_replot)
@@ -389,7 +396,8 @@ class OverviewWidget(QWidget):
         hint = label(
             "Click a point to select its row (Ctrl+click adds); double-click a row to open the "
             "stamp, or its colour name to rename it. Untick a colour to leave it out of the "
-            "plots and the report.",
+            "plots and the report. Ctrl+C copies the selected rows for pasting into a "
+            "spreadsheet; right-click for export to Excel or CSV.",
             "caption",
             wrap=True,
         )
@@ -464,7 +472,7 @@ class OverviewWidget(QWidget):
         group(label("Colour by"), self.group_combo)
         group(
             button("", "refresh", "flat", "Clear all filters", self.reset_filters),
-            button("", "import", "flat", "Export the visible rows as CSV", self._export),
+            self._export_button(),
         )
         self.count_label = label("", "caption")
         flow.addWidget(self.count_label)
@@ -634,33 +642,99 @@ class OverviewWidget(QWidget):
         self.table.scrollTo(index)
 
     def _on_double_click(self, index) -> None:
-        if index.column() == C_COLOUR or self.project_id is None:
-            return  # editing the name
+        if index.column() != C_COLOUR:  # double-clicking the name edits it
+            self._open_row(index)
+
+    def _open_row(self, index) -> None:
+        if not index.isValid() or self.project_id is None:
+            return
         e = self.model.entries[self.proxy.mapToSource(index).row()]
         self.save()
         self.open_stamp.emit(self.project_id, e.stamp_id)
 
-    # -- export ------------------------------------------------------------------
+    # -- export and clipboard ------------------------------------------------------
 
-    def _export(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export Overview", "colour_overview.csv", "CSV (*.csv)"
+    def _export_button(self) -> QToolButton:
+        tool = QToolButton()
+        tool.setIcon(icons.icon("import"))
+        tool.setText("Export")
+        tool.setToolTip("Export the table or copy it to the clipboard")
+        tool.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        tool.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        tool.setAutoRaise(True)
+        tool.setMenu(self._export_menu(tool))
+        return tool
+
+    def _export_menu(self, parent) -> QMenu:
+        menu = QMenu(parent)
+        menu.addAction(icons.icon("details"), "Copy Selected Rows", self.copy_selected)
+        menu.addAction(icons.icon("details"), "Copy All Visible Rows", self.copy_visible)
+        menu.addSeparator()
+        menu.addAction(
+            icons.icon("report"), "Export to Excel (.xlsx)…", lambda: self.export("xlsx")
         )
+        menu.addAction(icons.icon("report"), "Export to CSV…", lambda: self.export("csv"))
+        return menu
+
+    def _table_menu(self, pos) -> None:
+        menu = self._export_menu(self)
+        has_selection = bool(self.table.selectionModel().selectedRows())
+        menu.actions()[0].setEnabled(has_selection)
+        menu.insertSeparator(menu.actions()[0])
+        open_action = QAction(icons.icon("chevron-right"), "Open Stamp", menu)
+        index = self.table.indexAt(pos)
+        open_action.setEnabled(index.isValid())
+        open_action.triggered.connect(lambda: self._open_row(index))
+        menu.insertAction(menu.actions()[0], open_action)
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def _rows_visible(self) -> list[OverviewEntry]:
+        """Every row that passes the filters, in the table's sort order."""
+        return [
+            self.model.entries[self.proxy.mapToSource(self.proxy.index(r, 0)).row()]
+            for r in range(self.proxy.rowCount())
+        ]
+
+    def _rows_selected(self) -> list[OverviewEntry]:
+        rows = sorted(i.row() for i in self.table.selectionModel().selectedRows())
+        return [self.model.entries[self.proxy.mapToSource(self.proxy.index(r, 0)).row()]
+                for r in rows]  # fmt: skip
+
+    def _copy(self, entries: list[OverviewEntry], what: str) -> None:
+        if not entries:
+            return
+        mime = QMimeData()
+        mime.setText(overview_mod.to_tsv(entries))
+        mime.setHtml(overview_mod.to_html(entries))
+        QGuiApplication.clipboard().setMimeData(mime)
+        self.count_label.setText(f"Copied {len(entries)} {what} row(s) — paste into a spreadsheet")
+        self._replot_timer.start(2500)  # restore the counter afterwards
+
+    def copy_selected(self) -> None:
+        self._copy(self._rows_selected() or self._rows_visible(), "selected")
+
+    def copy_visible(self) -> None:
+        self._copy(self._rows_visible(), "visible")
+
+    def export(self, kind: str) -> None:
+        entries = self._rows_visible()
+        if not entries:
+            return
+        project = project_mod.load_project(self._root(), self.project_id)
+        filters = {"xlsx": "Excel workbook (*.xlsx)", "csv": "CSV, comma-separated (*.csv)"}
+        start = str(Path.home() / f"{project.name} – stamps.{kind}")
+        path, _ = QFileDialog.getSaveFileName(self, "Export Table", start, filters[kind])
         if not path:
             return
-        with Path(path).open("w", newline="", encoding="utf-8") as fh:
-            writer = csv.writer(fh)
-            writer.writerow(
-                ["stamp_id", "colour", "sheet", "catalogue", "perforation",
-                 "perforation_by_hand", "cancellation", "cancellation_date", "date_estimated",
-                 "philatelic_name", "L*", "a*", "b*", "C*", "h", "included"]
-            )  # fmt: skip
-            for r in range(self.proxy.rowCount()):
-                e = self.model.entries[self.proxy.mapToSource(self.proxy.index(r, 0)).row()]
-                writer.writerow(
-                    [e.stamp_id, e.label, e.sheet, e.catalogue, e.perforation,
-                     e.perforation_manual, e.cancellation_type, e.cancellation_date,
-                     e.cancellation_estimated, e.cluster.philatelic_name or "",
-                     *(f"{v:.2f}" for v in e.lab), f"{e.lch[1]:.2f}", f"{e.lch[2]:.2f}",
-                     e.cluster.overview_included]
-                )  # fmt: skip
+        if not path.lower().endswith(f".{kind}"):
+            path += f".{kind}"
+        try:
+            if kind == "xlsx":
+                overview_mod.write_xlsx(path, entries, title=project.name)
+            else:
+                overview_mod.write_csv(path, entries)
+        except OSError as exc:
+            QMessageBox.warning(self, "Export Failed", f"Could not write {path}:\n{exc}")
+            return
+        self.count_label.setText(f"Exported {len(entries)} row(s) to {Path(path).name}")
+        self._replot_timer.start(4000)
