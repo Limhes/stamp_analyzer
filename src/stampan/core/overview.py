@@ -35,6 +35,7 @@ class OverviewEntry:
     country_issue: str = ""
     cancellation_type: str = ""
     cancellation_date: str = ""
+    cancellation_place: str = ""
     cancellation_estimated: bool = False
 
     @property
@@ -89,6 +90,7 @@ def stamp_entries(stamp: Stamp, sample_id: str, sheet: str) -> list[OverviewEntr
                 country_issue=stamp.country_issue or "",
                 cancellation_type=stamp.cancellation.type or "",
                 cancellation_date=stamp.cancellation.date or "",
+                cancellation_place=stamp.cancellation.place or "",
                 cancellation_estimated=stamp.cancellation.date_estimated,
             )
         )
@@ -138,7 +140,8 @@ EXPORT_COLUMNS: list[tuple[str, str | None]] = [
     ("ΔE00 spread", "0.00"), ("Perforation", None),
     ("Gauge top", "0.00"), ("Gauge bottom", "0.00"), ("Gauge left", "0.00"),
     ("Gauge right", "0.00"), ("Perforation by hand", None), ("Cancellation", None),
-    ("Cancellation date", None), ("Date estimated", None), ("In overview", None),
+    ("Cancellation date", None), ("Date estimated", None), ("Cancellation place", None),
+    ("In overview", None),
     ("Stamp ID", None),
 ]  # fmt: skip
 
@@ -169,6 +172,7 @@ def export_rows(entries: list[OverviewEntry]) -> list[list]:
                 *(_side_value(e, s) for s in perforation_mod.SIDES),
                 "yes" if e.perforation_manual else "", e.cancellation_type,
                 e.cancellation_date, "yes" if e.cancellation_estimated else "",
+                e.cancellation_place,
                 "yes" if c.overview_included else "", e.stamp_id,
             ]
         )  # fmt: skip

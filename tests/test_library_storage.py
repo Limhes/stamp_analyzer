@@ -102,7 +102,12 @@ def test_publish_writes_stable_export_and_follows_changes(library_root):
     assert doc["schema"] == publish.SCHEMA
     first = doc["stamps"][0]
     assert first["catalogue"] == ["Mi 23", "SG 4"]
-    assert first["cancellation"] == {"type": None, "date": "1889-03", "estimated": True}
+    assert first["cancellation"] == {
+        "type": None,
+        "date": "1889-03",
+        "estimated": True,
+        "place": None,
+    }
     assert first["perforation"]["notation"] == "11 1/2 x 12"
     assert first["perforation"]["sides"]["top"]["by_hand"] is True
     assert first["image_calibrated"] is False  # no colour model: not a calibrated picture

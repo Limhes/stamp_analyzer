@@ -50,7 +50,8 @@ All paths inside a `project.json` are relative to its own `published/` folder.
     "condition": "on_paper",            // "soaked_off" | "on_paper" | null (not recorded)
     "multiplicity": "single", "multiplicity_count": null,
     "size_mm": [29.27, 28.91],
-    "cancellation": {"type": "Circular date stamp", "date": "1883-10-01", "estimated": true},
+    "cancellation": {"type": "Circular date stamp", "date": "1883-10-01", "estimated": true,
+                     "place": "Helsingfors"},
     "perforation": {                    // null when neither measured nor set by hand
       "notation": "12 1/2 x 12 1/2",    // top/bottom x left/right; "a/b" = opposite sides differ
       "by_hand": true, "reason": null, "confidence": 0.8, "warnings": ["…"],
@@ -89,7 +90,8 @@ All paths inside a `project.json` are relative to its own `published/` folder.
   `by_hand` marks values set by the user; the measured value is always kept under
   `measured`. `kind` is `perforated`, `imperf` or `straight_edge`.
 - **Cancellation.** The date is ISO and only as precise as known (`1889`, `1889-03` or
-  `1889-03-14`). `estimated` means it was inferred, not read from a legible postmark.
+  `1889-03-14`). `estimated` means it was inferred, not read from a legible postmark. `place` is the
+  postmark's place name exactly as the user typed it (any script or language), or null.
 - **Pictures.** Rendered from the 16-bit scan through the colour model to sRGB. When
   `image_calibrated` is false, the reference had no colour model and the picture is only
   a contrast stretch. Stamps lie as they were cropped; the margin around the teeth is

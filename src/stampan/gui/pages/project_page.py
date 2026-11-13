@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 )
 
 from stampan.core import project as project_mod
-from stampan.core import workflow
+from stampan.core import publish, workflow
 from stampan.core.calibration import reference as ref_mod
 from stampan.core.io import read_tiff
 from stampan.gui import icons, library_actions
@@ -21,7 +21,10 @@ from stampan.gui.dialogs.add_sheet import SOURCE_SCANNER, AddSheetDialog
 from stampan.gui.library_tree import KIND_SAMPLE, KIND_STAMP
 from stampan.gui.overview import OverviewWidget
 from stampan.gui.pages.base import AppContext, Page
-from stampan.gui.widgets import Banner, StatCard, button, label
+from stampan.gui.tasks import TaskRunner
+from stampan.gui.widgets import Banner, ScaledImage, StatCard, button, label, rgb_to_pixmap
+
+PICTURE_MAX_HEIGHT = 320
 
 
 class ProjectPage(Page):
@@ -35,25 +38,19 @@ class ProjectPage(Page):
                 "Add Sheet…", "import", "primary", "Scan or import a sample sheet", self.add_sheet
             )
         )
-        more = QToolButton()
-        more.setIcon(icons.icon("edit"))
-        more.setToolTip("Re-measure, rename or remove this project")
-        more.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        menu = QMenu(more)
+        manage = QToolButton()
+        manage.setIcon(icons.icon("edit"))
+        manage.setToolTip("Re-measure, rename or remove this project")
+        manage.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        menu = QMenu(manage)
         menu.addAction(
             icons.icon("perforation"), "Re-measure Perforation…", self.remeasure_perforation
         )
         menu.addAction(icons.icon("folder"), "Show Project Folder", self.open_folder)
-        more.setMenu(menu)
-        self.header.add_action(more)
-        manage = QToolButton()
-        manage.setIcon(icons.icon("edit"))
-        manage.setToolTip("Rename or remove this project")
-        manage.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        manage_menu = QMenu(manage)
-        manage_menu.addAction(icons.icon("edit"), "Rename Project…", self.rename_project)
-        manage_menu.addAction(icons.icon("clear"), "Remove Project…", self.remove_project)
-        manage.setMenu(manage_menu)
+        menu.addSeparator()
+        menu.addAction(icons.icon("edit"), "Rename Project…", self.rename_project)
+        menu.addAction(icons.icon("clear"), "Remove Project…", self.remove_project)
+        manage.setMenu(menu)
         self.header.add_action(manage)
 
         self.banner = Banner()
@@ -71,6 +68,14 @@ class ProjectPage(Page):
             stats.addWidget(card, i // 2, i % 2)
         self.body_layout.addLayout(stats)
 
+        #: The stamp selected in the overview table, in calibrated colour.
+        self.picture_title = label("", "section")
+        self.picture = ScaledImage(upscale=True, max_height=PICTURE_MAX_HEIGHT)
+        self.picture_caption = label("", "caption", wrap=True)
+        for widget in (self.picture_title, self.picture, self.picture_caption):
+            widget.setVisible(False)
+            self.body_layout.addWidget(widget)
+
         self.body_layout.addWidget(label("Comparison", "section"))
         self.body_layout.addWidget(
             label(
@@ -86,12 +91,15 @@ class ProjectPage(Page):
         self.overview = OverviewWidget(lambda: self.ctx.library_root)
         self.overview.open_stamp.connect(lambda pid, sid: self.ctx.navigate(KIND_STAMP, pid, sid))
         self.overview.saved.connect(self.changed)
+        self.overview.stamp_selected.connect(self._show_stamp)
+        self._picture_runner = TaskRunner(self)  # separate: never queued behind long tasks
         self.body_layout.addStretch(1)
 
     # -- loading ---------------------------------------------------------------
 
     def set_project(self, project_id: str) -> None:
         self.project_id = project_id
+        self._show_stamp(None)  # the table is reloaded without a selection
         root = self.ctx.library_root
         self._project = project = project_mod.load_project(root, project_id)
         self.header.set_text(project.name, f"Project · created {project.created}")
@@ -203,6 +211,47 @@ class ProjectPage(Page):
             description="Re-measuring perforation…",
             on_done=done,
             error_title="Re-measuring failed",
+        )
+
+    def _show_stamp(self, stamp_id: str | None) -> None:
+        for widget in (self.picture_title, self.picture, self.picture_caption):
+            widget.setVisible(stamp_id is not None)
+        if stamp_id is None or self.project_id is None:
+            return
+        project_id = self.project_id
+        stamp = project_mod.load_stamp(self.ctx.library_root, project_id, stamp_id)
+        sample_id = project_mod.find_sample_for_stamp(self.ctx.library_root, project_id, stamp_id)
+        sheet = project_mod.sheet_title(
+            project_mod.load_sample(self.ctx.library_root, project_id, sample_id)
+        )
+        title = f"{project_mod.stamp_label(stamp_id)} · {sheet}"
+        if stamp.catalogue_numbers:
+            title += f" · {', '.join(stamp.catalogue_numbers)}"
+        self.picture_title.setText(title)
+        self.picture_caption.setText("Rendering…")
+        self._shown_stamp = stamp_id
+
+        def done(result) -> None:
+            if getattr(self, "_shown_stamp", None) != stamp_id:
+                return  # another row was selected meanwhile
+            rgb, calibrated = result
+            self.picture.set_pixmap(rgb_to_pixmap(rgb))
+            self.picture_caption.setText(
+                "Calibrated colour, through the reference's colour model. Double-click the "
+                "row to open the stamp."
+                if calibrated
+                else "No colour model: contrast-stretched scanner RGB, not calibrated colour."
+            )
+
+        self._picture_runner.run(
+            publish.stamp_picture,
+            self.ctx.library_root,
+            project_id,
+            stamp_id,
+            max_px=2 * PICTURE_MAX_HEIGHT,
+            description="Loading stamp picture…",
+            on_done=done,
+            on_fail=lambda message: self.picture_caption.setText(message),
         )
 
     def rename_project(self) -> None:

@@ -56,11 +56,11 @@ from stampan.gui.widgets import Banner, EmptyState, FlowLayout, button, label
 SORT_ROLE = Qt.ItemDataRole.UserRole + 1
 
 # columns
-C_USE, C_COLOUR, C_STAMP, C_SHEET, C_CAT, C_PERF, C_CTYPE, C_CDATE, C_NAME = range(9)
-C_L, C_A, C_B, C_C, C_H = range(9, 14)
+C_USE, C_COLOUR, C_STAMP, C_SHEET, C_CAT, C_PERF, C_CTYPE, C_CDATE, C_PLACE, C_NAME = range(10)
+C_L, C_A, C_B, C_C, C_H = range(10, 15)
 _HEADERS = [
     "", "Colour", "Stamp", "Sheet", "Catalogue", "Perforation", "Cancellation", "Date",
-    "Philatelic name", "L*", "a*", "b*", "C*", "h°",
+    "Place", "Philatelic name", "L*", "a*", "b*", "C*", "h°",
 ]  # fmt: skip
 _NUMERIC = {C_L: ("lab", 0), C_A: ("lab", 1), C_B: ("lab", 2), C_C: ("lch", 1), C_H: ("lch", 2)}
 
@@ -87,13 +87,14 @@ def _date_text(e: OverviewEntry) -> str:
 #: Columns edited in place. Each edit is saved at once through the same
 #: workflow function the stamp page uses, so validation and clean-up are
 #: identical wherever a value is typed.
-EDITABLE = {C_COLOUR, C_CAT, C_PERF, C_CTYPE, C_CDATE}
+EDITABLE = {C_COLOUR, C_CAT, C_PERF, C_CTYPE, C_CDATE, C_PLACE}
 _EDIT_HINTS = {
     C_CAT: "Catalogue numbers, comma-separated. Double-click to edit.",
     C_PERF: "Double-click to set by hand: 11, 11½ × 12, 11/12 × imperf. "
     "Empty: use the measured values.",
     C_CTYPE: "Double-click to choose the cancellation type.",
     C_CDATE: "YYYY, YYYY-MM or YYYY-MM-DD; “c. 1889” for an estimate. Double-click to edit.",
+    C_PLACE: "Postmark place name, in any script. Double-click to edit.",
     C_COLOUR: "The name shown in plots and the published overview. Double-click to rename.",
 }
 
@@ -145,6 +146,7 @@ class OverviewModel(QAbstractTableModel):
             C_PERF: perforation_mod.pretty_notation(e.perforation),
             C_CTYPE: e.cancellation_type,
             C_CDATE: _date_text(e),
+            C_PLACE: e.cancellation_place,
         }[col]
 
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
@@ -219,7 +221,12 @@ class OverviewModel(QAbstractTableModel):
         elif col == C_PERF:
             save = lambda: workflow.set_perforation_text(root, project_id, e.stamp_id, text)  # noqa: E731
         else:
-            field = {C_CAT: "catalogue", C_CTYPE: "cancellation_type", C_CDATE: "cancellation_date"}
+            field = {
+                C_CAT: "catalogue",
+                C_CTYPE: "cancellation_type",
+                C_CDATE: "cancellation_date",
+                C_PLACE: "cancellation_place",
+            }
             save = lambda: workflow.update_stamp_details(  # noqa: E731
                 root, project_id, e.stamp_id, **{field[col]: text}
             )
@@ -312,7 +319,7 @@ class OverviewFilter(QSortFilterProxyModel):
             haystack = " ".join(
                 (e.label, e.stamp_label, e.stamp_id, e.sheet, e.catalogue, e.country_issue,
                  e.perforation, e.cancellation_type, e.cancellation_date,
-                 e.cluster.philatelic_name or "")
+                 e.cancellation_place, e.cluster.philatelic_name or "")
             ).lower()  # fmt: skip
             if not all(word in haystack for word in self.text.lower().split()):
                 return False
@@ -399,6 +406,8 @@ class OverviewWidget(QWidget):
 
     #: Open a stamp (project_id, stamp_id) -- double-clicked row.
     open_stamp = Signal(str, str)
+    #: The stamp of the current table row, or None.
+    stamp_selected = Signal(object)
     saved = Signal()
 
     def __init__(self, library_root_getter, parent=None) -> None:
@@ -465,6 +474,7 @@ class OverviewWidget(QWidget):
             (C_PERF, 150),
             (C_CTYPE, 150),
             (C_CDATE, 95),
+            (C_PLACE, 120),
             (C_NAME, 130),
         ):
             self.table.setColumnWidth(col, width)  # fmt: skip
@@ -477,6 +487,7 @@ class OverviewWidget(QWidget):
         copy = QShortcut(QKeySequence.StandardKey.Copy, self.table, self.copy_selected)
         copy.setContext(Qt.ShortcutContext.WidgetShortcut)
         self.table.selectionModel().selectionChanged.connect(self._schedule_replot)
+        self.table.selectionModel().currentRowChanged.connect(self._on_current_row)
         self.proxy.layoutChanged.connect(self._schedule_replot)
         self.proxy.rowsInserted.connect(self._schedule_replot)
         self.proxy.rowsRemoved.connect(self._schedule_replot)
@@ -722,6 +733,12 @@ class OverviewWidget(QWidget):
         )
         self.table.selectionModel().select(index, flags)
         self.table.scrollTo(index)
+
+    def _on_current_row(self, current, _previous) -> None:
+        if not current.isValid():
+            self.stamp_selected.emit(None)
+            return
+        self.stamp_selected.emit(self.model.entries[self.proxy.mapToSource(current).row()].stamp_id)
 
     def _on_double_click(self, index) -> None:
         if index.column() not in EDITABLE:  # double-clicking an editable cell edits it

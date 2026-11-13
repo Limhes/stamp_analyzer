@@ -139,7 +139,12 @@ def _stamp_record(stamp: Stamp, sample_id: str, number: int, image: dict | None)
         "multiplicity": stamp.multiplicity,
         "multiplicity_count": stamp.multiplicity_count,
         "size_mm": [_round(g.width_mm), _round(g.height_mm)] if g.width_mm else None,
-        "cancellation": {"type": c.type, "date": c.date, "estimated": c.date_estimated},
+        "cancellation": {
+            "type": c.type,
+            "date": c.date,
+            "estimated": c.date_estimated,
+            "place": c.place,
+        },
         "perforation": _perforation_record(stamp),
         "colours": [_colour_record(cl) for cl in stamp.colour.clusters if cl.mean_lab is not None],
         **(image or {"image": None, "thumbnail": None, "image_calibrated": None}),
@@ -211,6 +216,20 @@ def render_stamp_picture(
         return cv2.normalize(crop, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U), False
     lab = colour_mod.rgb_to_lab_d50(crop, model.predict_lab)
     return colour_mod.lab_image_to_display_rgb(lab), True
+
+
+def stamp_picture(
+    library_root: str | Path, project_id: str, stamp_id: str, max_px: int | None = None
+) -> tuple[np.ndarray, bool]:
+    """A stamp's picture as display sRGB (see :func:`render_stamp_picture`)."""
+    sample_id = project_mod.find_sample_for_stamp(library_root, project_id, stamp_id)
+    sample = project_mod.load_sample(library_root, project_id, sample_id)
+    reference = ref_mod.load_reference(library_root, sample.ref_id)
+    model = (
+        ref_mod.load_colour_model(library_root, sample.ref_id) if reference.colour_model else None
+    )
+    crop = project_mod.load_stamp_crop(library_root, project_id, stamp_id)
+    return render_stamp_picture(crop, model, max_px=max_px)
 
 
 # -- publishing ---------------------------------------------------------------

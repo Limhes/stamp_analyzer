@@ -106,3 +106,13 @@ def test_set_colour_overview(tmp_path):
     assert not ink.overview_included and ink.overview_label == "A"
     with pytest.raises(workflow.WorkflowError):
         workflow.set_colour_overview(tmp_path, project.project_id, stamp_id, "nope", included=True)
+
+
+def test_cancellation_place_kept_as_typed(tmp_path):
+    project, stamp_id = _project_with_stamp(tmp_path)
+    stamp = workflow.update_stamp_details(
+        tmp_path, project.project_id, stamp_id, cancellation_place="  Гельсингфорсъ "
+    )
+    assert stamp.cancellation.place == "Гельсингфорсъ"
+    reloaded = proj.load_stamp(tmp_path, project.project_id, stamp_id)
+    assert reloaded.cancellation.place == "Гельсингфорсъ"

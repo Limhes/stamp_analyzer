@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from stampan.core import models, publish, workflow
+from stampan.core import models, workflow
 from stampan.core import project as project_mod
 from stampan.gui import icons, preferences
 from stampan.gui.library_tree import KIND_SAMPLE, KIND_STAMP
@@ -28,9 +28,8 @@ from stampan.gui.pages.base import AppContext, Page
 from stampan.gui.pages.colour_tab import ColourTab
 from stampan.gui.pages.perforation_tab import PerforationTab
 from stampan.gui.viewer import TOOL_PAN
-from stampan.gui.widgets import Banner, ScaledImage, button, label, rgb_to_pixmap
+from stampan.gui.widgets import Banner, button, label
 
-PICTURE_MAX_HEIGHT = 220
 MODE_DETAILS = "details"
 MODE_PERFORATION = "perforation"
 MODE_COLOUR = "colour"
@@ -114,6 +113,14 @@ class DetailsTab(QWidget):
             "the sheet) rather than read from the cancellation itself."
         )
         form.addRow("", self.cancel_estimated_check)
+        self.cancel_place_edit = QLineEdit()
+        self.cancel_place_edit.setPlaceholderText(
+            "As on the postmark, e.g. Helsinki, Helsingfors, Гельсингфорсъ"
+        )
+        self.cancel_place_edit.setToolTip(
+            "The place name in any script or language; saved as typed"
+        )
+        form.addRow("Place", self.cancel_place_edit)
         layout.addWidget(cancel)
 
         geometry = QGroupBox("Size")
@@ -160,6 +167,7 @@ class DetailsTab(QWidget):
             self.cancel_type_combo.currentIndexChanged,
             self.cancel_date_edit.textChanged,
             self.cancel_estimated_check.toggled,
+            self.cancel_place_edit.textChanged,
         ):
             signal.connect(self._on_edited)
 
@@ -182,6 +190,7 @@ class DetailsTab(QWidget):
         self._fill_cancel_types(stamp.cancellation.type)
         self.cancel_date_edit.setText(stamp.cancellation.date or "")
         self.cancel_estimated_check.setChecked(stamp.cancellation.date_estimated)
+        self.cancel_place_edit.setText(stamp.cancellation.place or "")
         g = stamp.geometry
         self.size_label.setText(
             f"{g.width_mm:.2f} × {g.height_mm:.2f} mm" if g.width_mm and g.height_mm else "—"
@@ -231,6 +240,7 @@ class DetailsTab(QWidget):
                 cancellation_type=self.cancel_type_combo.currentData(),
                 cancellation_date=self.cancel_date_edit.text(),
                 date_estimated=self.cancel_estimated_check.isChecked(),
+                cancellation_place=self.cancel_place_edit.text(),
             )
         except workflow.WorkflowError as exc:
             self.banner.show_message(f"Not saved. {exc}", "error")
@@ -240,6 +250,7 @@ class DetailsTab(QWidget):
         self.country_edit.setText(stamp.country_issue or "")
         self.cancel_date_edit.setText(stamp.cancellation.date or "")
         self.cancel_estimated_check.setChecked(stamp.cancellation.date_estimated)
+        self.cancel_place_edit.setText(stamp.cancellation.place or "")
         self._loading = False
         self.save_button.setEnabled(False)
         self.banner.show_message("Saved.", "success")
@@ -276,10 +287,6 @@ class StampPage(Page):
         self.next_button = self._nav_button("chevron-right", "Next stamp (Alt+Right)", +1)
         self.header.add_action(self.prev_button)
         self.header.add_action(self.next_button)
-
-        #: The stamp in calibrated colour, whichever tab is open.
-        self.picture = ScaledImage(upscale=True, max_height=PICTURE_MAX_HEIGHT)
-        self.body_layout.addWidget(self.picture)
 
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
@@ -320,13 +327,6 @@ class StampPage(Page):
         )
         model = workflow.colour_model_for_stamp(root, project_id, stamp_id)
         self.ctx.viewer.set_image(crop, *scale, model.predict_lab if model else None)
-        rgb, calibrated = publish.render_stamp_picture(crop, model, max_px=2 * PICTURE_MAX_HEIGHT)
-        self.picture.set_pixmap(rgb_to_pixmap(rgb))
-        self.picture.setToolTip(
-            "Calibrated colour (through the reference's colour model)"
-            if calibrated
-            else "No colour model: contrast-stretched scanner RGB, not calibrated colour"
-        )
         self.ctx.viewer.set_tool(TOOL_PAN)
 
         self._sample_id = sample.sample_id

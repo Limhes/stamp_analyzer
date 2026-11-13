@@ -507,6 +507,7 @@ def update_stamp_details(
     cancellation_type=KEEP,
     cancellation_date=KEEP,
     date_estimated=KEEP,
+    cancellation_place=KEEP,
 ) -> Stamp:
     """Change a stamp's user-recorded details, from text as typed -- the
     one place their clean-up and validation happen, whether the edit comes
@@ -534,6 +535,8 @@ def update_stamp_details(
         stamp.multiplicity_count = None
     if cancellation_type is not KEEP:
         stamp.cancellation.type = " ".join((cancellation_type or "").split()) or None
+    if cancellation_place is not KEEP:
+        stamp.cancellation.place = " ".join((cancellation_place or "").split()) or None
     if date_estimated is not KEEP:
         stamp.cancellation.date_estimated = bool(date_estimated)
     if cancellation_date is not KEEP:

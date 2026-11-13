@@ -282,6 +282,9 @@ class Cancellation:
     #: True when the date was not read from a legible postmark (inferred from
     #: the issue period, a partial strike, the sheet's other stamps, ...).
     date_estimated: bool = False
+    #: Place name as read from the postmark, in whatever script and language
+    #: the user chooses (Cyrillic, Swedish, Finnish, ...); stored as typed.
+    place: str | None = None
 
     @staticmethod
     def from_dict(d: dict[str, Any]) -> Cancellation:
@@ -289,6 +292,7 @@ class Cancellation:
             type=d.get("type"),
             date=d.get("date"),
             date_estimated=bool(d.get("date_estimated", False)),
+            place=d.get("place"),
         )
 
 
